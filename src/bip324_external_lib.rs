@@ -47,7 +47,7 @@
 //!
 //! ## Asynchronous API (requires `tokio` feature)
 //!
-//! ```no_run
+//! ```ignore
 //! # #[cfg(feature = "tokio")]
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {

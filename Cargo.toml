@@ -3,8 +3,17 @@ name = "bip324_mitm"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "bip324_mitm"
+path = "src/lib.rs"
+
 [dependencies]
 bip324 = { git = "https://github.com/rust-bitcoin/bip324", version = "0.10.0" }
 bitcoin_hashes = { version = ">=0.15.0,<0.17.0", default-features = false }
 chacha20-poly1305 = "0.1.2"
 secp256k1 = "0.29.1"
+
+[dev-dependencies]
+bitcoin = "0.32.8"
+hex = { package = "hex-conservative", version = "0.2.0" }
+hex-literal = "1.1.0"

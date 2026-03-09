@@ -232,12 +232,12 @@ fn read_vec_dequeue_u8(stream: &mut VecDeque<u8>, buf: &mut [u8]) -> usize {
     limit
 }
 
-struct GarbageToSend {
+struct DataToSend {
     stream: VecDeque<u8>,
     eof: bool,
 }
 
-impl GarbageToSend {
+impl DataToSend {
     fn new() -> Self {
         Self {
             stream: VecDeque::new(),
@@ -254,13 +254,13 @@ impl GarbageToSend {
     }
 }
 
-impl Read for GarbageToSend {
+impl Read for DataToSend {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         Ok(read_vec_dequeue_u8(&mut self.stream, buf))
     }
 }
 
-impl Write for GarbageToSend {
+impl Write for DataToSend {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         if self.eof {
             return IOError(std::io::ErrorKind::Other, "Can't write. Eof was already reached.");
@@ -279,39 +279,6 @@ impl Write for GarbageToSend {
     }
 }
 
-struct FakeServerRelay {
-    stream: VecDeque<u8>,
-    garbage: GarbageToSend,
-}
-
-impl FakeServerRelay {
-    fn new() -> Self {
-        Self {
-            stream: VecDeque::new(),
-            garbage: GarbageToSend::new(),
-        }
-    }
-}
-
-impl Read for FakeServerRelay {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        Ok(read_vec_dequeue_u8(&mut self.stream, buf))
-    }
-}
-
-impl Write for FakeServerRelay {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.stream.extend(data);
-
-        Ok(data.len())
-    }
-
-    /// Doesn't actually flush, because it needs a consumer to call read
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 struct PartialPacket {
     length_bytes: Option<Vec<u8>>,
     data: Option<Vec<u8>>,
@@ -326,20 +293,51 @@ impl PartialPacket {
     }
 }
 
-struct FakeClientRelay {
-    garbage: Vec<u8>,
+struct FakePeerRelay {
+    key: DataToSend,
+    garbage: DataToSend,
     packets: Vec<PartialPacket>,
 }
 
-impl FakeClientRelay {
+impl FakePeerRelay {
     fn new() -> Self {
         Self {
-            garbage: vec![],
+            key: DataToSend::new(),
+            garbage: DataToSend::new(),
             packets: vec![],
         }
     }
-    fn add_garbage(&mut self, data: &[u8]) {
-        self.garbage.extend_from_slice(data);
+
+    fn write_garbage(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.garbage.write(data)
+    }
+
+    fn read_garbage(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
+        self.garbage.read(data)
+    }
+
+    fn set_eof_garbage(&mut self) {
+        self.garbage.set_eof();
+    }
+
+    fn is_eof_garbage(&self) -> bool {
+        self.garbage.is_eof()
+    }
+
+    fn write_key(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.key.write(data)
+    }
+
+    fn read_key(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
+        self.key.read(data)
+    }
+
+    fn set_eof_key(&mut self) {
+        self.key.set_eof();
+    }
+
+    fn is_eof_key(&self) -> bool {
+        self.key.is_eof()
     }
 
     fn add_length_bytes(&mut self, data: &[u8]) {
@@ -468,16 +466,16 @@ struct MitmImpersonatorLeg {
     key_to_send: Vec<u8>,
     garbage_terminator_to_send: Vec<u8>,
 
-    relay_in: Rc<RefCell<FakeServerRelay>>,
-    relay_fake_client: Rc<RefCell<FakeClientRelay>>,
+    relay_in: Rc<RefCell<FakePeerRelay>>,
+    relay_out: Rc<RefCell<FakePeerRelay>>,
 }
 
 impl MitmImpersonatorLeg {
     pub fn new(
         role: Role,
         magic: MagicType,
-        relay_in: Rc<RefCell<FakeServerRelay>>,
-        relay_fake_client: Rc<RefCell<FakeClientRelay>>,
+        relay_in: Rc<RefCell<FakePeerRelay>>,
+        relay_out: Rc<RefCell<FakePeerRelay>>,
         secret_key: EcdhPoint,
     ) -> Result<Self, Box<dyn Error>> {
         let point = secret_key;
@@ -496,26 +494,26 @@ impl MitmImpersonatorLeg {
             key_to_send,
             garbage_terminator_to_send: vec![],
             relay_in,
-            relay_fake_client,
+            relay_out,
         })
     }
 
     pub fn new_fake_server(
         magic: MagicType,
-        relay_in: Rc<RefCell<FakeServerRelay>>,
-        relay_fake_client: Rc<RefCell<FakeClientRelay>>,
+        relay_in: Rc<RefCell<FakePeerRelay>>,
+        relay_out: Rc<RefCell<FakePeerRelay>>,
         secret_key: EcdhPoint,
     ) -> Result<Self, Box<dyn Error>> {
-        Self::new(Role::Responder, magic, relay_in, relay_fake_client, secret_key)
+        Self::new(Role::Responder, magic, relay_in, relay_out, secret_key)
     }
 
     pub fn new_fake_client(
         magic: MagicType,
-        relay_in: Rc<RefCell<FakeServerRelay>>,
-        relay_fake_client: Rc<RefCell<FakeClientRelay>>,
+        relay_in: Rc<RefCell<FakePeerRelay>>,
+        relay_out: Rc<RefCell<FakePeerRelay>>,
         secret_key: EcdhPoint,
     ) -> Result<Self, Box<dyn Error>> {
-        Self::new(Role::Initiator, magic, relay_in, relay_fake_client, secret_key)
+        Self::new(Role::Initiator, magic, relay_in, relay_out, secret_key)
     }
 
     pub fn pass_peer_data(&mut self, data: &[u8]) -> Result<(), String> {
@@ -587,14 +585,14 @@ impl MitmImpersonatorLeg {
                     self.state = ReceivedGarbage(cipher.clone(), garbage.to_vec());
                     self.peer.undo_consume(rest.to_vec());
 
-                    self.relay_fake_client.borrow_mut().add_garbage(&garbage);
+                    self.relay_out.borrow_mut().write_garbage(&garbage).map_err(|_| "Error writing garbage to relay")?;
                 } else {
                     // The last bytes might be part of a truncated garbage terminator
                     let size = min(other_garbage_terminator.len() - 1, buf.len());
                     self.peer.undo_consume(buf[buf.len() - size..].to_vec());
 
                     let partial_garbage = &buf[..buf.len() - size];
-                    self.relay_fake_client.borrow_mut().add_garbage(partial_garbage);
+                    self.relay_out.borrow_mut().write_garbage(partial_garbage).map_err(|_| "Error writing garbage to relay")?;
                 }
 
                 if !(matches!(self.state, ReceivedKey(..))) {
@@ -619,7 +617,7 @@ impl MitmImpersonatorLeg {
                         [bytes[0], bytes[1], bytes[2]]
                     };
 
-                    self.relay_fake_client
+                    self.relay_out
                         .borrow_mut()
                         .add_length_bytes(&length_bytes_decrypted);
                     self.state =
@@ -638,7 +636,7 @@ impl MitmImpersonatorLeg {
                         .inbound()
                         .decrypt_in_place(&mut packet_bytes, aad)
                         .expect("Decryption Error");
-                    self.relay_fake_client.borrow_mut().add_packet_bytes(&packet_bytes);
+                    self.relay_out.borrow_mut().add_packet_bytes(&packet_bytes);
 
                     match packet_type {
                         PacketType::Genuine => {
@@ -669,7 +667,7 @@ impl MitmImpersonatorLeg {
             SendingKey => {
                 let limit = min(buf.len(), self.key_to_send.len());
                 let _key_buf = &mut buf[..limit];
-                let size = self.relay_in.borrow_mut().read(_key_buf)?;
+                let size = self.relay_in.borrow_mut().read_key(_key_buf)?;
 
                 // The key is replaced by ours. We're not using the original one
                 let data_to_send: Vec<u8> = self.key_to_send.drain(..size).collect();
@@ -684,9 +682,9 @@ impl MitmImpersonatorLeg {
                 Ok(size)
             }
             SendingGarbage => {
-                let size = self.relay_in.borrow_mut().garbage.read(buf)?;
+                let size = self.relay_in.borrow_mut().read_garbage(buf)?;
 
-                if self.relay_in.borrow().garbage.is_eof() {
+                if self.relay_in.borrow().is_eof_garbage() {
                     self.server_state = SendingGarbageTerminator;
 
                     return Ok(size + self.write_data(&mut buf[size..])?);
@@ -697,7 +695,7 @@ impl MitmImpersonatorLeg {
             SendingGarbageTerminator => {
                 let limit = min(buf.len(), self.garbage_terminator_to_send.len());
                 let _terminator_buf = &mut buf[..limit];
-                let size = self.relay_in.borrow_mut().read(_terminator_buf)?;
+                let size = self.relay_in.borrow_mut().read_garbage(_terminator_buf)?;
 
                 // The terminator is replaced by ours. We're not using the original one
                 let data_to_send: Vec<u8> = self.garbage_terminator_to_send.drain(..size).collect();
@@ -762,11 +760,11 @@ mod mitmfakeserverbip324_tests {
         }
     }
 
-    fn get_mitm_fake_server() -> (MitmImpersonatorLeg, Rc<RefCell<FakeServerRelay>>, Rc<RefCell<FakeClientRelay>>) {
+    fn get_mitm_fake_server() -> (MitmImpersonatorLeg, Rc<RefCell<FakePeerRelay>>, Rc<RefCell<FakePeerRelay>>) {
         let mut rng = secp256k1::rand::thread_rng();
 
-        let relay_in = Rc::new(RefCell::new(FakeServerRelay::new()));
-        let relay_out = Rc::new(RefCell::new(FakeClientRelay::new()));
+        let relay_in = Rc::new(RefCell::new(FakePeerRelay::new()));
+        let relay_out = Rc::new(RefCell::new(FakePeerRelay::new()));
         let secret_key = key_from_rng(&mut rng).expect("Failed generating the secret key");
 
         let server = MitmImpersonatorLeg::new_fake_server(DEFAULT_MAGIC, relay_in.clone(), relay_out.clone(), secret_key)
@@ -779,11 +777,11 @@ mod mitmfakeserverbip324_tests {
         TestRng::new(seed, seed / 2 + 1)
     }
 
-    fn get_mitm_fake_server_deterministic_insecurerng(seed: u64) -> (MitmImpersonatorLeg, Rc<RefCell<FakeServerRelay>>, Rc<RefCell<FakeClientRelay>>) {
+    fn get_mitm_fake_server_deterministic_insecurerng(seed: u64) -> (MitmImpersonatorLeg, Rc<RefCell<FakePeerRelay>>, Rc<RefCell<FakePeerRelay>>) {
         let mut insecure_rng = TestRng::new(seed, seed / 2 + 1);
 
-        let relay_in = Rc::new(RefCell::new(FakeServerRelay::new()));
-        let relay_out = Rc::new(RefCell::new(FakeClientRelay::new()));
+        let relay_in = Rc::new(RefCell::new(FakePeerRelay::new()));
+        let relay_out = Rc::new(RefCell::new(FakePeerRelay::new()));
         let secret_key = key_from_rng(&mut insecure_rng).expect("Failed generating the secret key");
 
         let server = MitmImpersonatorLeg::new_fake_server(DEFAULT_MAGIC, relay_in.clone(), relay_out.clone(), secret_key)
@@ -926,7 +924,7 @@ mod mitmfakeserverbip324_tests {
         let mut out_buf = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
         // Send one byte at a time
         for i in 0..NUM_ELLIGATOR_SWIFT_BYTES {
-            relay_in.borrow_mut().write(&buf).expect("Write to relay_in must to fail");
+            relay_in.borrow_mut().write_key(&buf).expect("Write to relay_in must to fail");
             let size = server.write_data(&mut out_buf[i..]).expect("Error on write_data");
             assert_eq!(size, 1, "Expected write_data to write one byte at step {i}");
 
@@ -945,7 +943,7 @@ mod mitmfakeserverbip324_tests {
         let (mut server, relay_in, _) = get_mitm_fake_server();
 
         let buf = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-        relay_in.borrow_mut().write(&buf).expect("Write must not fail");
+        relay_in.borrow_mut().write_key(&buf).expect("Write must not fail");
 
         let mut sent_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
         let size = server.write_data(&mut sent_key).expect("Error on write_data");
@@ -957,14 +955,14 @@ mod mitmfakeserverbip324_tests {
         let (mut server, relay_in, _) = get_mitm_fake_server();
 
         // Server sends something
-        relay_in.borrow_mut().write(&[0u8; 2]).expect("Write must not fail");
+        relay_in.borrow_mut().write_key(&[0u8; 2]).expect("Write must not fail");
 
         // Client sends something
         server.pass_peer_data(&[0x73; 3])
             .expect("Error on pass_peer_data");
 
         // Server sends something again
-        relay_in.borrow_mut().write(&[0u8; 2]).expect("Write must not fail");
+        relay_in.borrow_mut().write_key(&[0u8; 2]).expect("Write must not fail");
 
         // Client sends something again
         server.pass_peer_data(&[0x73; 4])
@@ -985,7 +983,7 @@ mod mitmfakeserverbip324_tests {
 
         // Real server sends the key
         let buf = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-        relay_in.borrow_mut().write(&buf).expect("Write must not fail");
+        relay_in.borrow_mut().write_key(&buf).expect("Write must not fail");
 
         let mut sent_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
         let size = server.write_data(&mut sent_key).expect("Error on write_data");
@@ -999,11 +997,11 @@ mod mitmfakeserverbip324_tests {
 
         // Real server sends the key
         let buf = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-        relay_in.borrow_mut().write(&buf).expect("Write must not fail");
+        relay_in.borrow_mut().write_key(&buf).expect("Write must not fail");
 
         // Real server sends some garbage
         let real_garbage = [3u8; 10];
-        relay_in.borrow_mut().garbage.write(&real_garbage).expect("Write must not fail");
+        relay_in.borrow_mut().write_garbage(&real_garbage).expect("Write must not fail");
 
         // Fake server sends key
         let mut sent_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];

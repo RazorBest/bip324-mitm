@@ -307,37 +307,32 @@ impl FakePeerRelay {
             packets: vec![],
         }
     }
+}
 
+trait FakePeerRelayWriter {
+    fn write_garbage(&mut self, data: &[u8]) -> std::io::Result<usize>;
+    fn set_eof_garbage(&mut self);
+    fn write_key(&mut self, data: &[u8]) -> std::io::Result<usize>;
+    fn set_eof_key(&mut self);
+    fn add_length_bytes(&mut self, data: &[u8]);
+    fn add_packet_bytes(&mut self, data: &[u8]);
+}
+
+impl FakePeerRelayWriter for FakePeerRelay {
     fn write_garbage(&mut self, data: &[u8]) -> std::io::Result<usize> {
         self.garbage.write(data)
-    }
-
-    fn read_garbage(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
-        self.garbage.read(data)
     }
 
     fn set_eof_garbage(&mut self) {
         self.garbage.set_eof();
     }
 
-    fn is_eof_garbage(&self) -> bool {
-        self.garbage.is_eof()
-    }
-
     fn write_key(&mut self, data: &[u8]) -> std::io::Result<usize> {
         self.key.write(data)
     }
 
-    fn read_key(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
-        self.key.read(data)
-    }
-
     fn set_eof_key(&mut self) {
         self.key.set_eof();
-    }
-
-    fn is_eof_key(&self) -> bool {
-        self.key.is_eof()
     }
 
     fn add_length_bytes(&mut self, data: &[u8]) {
@@ -378,6 +373,31 @@ impl FakePeerRelay {
 
         let packet_data = &mut last_packet.data.as_mut().unwrap();
         packet_data.extend_from_slice(data);
+    }
+}
+
+trait FakePeerRelayReader {
+    fn read_garbage(&mut self, data: &mut [u8]) -> std::io::Result<usize>;
+    fn is_eof_garbage(&self) -> bool;
+    fn read_key(&mut self, data: &mut [u8]) -> std::io::Result<usize>;
+    fn is_eof_key(&self) -> bool;
+}
+
+impl FakePeerRelayReader for FakePeerRelay {
+    fn read_garbage(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
+        self.garbage.read(data)
+    }
+
+    fn is_eof_garbage(&self) -> bool {
+        self.garbage.is_eof()
+    }
+
+    fn read_key(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
+        self.key.read(data)
+    }
+
+    fn is_eof_key(&self) -> bool {
+        self.key.is_eof()
     }
 }
 
@@ -466,16 +486,16 @@ struct MitmImpersonatorLeg {
     key_to_send: Vec<u8>,
     garbage_terminator_to_send: Vec<u8>,
 
-    relay_in: Rc<RefCell<FakePeerRelay>>,
-    relay_out: Rc<RefCell<FakePeerRelay>>,
+    relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
+    relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
 }
 
 impl MitmImpersonatorLeg {
     pub fn new(
         role: Role,
         magic: MagicType,
-        relay_in: Rc<RefCell<FakePeerRelay>>,
-        relay_out: Rc<RefCell<FakePeerRelay>>,
+        relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
+        relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
         secret_key: EcdhPoint,
     ) -> Result<Self, Box<dyn Error>> {
         let point = secret_key;
@@ -500,8 +520,8 @@ impl MitmImpersonatorLeg {
 
     pub fn new_fake_server(
         magic: MagicType,
-        relay_in: Rc<RefCell<FakePeerRelay>>,
-        relay_out: Rc<RefCell<FakePeerRelay>>,
+        relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
+        relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
         secret_key: EcdhPoint,
     ) -> Result<Self, Box<dyn Error>> {
         Self::new(Role::Responder, magic, relay_in, relay_out, secret_key)
@@ -509,8 +529,8 @@ impl MitmImpersonatorLeg {
 
     pub fn new_fake_client(
         magic: MagicType,
-        relay_in: Rc<RefCell<FakePeerRelay>>,
-        relay_out: Rc<RefCell<FakePeerRelay>>,
+        relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
+        relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
         secret_key: EcdhPoint,
     ) -> Result<Self, Box<dyn Error>> {
         Self::new(Role::Initiator, magic, relay_in, relay_out, secret_key)

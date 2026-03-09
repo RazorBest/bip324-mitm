@@ -1033,4 +1033,31 @@ mod mitmfakeserverbip324_tests {
         let size = server.write_data(&mut sent_garbage).expect("Error on write_data");
         assert_eq!(sent_garbage[..size], real_garbage, "The fake server must preserve the garbage sent by the real server");
     }
+
+    #[test]
+    fn real_server_sends_garbage_before_client_sending_entire_key() {
+        let (mut server, relay_in, _) = get_mitm_fake_server();
+
+        // Client sends partial key
+        server.pass_peer_data(&[0x73; NUM_ELLIGATOR_SWIFT_BYTES-1])
+            .expect("Error on pass_peer_data");
+
+        // Real server sends the key
+        let buf = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+        relay_in.borrow_mut().write_key(&buf).expect("Write must not fail");
+
+        // Real server sends some garbage
+        let real_garbage = [3u8; 10];
+        relay_in.borrow_mut().write_garbage(&real_garbage).expect("Write must not fail");
+
+        // Fake server sends key
+        let mut sent_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+        let size = server.write_data(&mut sent_key).expect("Error on write_data");
+        assert_eq!(size, NUM_ELLIGATOR_SWIFT_BYTES, "Fake server must send the entire key");
+
+        // Fake server sends garbage
+        let mut sent_garbage = [0u8; 128];
+        let size = server.write_data(&mut sent_garbage).expect("Error on write_data");
+        assert_eq!(sent_garbage[..size], real_garbage, "The fake server must preserve the garbage sent by the real server");
+    }
 }

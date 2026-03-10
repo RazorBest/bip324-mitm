@@ -252,6 +252,10 @@ impl DataToSend {
     fn set_eof(&mut self) {
         self.eof = true;
     }
+
+    fn peek_len(&self) -> usize {
+        self.stream.len()
+    }
 }
 
 impl Read for DataToSend {
@@ -296,6 +300,7 @@ impl PartialPacket {
 struct FakePeerRelay {
     key: DataToSend,
     garbage: DataToSend,
+    terminator: DataToSend,
     packets: Vec<PartialPacket>,
 }
 
@@ -304,21 +309,35 @@ impl FakePeerRelay {
         Self {
             key: DataToSend::new(),
             garbage: DataToSend::new(),
+            terminator: DataToSend::new(),
             packets: vec![],
         }
     }
 }
 
 trait FakePeerRelayWriter {
-    fn write_garbage(&mut self, data: &[u8]) -> std::io::Result<usize>;
-    fn set_eof_garbage(&mut self);
     fn write_key(&mut self, data: &[u8]) -> std::io::Result<usize>;
     fn set_eof_key(&mut self);
+
+    fn write_garbage(&mut self, data: &[u8]) -> std::io::Result<usize>;
+    fn set_eof_garbage(&mut self);
+
+    fn write_terminator(&mut self, data: &[u8]) -> std::io::Result<usize>;
+    fn set_eof_terminator(&mut self);
+
     fn add_length_bytes(&mut self, data: &[u8]);
     fn add_packet_bytes(&mut self, data: &[u8]);
 }
 
 impl FakePeerRelayWriter for FakePeerRelay {
+    fn write_key(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.key.write(data)
+    }
+
+    fn set_eof_key(&mut self) {
+        self.key.set_eof();
+    }
+
     fn write_garbage(&mut self, data: &[u8]) -> std::io::Result<usize> {
         self.garbage.write(data)
     }
@@ -327,12 +346,12 @@ impl FakePeerRelayWriter for FakePeerRelay {
         self.garbage.set_eof();
     }
 
-    fn write_key(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.key.write(data)
+    fn write_terminator(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.terminator.write(data)
     }
 
-    fn set_eof_key(&mut self) {
-        self.key.set_eof();
+    fn set_eof_terminator(&mut self) {
+        self.terminator.set_eof();
     }
 
     fn add_length_bytes(&mut self, data: &[u8]) {
@@ -377,13 +396,32 @@ impl FakePeerRelayWriter for FakePeerRelay {
 }
 
 trait FakePeerRelayReader {
-    fn read_garbage(&mut self, data: &mut [u8]) -> std::io::Result<usize>;
-    fn is_eof_garbage(&self) -> bool;
     fn read_key(&mut self, data: &mut [u8]) -> std::io::Result<usize>;
     fn is_eof_key(&self) -> bool;
+    fn peek_len_key(&self) -> usize;
+
+    fn read_garbage(&mut self, data: &mut [u8]) -> std::io::Result<usize>;
+    fn is_eof_garbage(&self) -> bool;
+    fn peek_len_garbage(&self) -> usize;
+
+    fn read_terminator(&mut self, data: &mut [u8]) -> std::io::Result<usize>;
+    fn is_eof_terminator(&self) -> bool;
+    fn peek_len_terminator(&self) -> usize;
 }
 
 impl FakePeerRelayReader for FakePeerRelay {
+    fn read_key(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
+        self.key.read(data)
+    }
+
+    fn is_eof_key(&self) -> bool {
+        self.key.is_eof()
+    }
+
+    fn peek_len_key(&self) -> usize {
+        self.key.peek_len()
+    }
+
     fn read_garbage(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
         self.garbage.read(data)
     }
@@ -392,12 +430,20 @@ impl FakePeerRelayReader for FakePeerRelay {
         self.garbage.is_eof()
     }
 
-    fn read_key(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
-        self.key.read(data)
+    fn peek_len_garbage(&self) -> usize {
+        self.garbage.peek_len()
     }
 
-    fn is_eof_key(&self) -> bool {
-        self.key.is_eof()
+    fn read_terminator(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
+        self.terminator.read(data)
+    }
+
+    fn is_eof_terminator(&self) -> bool {
+        self.terminator.is_eof()
+    }
+
+    fn peek_len_terminator(&self) -> usize {
+        self.terminator.peek_len()
     }
 }
 
@@ -544,33 +590,6 @@ impl MitmImpersonatorLeg {
         match &mut self.state {
             Initialized(magic) => {
                 if let Some(client_key) = self.peer.key {
-                    /*
-                    let their_ellswift = ElligatorSwift::from_array(client_key);
-
-                    let (initiator_ellswift, responder_ellswift, secret, party) = match self.role {
-                        Role::Initiator => (
-                            self.point.elligator_swift,
-                            their_ellswift,
-                            self.point.secret_key,
-                            ElligatorSwiftParty::A,
-                        ),
-                        Role::Responder => (
-                            their_ellswift,
-                            self.point.elligator_swift,
-                            self.point.secret_key,
-                            ElligatorSwiftParty::B,
-                        ),
-                    };
-
-                    let session_keys = SessionKeyMaterial::from_ecdh(
-                        initiator_ellswift,
-                        responder_ellswift,
-                        secret,
-                        party,
-                        magic,
-                    )
-                    .map_err(|_| "Error creating the shared key")?;
-                    */
                     let session_keys = generate_session_keys_ecdh(magic.clone(), self.role, &self.point, client_key)?;
 
                     let cipher = CipherSession::new(session_keys.clone(), self.role);
@@ -704,7 +723,7 @@ impl MitmImpersonatorLeg {
             SendingGarbage => {
                 let size = self.relay_in.borrow_mut().read_garbage(buf)?;
 
-                if self.relay_in.borrow().is_eof_garbage() {
+                if self.relay_in.borrow().peek_len_garbage() == 0 && self.relay_in.borrow().is_eof_garbage() {
                     self.server_state = SendingGarbageTerminator;
 
                     return Ok(size + self.write_data(&mut buf[size..])?);
@@ -715,7 +734,7 @@ impl MitmImpersonatorLeg {
             SendingGarbageTerminator => {
                 let limit = min(buf.len(), self.garbage_terminator_to_send.len());
                 let _terminator_buf = &mut buf[..limit];
-                let size = self.relay_in.borrow_mut().read_garbage(_terminator_buf)?;
+                let size = self.relay_in.borrow_mut().read_terminator(_terminator_buf)?;
 
                 // The terminator is replaced by ours. We're not using the original one
                 let data_to_send: Vec<u8> = self.garbage_terminator_to_send.drain(..size).collect();
@@ -1086,5 +1105,48 @@ mod mitmfakeserverbip324_tests {
         let mut sent_garbage = [0u8; 128];
         let size = server.write_data(&mut sent_garbage).expect("Error on write_data");
         assert_eq!(sent_garbage[..size], real_garbage, "The fake server must preserve the garbage sent by the real server");
+    }
+
+    #[test]
+    fn real_server_sends_entire_garbage() {
+        const seed: u64 = 32890322278;
+        const server_key: [u8; NUM_ELLIGATOR_SWIFT_BYTES] = hex!("6a34b0f8757abbd31934ce6375857b06000d1a4528274eaec46c6e11a243366dcb14d23c315b7305fb4bd7c11ddc515785061f2a9402c867f2550a7e8e5496ca");
+        const server_garbage_terminator: [u8; NUM_GARBAGE_TERMINTOR_BYTES] = hex!("7064cc9fe99282b77afbe58925e2cf2b");
+        // Client seed: 992983889292929773;
+        const client_key: [u8; NUM_ELLIGATOR_SWIFT_BYTES] = hex!("61a5de62da81aec5967d511fec1f08f98e9c1108bffaaf304b5b31876bec2cbc2d20736f19f93b3f3fd7b9bbf7d1306da07d13218b90fae8c22276846848ad0c");
+
+        let (mut server, relay_in, _) = get_mitm_fake_server_deterministic_insecurerng(seed);
+        assert_eq!(server.key_to_send, server_key, "The generated secret key is different from the expected one");
+
+        // Real client sends the key
+        server.pass_peer_data(&client_key)
+            .expect("Error on pass_peer_data");
+
+        // Real server sends the key
+        let buf = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+        relay_in.borrow_mut().write_key(&buf).expect("Write must not fail");
+
+        // Real server sends the entire garbage
+        let garbage = [73u8; 84];
+        relay_in.borrow_mut().write_garbage(&garbage).expect("Write must not fail");
+        relay_in.borrow_mut().set_eof_garbage();
+
+        // Real server sends the garbage terminator
+        let garbage_terminator = [75u8; NUM_GARBAGE_TERMINTOR_BYTES];
+        relay_in.borrow_mut().write_terminator(&garbage).expect("Write must not fail");
+        relay_in.borrow_mut().set_eof_terminator();
+
+        // Real client sends the key
+        let mut sent_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+        let size = server.write_data(&mut sent_key).expect("Error on write_data");
+        assert_eq!(size, NUM_ELLIGATOR_SWIFT_BYTES, "Fake server must send the entire key");
+        assert_eq!(sent_key, server_key, "Incorrect server key");
+
+        let expected_len = garbage.len() + garbage_terminator.len();
+        let mut sent_garbage = [0u8; 200];
+        let size = server.write_data(&mut sent_garbage).expect("Error on write_data");
+        assert_eq!(size, expected_len, "Fake server must send the entire garbage");
+        assert_eq!(sent_garbage[..expected_len-NUM_GARBAGE_TERMINTOR_BYTES], garbage[..expected_len-NUM_GARBAGE_TERMINTOR_BYTES], "Incorrect server garbage");
+        assert_eq!(sent_garbage[expected_len-NUM_GARBAGE_TERMINTOR_BYTES..expected_len], server_garbage_terminator, "Incorrect garbage terminator");
     }
 }

@@ -1912,4 +1912,61 @@ mod mitmfakeserverbip324_tests {
             "Fake peer didn't send the expected encrypted payload"
         );
     }
+
+    // Test copied from https://github.com/rust-bitcoin/bip324
+    #[test]
+    fn test_cipher_session() {
+        let alice =
+            SecretKey::from_str("61062ea5071d800bbfd59e2e8b53d47d194b095ae5a4df04936b49772ef0d4d7")
+                .unwrap();
+        let elliswift_alice = ElligatorSwift::from_str("ec0adff257bbfe500c188c80b4fdd640f6b45a482bbc15fc7cef5931deff0aa186f6eb9bba7b85dc4dcc28b28722de1e3d9108b985e2967045668f66098e475b").unwrap();
+        let elliswift_bob = ElligatorSwift::from_str("a4a94dfce69b4a2a0a099313d10f9f7e7d649d60501c9e1d274c300e0d89aafaffffffffffffffffffffffffffffffffffffffffffffffffffffffff8faf88d5").unwrap();
+        let session_keys = SessionKeyMaterial::from_ecdh(
+            elliswift_alice,
+            elliswift_bob,
+            alice,
+            ElligatorSwiftParty::A,
+            DEFAULT_MAGIC,
+        )
+        .unwrap();
+        let mut alice_cipher = CipherSession::new(session_keys.clone(), Role::Initiator);
+        let mut bob_cipher = CipherSession::new(session_keys, Role::Responder);
+        let message = b"Bitcoin rox!".to_vec();
+
+        let mut enc_packet = vec![0u8; OutboundCipher::encryption_buffer_len(message.len())];
+        alice_cipher
+            .outbound()
+            .encrypt(&message, &mut enc_packet, PacketType::Decoy, None)
+            .unwrap();
+
+        let plaintext_len = bob_cipher
+            .inbound()
+            .decrypt_packet_len(enc_packet[0..NUM_LENGTH_BYTES].try_into().unwrap());
+        let mut plaintext_buffer = vec![0u8; InboundCipher::decryption_buffer_len(plaintext_len)];
+        let packet_type = bob_cipher
+            .inbound()
+            .decrypt(&enc_packet[NUM_LENGTH_BYTES..], &mut plaintext_buffer, None)
+            .unwrap();
+        assert_eq!(PacketType::Decoy, packet_type);
+        assert_eq!(message, plaintext_buffer[1..].to_vec()); // Skip header byte
+
+        let message = b"Windows sox!".to_vec();
+        let packet_len = OutboundCipher::encryption_buffer_len(message.len());
+        let mut enc_packet = vec![0u8; packet_len];
+        bob_cipher
+            .outbound()
+            .encrypt(&message, &mut enc_packet, PacketType::Genuine, None)
+            .unwrap();
+
+        let plaintext_len = alice_cipher
+            .inbound()
+            .decrypt_packet_len(enc_packet[0..NUM_LENGTH_BYTES].try_into().unwrap());
+        let mut plaintext_buffer = vec![0u8; InboundCipher::decryption_buffer_len(plaintext_len)];
+        let packet_type = alice_cipher
+            .inbound()
+            .decrypt(&enc_packet[NUM_LENGTH_BYTES..], &mut plaintext_buffer, None)
+            .unwrap();
+        assert_eq!(PacketType::Genuine, packet_type);
+        assert_eq!(message, plaintext_buffer[1..].to_vec()); // Skip header byte
+    }
 }

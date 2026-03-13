@@ -1,5 +1,3 @@
-mod bip324_external_fschacha20poly1305;
-mod bip324_external_lib;
 mod external;
 
 use std::cell::RefCell;
@@ -19,8 +17,8 @@ use secp256k1::{
     rand::CryptoRng,
 };
 
-use crate::bip324_external_fschacha20poly1305::{FSChaCha20Poly1305, FSChaCha20Stream};
-use crate::bip324_external_lib::{
+use crate::external::bip324::fschacha20poly1305::{FSChaCha20Poly1305, FSChaCha20Stream};
+use crate::external::bip324::{
     FillBytes, InboundCipher, OutboundCipher, PacketType, SessionKeyMaterial,
 };
 use crate::external::chacha20_poly1305::ChaCha20Poly1305Stream;
@@ -1079,7 +1077,7 @@ mod mitmfakeserverbip324_tests {
     use secp256k1::rand::RngCore;
     use secp256k1::rand::rngs::mock::StepRng;
 
-    use crate::bip324_external_lib::impl_fill_bytes;
+    use crate::external::bip324::impl_fill_bytes;
 
     macro_rules! test_data {
         ($varname:ident, $name:ident { $($field:ident: $ty:ty = $val:expr),* $(,)? }) => {
@@ -1855,7 +1853,6 @@ mod mitmfakeserverbip324_tests {
         relay_in.borrow_mut().set_eof_garbage();
 
         // Real self sends the garbage terminator
-        let garbage_terminator = [75u8; NUM_GARBAGE_TERMINATOR_BYTES];
         relay_in
             .borrow_mut()
             .write_terminator(&mid_send_garbage_terminator)
@@ -1867,7 +1864,7 @@ mod mitmfakeserverbip324_tests {
 
         // Real self sends decoys
         for _ in 0..in_idx {
-            let mut payload = DECOY_HEADER.to_vec();
+            let payload = DECOY_HEADER.to_vec();
 
             // The packet doesn't have any content
             let packet_len: usize = 0;

@@ -121,6 +121,8 @@
 //! The protocol supports both genuine packets containing application data and decoy
 //! packets with random data for traffic analysis resistance.
 
+pub(crate) mod fschacha20poly1305;
+
 use core::{borrow::Borrow, fmt};
 
 use bitcoin_hashes::{Hkdf, hkdf, sha256};
@@ -129,8 +131,7 @@ use secp256k1::{
     ellswift::{ElligatorSwift, ElligatorSwiftParty},
 };
 
-use crate::bip324_external_fschacha20poly1305 as fschacha20poly1305;
-use crate::bip324_external_fschacha20poly1305::{FSChaCha20, FSChaCha20Poly1305, FSChaCha20Stream};
+use fschacha20poly1305::{FSChaCha20, FSChaCha20Poly1305, FSChaCha20Stream};
 
 /// Value for header byte with the decoy flag flipped to true.
 pub const DECOY_BYTE: u8 = 128;
@@ -782,7 +783,7 @@ macro_rules! impl_fill_bytes {
 }
 
 #[cfg(test)]
-pub(super) use impl_fill_bytes;
+pub(crate) use impl_fill_bytes;
 
 use secp256k1::rand::rngs::{StdRng, ThreadRng};
 impl_fill_bytes!(StdRng);

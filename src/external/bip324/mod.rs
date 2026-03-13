@@ -131,7 +131,7 @@ use secp256k1::{
     ellswift::{ElligatorSwift, ElligatorSwiftParty},
 };
 
-use fschacha20poly1305::{FSChaCha20, FSChaCha20Poly1305, FSChaCha20Stream};
+use fschacha20poly1305::{FSChaCha20Poly1305, FSChaCha20Stream};
 
 /// Value for header byte with the decoy flag flipped to true.
 pub const DECOY_BYTE: u8 = 128;
@@ -388,6 +388,7 @@ impl PacketType {
     }
 
     /// Returns header byte based on the type.
+    #[warn(clippy::wrong_self_convention)]
     pub fn to_byte(&self) -> u8 {
         match self {
             PacketType::Genuine => 0,
@@ -401,9 +402,6 @@ impl PacketType {
 pub struct InboundCipher {
     pub length_cipher: FSChaCha20Stream,
     pub packet_cipher: FSChaCha20Poly1305,
-
-    #[cfg(test)]
-    pub _length_cipher: Option<FSChaCha20>,
 }
 
 impl InboundCipher {
@@ -577,9 +575,6 @@ impl InboundCipher {
 pub struct OutboundCipher {
     pub length_cipher: FSChaCha20Stream,
     pub packet_cipher: FSChaCha20Poly1305,
-
-    #[cfg(test)]
-    pub _length_cipher: Option<FSChaCha20>,
 }
 
 impl OutboundCipher {
@@ -706,14 +701,10 @@ impl CipherSession {
                     inbound: InboundCipher {
                         length_cipher: responder_length_cipher,
                         packet_cipher: responder_packet_cipher,
-                        #[cfg(test)]
-                        _length_cipher: Some(FSChaCha20::new(materials.responder_length_key)),
                     },
                     outbound: OutboundCipher {
                         length_cipher: initiator_length_cipher,
                         packet_cipher: initiator_packet_cipher,
-                        #[cfg(test)]
-                        _length_cipher: Some(FSChaCha20::new(materials.initiator_length_key)),
                     },
                 }
             }
@@ -729,14 +720,10 @@ impl CipherSession {
                     inbound: InboundCipher {
                         length_cipher: initiator_length_cipher,
                         packet_cipher: initiator_packet_cipher,
-                        #[cfg(test)]
-                        _length_cipher: Some(FSChaCha20::new(materials.initiator_length_key)),
                     },
                     outbound: OutboundCipher {
                         length_cipher: responder_length_cipher,
                         packet_cipher: responder_packet_cipher,
-                        #[cfg(test)]
-                        _length_cipher: Some(FSChaCha20::new(materials.responder_length_key)),
                     },
                 }
             }
@@ -789,7 +776,7 @@ use secp256k1::rand::rngs::{StdRng, ThreadRng};
 impl_fill_bytes!(StdRng);
 impl_fill_bytes!(ThreadRng);
 
-#[cfg(all(test))]
+#[cfg(test)]
 mod tests {
 
     use super::*;
@@ -800,6 +787,7 @@ mod tests {
     use hex::prelude::*;
     use std::vec;
     use std::vec::Vec;
+    use fschacha20poly1305::FSChaCha20;
 
     const MAGIC: [u8; 4] = [0xF9, 0xBE, 0xB4, 0xD9];
 

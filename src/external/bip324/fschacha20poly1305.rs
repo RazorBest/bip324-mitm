@@ -93,7 +93,7 @@ impl FSChaCha20Poly1305 {
         if self.stream_mode {
             panic!("Can't rekey while in stream mode");
         }
-        if (self.message_counter + 1) % REKEY_INTERVAL == 0 {
+        if (self.message_counter + 1).is_multiple_of(REKEY_INTERVAL) {
             let mut rekey_nonce = [0u8; 12];
             rekey_nonce[0..4].copy_from_slice(&REKEY_INITIAL_NONCE);
             rekey_nonce[4..].copy_from_slice(&self.nonce()[4..]);
@@ -206,7 +206,7 @@ impl FSChaCha20 {
         cipher.seek(self.block_counter);
         cipher.apply_keystream(chunk);
         self.block_counter += LENGTH_BYTES;
-        if (self.chunk_counter + 1) % REKEY_INTERVAL as u32 == 0 {
+        if (self.chunk_counter + 1).is_multiple_of(REKEY_INTERVAL as u32) {
             let mut key_buffer = [0u8; 32];
             cipher.seek(self.block_counter);
             cipher.apply_keystream(&mut key_buffer);
@@ -241,7 +241,7 @@ impl FSChaCha20Stream {
 
     fn rekey(&mut self) {
         const STREAM_SIZE: u32 = REKEY_INTERVAL as u32 * LENGTH_BYTES;
-        if (self.byte_counter as u32) < STREAM_SIZE {
+        if self.byte_counter < STREAM_SIZE {
             return;
         }
 

@@ -100,14 +100,10 @@ impl CipherSession {
                     inbound: InboundCipher {
                         length_cipher: responder_length_cipher,
                         packet_cipher: responder_packet_cipher,
-                        #[cfg(test)]
-                        _length_cipher: None,
                     },
                     outbound: OutboundCipher {
                         length_cipher: initiator_length_cipher,
                         packet_cipher: initiator_packet_cipher,
-                        #[cfg(test)]
-                        _length_cipher: None,
                     },
                 }
             }
@@ -123,14 +119,10 @@ impl CipherSession {
                     inbound: InboundCipher {
                         length_cipher: initiator_length_cipher,
                         packet_cipher: initiator_packet_cipher,
-                        #[cfg(test)]
-                        _length_cipher: None,
                     },
                     outbound: OutboundCipher {
                         length_cipher: responder_length_cipher,
                         packet_cipher: responder_packet_cipher,
-                        #[cfg(test)]
-                        _length_cipher: None,
                     },
                 }
             }
@@ -327,7 +319,7 @@ impl PartialPacket {
             return 0;
         };
 
-        return read_vec_dequeue_u8(length_bytes, buf);
+        read_vec_dequeue_u8(length_bytes, buf)
     }
 
     fn read_data_bytes(&mut self, buf: &mut [u8]) -> usize {
@@ -335,7 +327,7 @@ impl PartialPacket {
             return 0;
         };
 
-        return read_vec_dequeue_u8(data, buf);
+        read_vec_dequeue_u8(data, buf)
     }
 
     fn read_tag_bytes(&mut self, buf: &mut [u8]) -> usize {
@@ -343,7 +335,7 @@ impl PartialPacket {
             return 0;
         };
 
-        return read_vec_dequeue_u8(tag, buf);
+        read_vec_dequeue_u8(tag, buf)
     }
 
     fn set_aad(&mut self, data: &[u8]) {
@@ -356,10 +348,7 @@ impl PartialPacket {
     }
 
     fn read_aad(&mut self) -> Option<Vec<u8>> {
-        match self.aad.take() {
-            Some(aad) => Some(Vec::<_>::from(aad)),
-            None => None,
-        }
+        self.aad.take().map(Vec::<_>::from)
     }
 
     fn is_empty(&self) -> bool {
@@ -379,7 +368,7 @@ struct FakePeerRelay {
 
 impl FakePeerRelay {
     fn remove_first_packet_if_consumed(&mut self) {
-        if self.packets.len() == 0 {
+        if self.packets.is_empty() {
             return;
         }
         let packet = &self.packets[0];
@@ -447,11 +436,11 @@ impl FakePeerRelayWriter for FakePeerRelay {
     }
 
     fn write_length_bytes(&mut self, data: &[u8]) {
-        if data.len() == 0 {
+        if data.is_empty() {
             return;
         }
 
-        if self.packets.len() == 0
+        if self.packets.is_empty()
             || self.packets[self.packets.len() - 1].data.is_some()
             || self.packets[self.packets.len() - 1].tag.is_some()
         {
@@ -470,11 +459,11 @@ impl FakePeerRelayWriter for FakePeerRelay {
     }
 
     fn write_packet_bytes(&mut self, data: &[u8]) {
-        if data.len() == 0 {
+        if data.is_empty() {
             return;
         }
 
-        if self.packets.len() == 0 || self.packets[self.packets.len() - 1].tag.is_some() {
+        if self.packets.is_empty() || self.packets[self.packets.len() - 1].tag.is_some() {
             self.packets.push(PartialPacket::new());
         }
 
@@ -490,11 +479,11 @@ impl FakePeerRelayWriter for FakePeerRelay {
     }
 
     fn write_tag_bytes(&mut self, data: &[u8]) {
-        if data.len() == 0 {
+        if data.is_empty() {
             return;
         }
 
-        if self.packets.len() == 0 {
+        if self.packets.is_empty() {
             self.packets.push(PartialPacket::new());
         }
 
@@ -510,7 +499,7 @@ impl FakePeerRelayWriter for FakePeerRelay {
     }
 
     fn set_aad(&mut self, aad: &[u8]) {
-        if self.packets.len() == 0 {
+        if self.packets.is_empty() {
             self.packets.push(PartialPacket::new());
         }
 
@@ -578,7 +567,7 @@ impl FakePeerRelayReader for FakePeerRelay {
     }
 
     fn read_length_bytes(&mut self, data: &mut [u8]) -> usize {
-        if self.packets.len() == 0 {
+        if self.packets.is_empty() {
             return 0;
         }
 
@@ -587,11 +576,11 @@ impl FakePeerRelayReader for FakePeerRelay {
 
         self.remove_first_packet_if_consumed();
 
-        return size;
+        size
     }
 
     fn read_data_bytes(&mut self, data: &mut [u8]) -> usize {
-        if self.packets.len() == 0 {
+        if self.packets.is_empty() {
             return 0;
         }
 
@@ -600,11 +589,11 @@ impl FakePeerRelayReader for FakePeerRelay {
 
         self.remove_first_packet_if_consumed();
 
-        return size;
+        size
     }
 
     fn read_tag_bytes(&mut self, data: &mut [u8]) -> usize {
-        if self.packets.len() == 0 {
+        if self.packets.is_empty() {
             return 0;
         }
 
@@ -613,11 +602,11 @@ impl FakePeerRelayReader for FakePeerRelay {
 
         self.remove_first_packet_if_consumed();
 
-        return size;
+        size
     }
 
     fn read_aad(&mut self) -> Option<Vec<u8>> {
-        if self.packets.len() == 0 {
+        if self.packets.is_empty() {
             return None;
         }
 
@@ -631,7 +620,7 @@ impl FakePeerRelayReader for FakePeerRelay {
             self.packets.splice(..1, []);
         }
 
-        return aad;
+        aad
     }
 }
 
@@ -706,11 +695,10 @@ fn generate_session_keys_ecdh(
         ),
     };
 
-    let session_keys =
-        SessionKeyMaterial::from_ecdh(initiator_ellswift, responder_ellswift, secret, party, magic)
-            .map_err(|_| "Error creating the shared key".to_string());
+    
 
-    session_keys
+    SessionKeyMaterial::from_ecdh(initiator_ellswift, responder_ellswift, secret, party, magic)
+            .map_err(|_| "Error creating the shared key".to_string())
 }
 
 struct MitmImpersonatorLeg {
@@ -784,7 +772,7 @@ impl MitmImpersonatorLeg {
             state @ Initialized(magic, role) => {
                 if let Some(client_key) = self.peer.key {
                     let session_keys =
-                        generate_session_keys_ecdh(magic.clone(), role, &self.point, client_key)?;
+                        generate_session_keys_ecdh(magic, role, &self.point, client_key)?;
 
                     let (garbage_terminator, other_garbage_terminator) = match role {
                         Role::Initiator => (
@@ -816,7 +804,7 @@ impl MitmImpersonatorLeg {
                     self.peer.undo_consume(rest.to_vec());
                     self.relay_out
                         .borrow_mut()
-                        .write_garbage(&garbage)
+                        .write_garbage(garbage)
                         .map_err(|_| "Error writing garbage to relay")?;
 
                     let aad = garbage.to_vec();
@@ -948,7 +936,7 @@ impl MitmImpersonatorLeg {
                 let data_to_send: Vec<u8> = self.key_to_send.drain(..size).collect();
                 buf[..size].copy_from_slice(&data_to_send);
 
-                if self.key_to_send.len() == 0 {
+                if self.key_to_send.is_empty() {
                     (SendingGarbage, size, true)
                 } else {
                     (state, size, false)
@@ -977,7 +965,7 @@ impl MitmImpersonatorLeg {
                 let data_to_send: Vec<u8> = self.garbage_terminator_to_send.drain(..size).collect();
                 buf[..size].copy_from_slice(&data_to_send);
 
-                if self.garbage_terminator_to_send.len() == 0 {
+                if self.garbage_terminator_to_send.is_empty() {
                     (SendingLength(LENGTH_BYTES_SIZE, vec![]), size, true)
                 } else {
                     (state, size, false)
@@ -1048,7 +1036,7 @@ impl MitmImpersonatorLeg {
                 // Overwrite with our own tag
                 buf[..size].copy_from_slice(&tag.drain(0..size).collect::<Vec<_>>());
 
-                if tag.len() == 0 {
+                if tag.is_empty() {
                     (SendingLength(LENGTH_BYTES_SIZE, vec![]), size, true)
                 } else {
                     (SendingTag(tag), size, false)

@@ -1,10 +1,10 @@
 mod external;
+mod fmt_utils;
 
 use std::cell::RefCell;
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::error::Error;
-use std::fmt;
 use std::io::{Read, Write};
 use std::mem;
 use std::rc::Rc;
@@ -65,24 +65,6 @@ pub struct CipherSession {
     inbound: InboundCipher,
     /// Encrypts outbound packets.
     outbound: OutboundCipher,
-}
-
-impl fmt::Debug for InboundCipher {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<InboundCipher>")
-    }
-}
-
-impl fmt::Debug for OutboundCipher {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<OutboundCipher>")
-    }
-}
-
-impl fmt::Debug for ChaCha20Poly1305Stream {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<ChaCha20Poly1305Stream>")
-    }
 }
 
 impl CipherSession {

@@ -388,7 +388,7 @@ impl PacketType {
     }
 
     /// Returns header byte based on the type.
-    #[warn(clippy::wrong_self_convention)]
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_byte(&self) -> u8 {
         match self {
             PacketType::Genuine => 0,
@@ -787,7 +787,6 @@ mod tests {
     use hex::prelude::*;
     use std::vec;
     use std::vec::Vec;
-    use fschacha20poly1305::FSChaCha20;
 
     const MAGIC: [u8; 4] = [0xF9, 0xBE, 0xB4, 0xD9];
 

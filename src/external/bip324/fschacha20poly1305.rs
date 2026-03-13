@@ -12,7 +12,7 @@
 //! Tests comparing the current implementation against a version with
 //! pre-allocated buffers to reduce stack allocations showed decreased performance.
 //!
-//! * **FSChaCha20 operations** +3.7% overhead with pre-allocated buffers.
+//! (OUTDATED) * **FSChaCha20 operations** +3.7% overhead with pre-allocated buffers.
 //! * **FSChaCha20Poly1305 operations** +1.0% overhead with pre-allocated buffers.  
 
 use chacha20_poly1305::{ChaCha20Poly1305, Key, Nonce, chacha20::ChaCha20};
@@ -167,53 +167,6 @@ impl FSChaCha20Poly1305 {
         self.rekey(aad);
 
         Ok(())
-    }
-}
-
-/// A wrapper over ChaCha20 (unauthenticated) stream cipher which handles automatically changing
-/// nonces and re-keying, providing forward secrecy within the session.
-///
-/// FSChaCha20 is used for lengths in BIP-324. Should be noted that the lengths are still
-/// implicitly authenticated by the message packets.
-#[derive(Clone)]
-pub struct FSChaCha20 {
-    key: Key,
-    block_counter: u32,
-    chunk_counter: u32,
-
-    #[cfg(test)]
-    pub key_bytes: [u8; 32],
-}
-
-impl FSChaCha20 {
-    pub fn new(key: [u8; 32]) -> Self {
-        FSChaCha20 {
-            key: Key::new(key),
-            block_counter: 0,
-            chunk_counter: 0,
-
-            #[cfg(test)]
-            key_bytes: key.clone(),
-        }
-    }
-
-    /// Encrypt or decrypt the 3-byte length encodings.
-    pub fn crypt(&mut self, chunk: &mut [u8; LENGTH_BYTES as usize]) {
-        let counter_mod = (self.chunk_counter / REKEY_INTERVAL as u32).to_le_bytes();
-        let mut nonce = [0u8; 12];
-        nonce[4..8].copy_from_slice(&counter_mod);
-        let mut cipher = ChaCha20::new(self.key, Nonce::new(nonce), 0);
-        cipher.seek(self.block_counter);
-        cipher.apply_keystream(chunk);
-        self.block_counter += LENGTH_BYTES;
-        if (self.chunk_counter + 1).is_multiple_of(REKEY_INTERVAL as u32) {
-            let mut key_buffer = [0u8; 32];
-            cipher.seek(self.block_counter);
-            cipher.apply_keystream(&mut key_buffer);
-            self.block_counter = 0;
-            self.key = Key::new(key_buffer);
-        }
-        self.chunk_counter += 1;
     }
 }
 

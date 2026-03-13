@@ -677,10 +677,8 @@ fn generate_session_keys_ecdh(
         ),
     };
 
-    
-
     SessionKeyMaterial::from_ecdh(initiator_ellswift, responder_ellswift, secret, party, magic)
-            .map_err(|_| "Error creating the shared key".to_string())
+        .map_err(|_| "Error creating the shared key".to_string())
 }
 
 struct MitmImpersonatorLeg {

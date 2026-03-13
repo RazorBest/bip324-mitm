@@ -130,7 +130,7 @@ use secp256k1::{
 };
 
 use crate::bip324_external_fschacha20poly1305 as fschacha20poly1305;
-use crate::bip324_external_fschacha20poly1305::{FSChaCha20, FSChaCha20Poly1305};
+use crate::bip324_external_fschacha20poly1305::{FSChaCha20, FSChaCha20Poly1305, FSChaCha20Stream};
 
 /// Value for header byte with the decoy flag flipped to true.
 pub const DECOY_BYTE: u8 = 128;
@@ -398,8 +398,11 @@ impl PacketType {
 /// Decrypts packets received from the remote peer.
 #[derive(Clone)]
 pub struct InboundCipher {
-    pub length_cipher: FSChaCha20,
+    pub length_cipher: FSChaCha20Stream,
     pub packet_cipher: FSChaCha20Poly1305,
+
+    #[cfg(test)]
+    pub _length_cipher: Option<FSChaCha20>,
 }
 
 impl InboundCipher {
@@ -416,7 +419,7 @@ impl InboundCipher {
     ///
     /// The length of the rest of the packet.
     pub fn decrypt_packet_len(&mut self, mut len_bytes: [u8; NUM_LENGTH_BYTES]) -> usize {
-        self.length_cipher.crypt(&mut len_bytes);
+        self.length_cipher.apply_keystream(&mut len_bytes);
 
         u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], 0]) as usize
             + NUM_HEADER_BYTES
@@ -571,14 +574,21 @@ impl InboundCipher {
 /// Encrypts packets to send to the remote peer.
 #[derive(Clone)]
 pub struct OutboundCipher {
-    pub length_cipher: FSChaCha20,
+    pub length_cipher: FSChaCha20Stream,
     pub packet_cipher: FSChaCha20Poly1305,
+
+    #[cfg(test)]
+    pub _length_cipher: Option<FSChaCha20>,
 }
 
 impl OutboundCipher {
     /// Calculate the required encryption buffer length for given plaintext length.
     pub const fn encryption_buffer_len(plaintext_len: usize) -> usize {
         plaintext_len + NUM_PACKET_OVERHEAD_BYTES
+    }
+
+    pub fn encrypt_len_part_inplace(&mut self, content_len: &mut [u8]) {
+        self.length_cipher.apply_keystream(content_len);
     }
 
     /// Encrypt plaintext into a packet for transmission.
@@ -628,7 +638,7 @@ impl OutboundCipher {
         // Encrypt plaintext length.
         let mut content_len = [0u8; 3];
         content_len.copy_from_slice(&(plaintext_length as u32).to_le_bytes()[0..NUM_LENGTH_BYTES]);
-        self.length_cipher.crypt(&mut content_len);
+        self.length_cipher.apply_keystream(&mut content_len);
 
         // Copy over encrypted length and the tag to the final packet (plaintext already encrypted).
         ciphertext_buffer[0..NUM_LENGTH_BYTES].copy_from_slice(&content_len);
@@ -684,8 +694,8 @@ impl CipherSession {
     pub(crate) fn new(materials: SessionKeyMaterial, role: Role) -> Self {
         match role {
             Role::Initiator => {
-                let initiator_length_cipher = FSChaCha20::new(materials.initiator_length_key);
-                let responder_length_cipher = FSChaCha20::new(materials.responder_length_key);
+                let initiator_length_cipher = FSChaCha20Stream::new(materials.initiator_length_key);
+                let responder_length_cipher = FSChaCha20Stream::new(materials.responder_length_key);
                 let initiator_packet_cipher =
                     FSChaCha20Poly1305::new(materials.initiator_packet_key);
                 let responder_packet_cipher =
@@ -695,16 +705,20 @@ impl CipherSession {
                     inbound: InboundCipher {
                         length_cipher: responder_length_cipher,
                         packet_cipher: responder_packet_cipher,
+                        #[cfg(test)]
+                        _length_cipher: Some(FSChaCha20::new(materials.responder_length_key)),
                     },
                     outbound: OutboundCipher {
                         length_cipher: initiator_length_cipher,
                         packet_cipher: initiator_packet_cipher,
+                        #[cfg(test)]
+                        _length_cipher: Some(FSChaCha20::new(materials.initiator_length_key)),
                     },
                 }
             }
             Role::Responder => {
-                let responder_length_cipher = FSChaCha20::new(materials.responder_length_key);
-                let initiator_length_cipher = FSChaCha20::new(materials.initiator_length_key);
+                let responder_length_cipher = FSChaCha20Stream::new(materials.responder_length_key);
+                let initiator_length_cipher = FSChaCha20Stream::new(materials.initiator_length_key);
                 let responder_packet_cipher =
                     FSChaCha20Poly1305::new(materials.responder_packet_key);
                 let initiator_packet_cipher =
@@ -714,10 +728,14 @@ impl CipherSession {
                     inbound: InboundCipher {
                         length_cipher: initiator_length_cipher,
                         packet_cipher: initiator_packet_cipher,
+                        #[cfg(test)]
+                        _length_cipher: Some(FSChaCha20::new(materials.initiator_length_key)),
                     },
                     outbound: OutboundCipher {
                         length_cipher: responder_length_cipher,
                         packet_cipher: responder_packet_cipher,
+                        #[cfg(test)]
+                        _length_cipher: Some(FSChaCha20::new(materials.responder_length_key)),
                     },
                 }
             }
@@ -762,6 +780,8 @@ macro_rules! impl_fill_bytes {
         }
     };
 }
+
+#[cfg(test)]
 pub(super) use impl_fill_bytes;
 
 use secp256k1::rand::rngs::{StdRng, ThreadRng};

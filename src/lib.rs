@@ -1027,7 +1027,7 @@ impl MitmImpersonatorLeg {
 #[cfg(test)]
 mod mitmfakeserverbip324_tests {
     use super::*;
-
+    use std::str::FromStr;
     use hex_literal::hex;
     use secp256k1::rand::RngCore;
     use secp256k1::rand::rngs::mock::StepRng;
@@ -1134,7 +1134,6 @@ mod mitmfakeserverbip324_tests {
 
     const DEFAULT_HEADER: [u8; 1] = hex!("00");
     const DECOY_HEADER: [u8; 1] = hex!("80");
-    const VERSION_PACKET: [u8; 1] = hex!("00");
 
     struct TestRng(StepRng);
     impl_fill_bytes!(TestRng);
@@ -1218,7 +1217,7 @@ mod mitmfakeserverbip324_tests {
         )
         .expect("Error creating the MitmImpersonatorLeg");
 
-        return (server, relay_in, relay_out);
+        (server, relay_in, relay_out)
     }
 
     fn get_mitm_fake_server_from_secret_key(
@@ -1880,8 +1879,8 @@ mod mitmfakeserverbip324_tests {
         }
 
         for _ in 0..in_idx {
-            // Read decoy packet. This includes: packet length, header, version contents and aead.
-            let expected_len = LENGTH_BYTES_SIZE + HEADER_LEN + 0 + TAG_LEN;
+            // Read decoy packet. This includes: packet length (0), header, version contents and aead.
+            let expected_len = LENGTH_BYTES_SIZE + HEADER_LEN + TAG_LEN;
             let mut buf = vec![0u8; expected_len];
             let size = impersonator
                 .write_data(&mut buf)

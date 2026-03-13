@@ -71,7 +71,7 @@ impl FSChaCha20Poly1305 {
             stream_mode: false,
 
             #[cfg(test)]
-            key_bytes: key.clone(),
+            key_bytes: key,
         }
     }
 
@@ -188,7 +188,7 @@ impl FSChaCha20Stream {
             total_byte_counter: 0,
 
             #[cfg(test)]
-            key_bytes: key.clone(),
+            key_bytes: key,
         }
     }
 

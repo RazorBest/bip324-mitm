@@ -68,46 +68,33 @@ pub struct CipherSession {
 }
 
 impl CipherSession {
-    pub(crate) fn new(materials: SessionKeyMaterial, role: Role) -> Self {
-        match role {
-            Role::Initiator => {
-                let initiator_length_cipher = FSChaCha20Stream::new(materials.initiator_length_key);
-                let responder_length_cipher = FSChaCha20Stream::new(materials.responder_length_key);
-                let initiator_packet_cipher =
-                    FSChaCha20Poly1305::new(materials.initiator_packet_key);
-                let responder_packet_cipher =
-                    FSChaCha20Poly1305::new(materials.responder_packet_key);
-                CipherSession {
-                    id: materials.session_id,
-                    inbound: InboundCipher {
-                        length_cipher: responder_length_cipher,
-                        packet_cipher: responder_packet_cipher,
-                    },
-                    outbound: OutboundCipher {
-                        length_cipher: initiator_length_cipher,
-                        packet_cipher: initiator_packet_cipher,
-                    },
-                }
-            }
-            Role::Responder => {
-                let responder_length_cipher = FSChaCha20Stream::new(materials.responder_length_key);
-                let initiator_length_cipher = FSChaCha20Stream::new(materials.initiator_length_key);
-                let responder_packet_cipher =
-                    FSChaCha20Poly1305::new(materials.responder_packet_key);
-                let initiator_packet_cipher =
-                    FSChaCha20Poly1305::new(materials.initiator_packet_key);
-                CipherSession {
-                    id: materials.session_id,
-                    inbound: InboundCipher {
-                        length_cipher: initiator_length_cipher,
-                        packet_cipher: initiator_packet_cipher,
-                    },
-                    outbound: OutboundCipher {
-                        length_cipher: responder_length_cipher,
-                        packet_cipher: responder_packet_cipher,
-                    },
-                }
-            }
+    pub(crate) fn new(mut materials: SessionKeyMaterial, role: Role) -> Self {
+        if role == Role::Responder {
+            std::mem::swap(
+                &mut materials.initiator_length_key,
+                &mut materials.responder_length_key,
+            );
+            std::mem::swap(
+                &mut materials.initiator_packet_key,
+                &mut materials.responder_packet_key,
+            );
+        }
+
+        let outbound_length_cipher = FSChaCha20Stream::new(materials.initiator_length_key);
+        let inbound_length_cipher = FSChaCha20Stream::new(materials.responder_length_key);
+        let outbound_packet_cipher = FSChaCha20Poly1305::new(materials.initiator_packet_key);
+        let inbound_packet_cipher = FSChaCha20Poly1305::new(materials.responder_packet_key);
+
+        CipherSession {
+            id: materials.session_id,
+            inbound: InboundCipher {
+                length_cipher: inbound_length_cipher,
+                packet_cipher: inbound_packet_cipher,
+            },
+            outbound: OutboundCipher {
+                length_cipher: outbound_length_cipher,
+                packet_cipher: outbound_packet_cipher,
+            },
         }
     }
 

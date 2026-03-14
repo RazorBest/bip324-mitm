@@ -1,6 +1,6 @@
-mod external;
+pub mod external;
 mod fmt_utils;
-mod protocol;
+pub mod protocol;
 
 use std::cell::RefCell;
 use std::cmp;
@@ -19,7 +19,7 @@ use secp256k1::{
 
 use crate::external::bip324::{FillBytes, PacketType, SessionKeyMaterial};
 use crate::external::chacha20_poly1305::ChaCha20Poly1305Stream;
-use crate::protocol::{CipherSession, EcdhPoint, ProtocolBuffer};
+use crate::protocol::{CipherSession, EcdhPoint, PartialPacket, ProtocolBuffer};
 
 // Number of bytes in elligator swift key.
 const NUM_ELLIGATOR_SWIFT_BYTES: usize = 64;
@@ -63,77 +63,6 @@ enum HandshakeBIP324State {
 impl HandshakeBIP324State {
     fn take(&mut self) -> Self {
         mem::replace(self, Self::Invalid)
-    }
-}
-
-fn read_vec_dequeue_u8(stream: &mut VecDeque<u8>, buf: &mut [u8]) -> usize {
-    let limit = cmp::min(buf.len(), stream.len());
-
-    let data: Vec<_> = stream.drain(..limit).collect();
-    buf[..limit].copy_from_slice(&data);
-
-    limit
-}
-
-struct PartialPacket {
-    length_bytes: Option<VecDeque<u8>>,
-    data: Option<VecDeque<u8>>,
-    tag: Option<VecDeque<u8>>,
-    aad: Option<VecDeque<u8>>,
-}
-
-impl PartialPacket {
-    fn new() -> Self {
-        Self {
-            length_bytes: None,
-            data: None,
-            tag: None,
-            aad: None,
-        }
-    }
-
-    fn read_length_bytes(&mut self, buf: &mut [u8]) -> usize {
-        let Some(length_bytes) = &mut self.length_bytes else {
-            return 0;
-        };
-
-        read_vec_dequeue_u8(length_bytes, buf)
-    }
-
-    fn read_data_bytes(&mut self, buf: &mut [u8]) -> usize {
-        let Some(data) = &mut self.data else {
-            return 0;
-        };
-
-        read_vec_dequeue_u8(data, buf)
-    }
-
-    fn read_tag_bytes(&mut self, buf: &mut [u8]) -> usize {
-        let Some(tag) = &mut self.tag else {
-            return 0;
-        };
-
-        read_vec_dequeue_u8(tag, buf)
-    }
-
-    fn set_aad(&mut self, data: &[u8]) {
-        if self.aad.is_some() {
-            panic!("AAD can only be set once");
-        }
-        let mut aad = VecDeque::new();
-        aad.extend(data);
-        self.aad = Some(aad);
-    }
-
-    fn read_aad(&mut self) -> Option<Vec<u8>> {
-        self.aad.take().map(Vec::<_>::from)
-    }
-
-    fn is_empty(&self) -> bool {
-        (self.length_bytes.is_none() || self.length_bytes.as_ref().unwrap().len() == 0)
-            && (self.data.is_none() || self.data.as_ref().unwrap().len() == 0)
-            && (self.aad.is_none() || self.aad.as_ref().unwrap().len() == 0)
-            && (self.tag.is_none() || self.tag.as_ref().unwrap().len() == 0)
     }
 }
 
@@ -480,7 +409,7 @@ fn generate_session_keys_ecdh(
         .map_err(|_| "Error creating the shared key".to_string())
 }
 
-struct MitmImpersonatorLeg {
+pub struct MitmImpersonatorLeg {
     state: HandshakeBIP324State,
     sending_state: RelayPeerState,
 
@@ -544,7 +473,7 @@ impl MitmImpersonatorLeg {
     pub fn pass_peer_data(&mut self, data: &[u8]) -> Result<(), String> {
         use HandshakeBIP324State::*;
 
-        self.peer.write(data).unwrap();
+        self.peer.write_all(data).unwrap();
 
         let curr_state = self.state.take();
         let (new_state, incomplete) = match curr_state {
@@ -577,7 +506,7 @@ impl MitmImpersonatorLeg {
                     (state, false)
                 }
             }
-            state @ ReceivedKey(other_garbage_terminator) => {
+            ReceivedKey(other_garbage_terminator) => {
                 let buf = self.peer.buf_ref();
 
                 if let Some((garbage, _rest)) = find_garbage(buf, other_garbage_terminator) {

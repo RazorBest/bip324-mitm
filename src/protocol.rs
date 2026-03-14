@@ -110,12 +110,6 @@ impl ProtocolBuffer {
         }
     }
 
-    /*
-    pub fn write(&mut self, data: &[u8]) {
-        self.buf.extend(data);
-    }
-    */
-
     pub fn try_consume(&mut self, amount: usize) -> Option<Vec<u8>> {
         if amount > self.buf.len() {
             return None;
@@ -128,7 +122,7 @@ impl ProtocolBuffer {
         self.buf.drain(..).collect()
     }
 
-    pub fn buf_ref<'a>(&'a mut self) -> &'a [u8] {
+    pub fn buf_ref(&mut self) -> &[u8] {
         self.buf.make_contiguous()
     }
 
@@ -142,6 +136,12 @@ impl ProtocolBuffer {
 
     pub fn peek_len(&self) -> usize {
         self.buf.len()
+    }
+}
+
+impl Default for ProtocolBuffer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -167,5 +167,73 @@ impl Write for ProtocolBuffer {
     /// Doesn't actually flush because there's no buffering
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+pub struct PartialPacket {
+    pub length_bytes: Option<VecDeque<u8>>,
+    pub data: Option<VecDeque<u8>>,
+    pub tag: Option<VecDeque<u8>>,
+    pub aad: Option<VecDeque<u8>>,
+}
+
+impl PartialPacket {
+    pub fn new() -> Self {
+        Self {
+            length_bytes: None,
+            data: None,
+            tag: None,
+            aad: None,
+        }
+    }
+
+    pub fn read_length_bytes(&mut self, buf: &mut [u8]) -> usize {
+        let Some(length_bytes) = &mut self.length_bytes else {
+            return 0;
+        };
+
+        read_vec_dequeue_u8(length_bytes, buf)
+    }
+
+    pub fn read_data_bytes(&mut self, buf: &mut [u8]) -> usize {
+        let Some(data) = &mut self.data else {
+            return 0;
+        };
+
+        read_vec_dequeue_u8(data, buf)
+    }
+
+    pub fn read_tag_bytes(&mut self, buf: &mut [u8]) -> usize {
+        let Some(tag) = &mut self.tag else {
+            return 0;
+        };
+
+        read_vec_dequeue_u8(tag, buf)
+    }
+
+    pub fn set_aad(&mut self, data: &[u8]) {
+        if self.aad.is_some() {
+            panic!("AAD can only be set once");
+        }
+        let mut aad = VecDeque::new();
+        aad.extend(data);
+        self.aad = Some(aad);
+    }
+
+    pub fn read_aad(&mut self) -> Option<Vec<u8>> {
+        self.aad.take().map(Vec::<_>::from)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        (self.length_bytes.is_none() || self.length_bytes.as_ref().unwrap().len() == 0)
+            && (self.data.is_none() || self.data.as_ref().unwrap().len() == 0)
+            && (self.aad.is_none() || self.aad.as_ref().unwrap().len() == 0)
+            && (self.tag.is_none() || self.tag.as_ref().unwrap().len() == 0)
+    }
+}
+
+impl Default for PartialPacket {
+    fn default() -> Self {
+        Self::new()
     }
 }

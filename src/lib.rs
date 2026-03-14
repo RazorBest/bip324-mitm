@@ -1,5 +1,6 @@
 mod external;
 mod fmt_utils;
+mod protocol;
 
 use std::cell::RefCell;
 use std::cmp::min;
@@ -9,8 +10,7 @@ use std::io::{Read, Write};
 use std::mem;
 use std::rc::Rc;
 
-use bip324::NUM_LENGTH_BYTES;
-use bip324::Role;
+use bip324::{NUM_LENGTH_BYTES, Role};
 use secp256k1::{
     PublicKey, Secp256k1, SecretKey,
     ellswift::{ElligatorSwift, ElligatorSwiftParty},
@@ -22,6 +22,7 @@ use crate::external::bip324::{
     FillBytes, InboundCipher, OutboundCipher, PacketType, SessionKeyMaterial,
 };
 use crate::external::chacha20_poly1305::ChaCha20Poly1305Stream;
+use crate::protocol::{CipherSession, EcdhPoint};
 
 // Number of bytes in elligator swift key.
 const NUM_ELLIGATOR_SWIFT_BYTES: usize = 64;
@@ -39,6 +40,8 @@ const LENGTH_BYTES_SIZE: usize = 3;
 type GarbageType = Vec<u8>;
 type GarbageTerminatorType = [u8; NUM_GARBAGE_TERMINATOR_BYTES];
 type MagicType = [u8; 4];
+type AADType = Vec<u8>;
+type TagType = Vec<u8>;
 
 /// A wrapper over Err(std::io::Error(..))
 #[allow(non_snake_case)]
@@ -49,83 +52,13 @@ where
     Err(std::io::Error::new(kind, error))
 }
 
-/// A point on the curve used to complete the handshake.
-#[derive(Clone)]
-pub struct EcdhPoint {
-    secret_key: SecretKey,
-    elligator_swift: ElligatorSwift,
-}
-
-/// Manages cipher state for a BIP-324 encrypted connection.
-#[derive(Debug, Clone)]
-pub struct CipherSession {
-    /// A unique identifier for the communication session.
-    id: [u8; 32],
-    /// Decrypts inbound packets.
-    inbound: InboundCipher,
-    /// Encrypts outbound packets.
-    outbound: OutboundCipher,
-}
-
-impl CipherSession {
-    pub(crate) fn new(mut materials: SessionKeyMaterial, role: Role) -> Self {
-        if role == Role::Responder {
-            std::mem::swap(
-                &mut materials.initiator_length_key,
-                &mut materials.responder_length_key,
-            );
-            std::mem::swap(
-                &mut materials.initiator_packet_key,
-                &mut materials.responder_packet_key,
-            );
-        }
-
-        let outbound_length_cipher = FSChaCha20Stream::new(materials.initiator_length_key);
-        let inbound_length_cipher = FSChaCha20Stream::new(materials.responder_length_key);
-        let outbound_packet_cipher = FSChaCha20Poly1305::new(materials.initiator_packet_key);
-        let inbound_packet_cipher = FSChaCha20Poly1305::new(materials.responder_packet_key);
-
-        CipherSession {
-            id: materials.session_id,
-            inbound: InboundCipher {
-                length_cipher: inbound_length_cipher,
-                packet_cipher: inbound_packet_cipher,
-            },
-            outbound: OutboundCipher {
-                length_cipher: outbound_length_cipher,
-                packet_cipher: outbound_packet_cipher,
-            },
-        }
-    }
-
-    /// Unique session ID.
-    pub fn id(&self) -> &[u8; 32] {
-        &self.id
-    }
-
-    /// Get a mutable reference to the inbound cipher for decryption operations.
-    pub fn inbound(&mut self) -> &mut InboundCipher {
-        &mut self.inbound
-    }
-
-    /// Get a mutable reference to the outbound cipher for encryption operations.
-    pub fn outbound(&mut self) -> &mut OutboundCipher {
-        &mut self.outbound
-    }
-
-    /// Split the session into separate inbound and outbound ciphers.
-    pub fn into_split(self) -> (InboundCipher, OutboundCipher) {
-        (self.inbound, self.outbound)
-    }
-}
-
 #[derive(Debug)]
 enum HandshakeBIP324State {
     Initialized(MagicType, Role),
     ReceivedKey(GarbageTerminatorType),
-    ReceivedGarbage(Vec<u8>),
-    ReceivedPacketLen(usize, ChaCha20Poly1305Stream, Vec<u8>),
-    ReceivedPacketContent(PacketType, Vec<u8>),
+    ReceivedGarbage(AADType),
+    ReceivedPacketLen(usize, ChaCha20Poly1305Stream, AADType),
+    ReceivedPacketContent(PacketType, TagType),
     ReceivedVersion,
     Invalid,
 }
@@ -670,7 +603,7 @@ fn generate_session_keys_ecdh(
 
 struct MitmImpersonatorLeg {
     state: HandshakeBIP324State,
-    server_state: RelayPeerState,
+    sending_state: RelayPeerState,
 
     peer: SessionEntityTrackerBIP324,
 
@@ -700,7 +633,7 @@ impl MitmImpersonatorLeg {
 
         Ok(Self {
             state: HandshakeBIP324State::Initialized(magic, role),
-            server_state: RelayPeerState::new(),
+            sending_state: RelayPeerState::new(),
             point,
             peer: SessionEntityTrackerBIP324::new(),
             key_to_send,
@@ -892,8 +825,8 @@ impl MitmImpersonatorLeg {
     pub fn write_data(&mut self, buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
         use RelayPeerState::*;
 
-        let server_state = self.server_state.take();
-        let (new_state, size, incomplete) = match server_state {
+        let sending_state = self.sending_state.take();
+        let (new_state, size, incomplete) = match sending_state {
             state @ SendingKey => {
                 let limit = min(buf.len(), self.key_to_send.len());
                 let _key_buf = &mut buf[..limit];
@@ -1014,7 +947,7 @@ impl MitmImpersonatorLeg {
             }
         };
 
-        self.server_state = new_state;
+        self.sending_state = new_state;
         if incomplete {
             return Ok(size + self.write_data(&mut buf[size..])?);
         }
@@ -1027,10 +960,10 @@ impl MitmImpersonatorLeg {
 #[cfg(test)]
 mod mitmfakeserverbip324_tests {
     use super::*;
-    use std::str::FromStr;
     use hex_literal::hex;
     use secp256k1::rand::RngCore;
     use secp256k1::rand::rngs::mock::StepRng;
+    use std::str::FromStr;
 
     use crate::external::bip324::impl_fill_bytes;
 

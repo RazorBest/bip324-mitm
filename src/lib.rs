@@ -12,6 +12,8 @@ use std::mem;
 use std::rc::Rc;
 
 use secp256k1::ellswift::{ElligatorSwift, ElligatorSwiftParty};
+use secp256k1::rand::{CryptoRng, RngCore};
+use secp256k1::{PublicKey, Secp256k1, SecretKey};
 
 use crate::cipher::{CipherSession, SessionKeyMaterial};
 use crate::external::chacha20_poly1305::ChaCha20Poly1305Stream;
@@ -385,7 +387,7 @@ impl MitmImpersonatorLeg {
         relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
         relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
         secret_key: EcdhPoint,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Self {
         let point = secret_key;
         let key_buffer = point.elligator_swift.to_array();
 
@@ -393,7 +395,7 @@ impl MitmImpersonatorLeg {
         let mut key_to_send = vec![];
         key_to_send.extend_from_slice(&key_buffer);
 
-        Ok(Self {
+        Self {
             state: HandshakeBIP324State::Initialized(magic, role),
             sending_state: RelayPeerState::new(),
             point,
@@ -403,7 +405,7 @@ impl MitmImpersonatorLeg {
             cipher: None,
             relay_in,
             relay_out,
-        })
+        }
     }
 
     pub fn new_fake_server(
@@ -411,7 +413,7 @@ impl MitmImpersonatorLeg {
         relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
         relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
         secret_key: EcdhPoint,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Self {
         Self::new(Role::Responder, magic, relay_in, relay_out, secret_key)
     }
 
@@ -420,7 +422,7 @@ impl MitmImpersonatorLeg {
         relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
         relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
         secret_key: EcdhPoint,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Self {
         Self::new(Role::Initiator, magic, relay_in, relay_out, secret_key)
     }
 
@@ -717,14 +719,78 @@ impl MitmImpersonatorLeg {
     }
 }
 
+pub fn key_from_rng<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Result<EcdhPoint, Box<dyn Error>> {
+    let curve = Secp256k1::signing_only();
+    let mut secret_key_buffer = [0u8; 32];
+    RngCore::fill_bytes(rng, &mut secret_key_buffer);
+    debug_assert_ne!([0u8; 32], secret_key_buffer);
+    let sk = SecretKey::from_slice(&secret_key_buffer)?;
+    let pk = PublicKey::from_secret_key(&curve, &sk);
+    let es = ElligatorSwift::from_pubkey(pk);
+
+    Ok(EcdhPoint {
+        secret_key: sk,
+        elligator_swift: es,
+    })
+}
+
+pub struct MitmHandshakeBridge {
+    client_leg: MitmImpersonatorLeg,
+    server_leg: MitmImpersonatorLeg,
+
+    relay_to_fake_server: Rc<RefCell<FakePeerRelay>>,
+    relay_to_fake_client: Rc<RefCell<FakePeerRelay>>,
+}
+
+impl MitmHandshakeBridge {
+    pub fn new<Rng: RngCore + CryptoRng>(magic: MagicType, rng: &mut Rng) -> Self {
+        let client_secret_key = key_from_rng(rng).expect("32 bytes, within curve order");
+        let server_secret_key = key_from_rng(rng).expect("32 bytes, within curve order");
+        let relay_to_fake_server = Rc::new(RefCell::new(FakePeerRelay::new()));
+        let relay_to_fake_client = Rc::new(RefCell::new(FakePeerRelay::new()));
+        let client_leg = MitmImpersonatorLeg::new_fake_client(
+            magic,
+            relay_to_fake_client.clone(),
+            relay_to_fake_server.clone(),
+            client_secret_key,
+        );
+        let server_leg = MitmImpersonatorLeg::new_fake_server(
+            magic,
+            relay_to_fake_server.clone(),
+            relay_to_fake_client.clone(),
+            server_secret_key,
+        );
+        Self {
+            client_leg,
+            server_leg,
+            relay_to_fake_server,
+            relay_to_fake_client,
+        }
+    }
+
+    pub fn client_write(&mut self, data: &[u8]) -> Result<(), String> {
+        self.server_leg.pass_peer_data(data)
+    }
+
+    pub fn server_write(&mut self, data: &[u8]) -> Result<(), String> {
+        self.client_leg.pass_peer_data(data)
+    }
+
+    pub fn client_read(&mut self, buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+        self.server_leg.write_data(buf)
+    }
+
+    pub fn server_read(&mut self, buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+        self.client_leg.write_data(buf)
+    }
+}
+
 #[allow(non_upper_case_globals)]
 #[cfg(test)]
 mod mitmfakeserverbip324_tests {
     use super::*;
     use hex_literal::hex;
     use secp256k1::rand::rngs::mock::StepRng;
-    use secp256k1::rand::{CryptoRng, RngCore};
-    use secp256k1::{PublicKey, Secp256k1, SecretKey};
     use std::str::FromStr;
 
     use crate::cipher::{InboundCipher, OutboundCipher};
@@ -744,23 +810,6 @@ mod mitmfakeserverbip324_tests {
     const DEFAULT_MAGIC: [u8; 4] = [0xF9, 0xBE, 0xB4, 0xD9];
     const HEADER_LEN: usize = 1;
     const TAG_LEN: usize = 16;
-
-    pub fn key_from_rng<Rng: RngCore + CryptoRng>(
-        rng: &mut Rng,
-    ) -> Result<EcdhPoint, Box<dyn Error>> {
-        let curve = Secp256k1::signing_only();
-        let mut secret_key_buffer = [0u8; 32];
-        RngCore::fill_bytes(rng, &mut secret_key_buffer);
-        debug_assert_ne!([0u8; 32], secret_key_buffer);
-        let sk = SecretKey::from_slice(&secret_key_buffer)?;
-        let pk = PublicKey::from_secret_key(&curve, &sk);
-        let es = ElligatorSwift::from_pubkey(pk);
-
-        Ok(EcdhPoint {
-            secret_key: sk,
-            elligator_swift: es,
-        })
-    }
 
     struct TestHandshakeParams {
         /// The seed used to derive the server key
@@ -925,8 +974,7 @@ mod mitmfakeserverbip324_tests {
             relay_in.clone(),
             relay_out.clone(),
             secret_key,
-        )
-        .expect("Error creating the MitmImpersonatorLeg");
+        );
 
         (server, relay_in, relay_out)
     }

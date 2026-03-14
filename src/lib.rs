@@ -17,10 +17,7 @@ use secp256k1::{
     rand::CryptoRng,
 };
 
-use crate::external::bip324::fschacha20poly1305::{FSChaCha20Poly1305, FSChaCha20Stream};
-use crate::external::bip324::{
-    FillBytes, InboundCipher, OutboundCipher, PacketType, SessionKeyMaterial,
-};
+use crate::external::bip324::{FillBytes, PacketType, SessionKeyMaterial};
 use crate::external::chacha20_poly1305::ChaCha20Poly1305Stream;
 use crate::protocol::{CipherSession, EcdhPoint};
 
@@ -112,12 +109,12 @@ impl SessionEntityTrackerBIP324 {
         Ok(())
     }
 
-    pub fn consume_bytes(&mut self, amount: usize) -> Result<Vec<u8>, String> {
+    pub fn try_consume(&mut self, amount: usize) -> Option<Vec<u8>> {
         if amount > self.write_buf.len() {
-            return Err("Can't consume. Requested amount exceeds the available data".to_string());
+            return None;
         }
 
-        Ok(self.write_buf.drain(0..amount).collect())
+        Some(self.write_buf.drain(0..amount).collect())
     }
 
     pub fn consume_all_bytes(&mut self) -> Vec<u8> {
@@ -724,12 +721,9 @@ impl MitmImpersonatorLeg {
                 }
             }
             ReceivedGarbage(aad) => {
-                if self.peer.available_bytes() >= NUM_LENGTH_BYTES {
-                    let length_bytes: [u8; NUM_LENGTH_BYTES] = self
-                        .peer
-                        .consume_bytes(NUM_LENGTH_BYTES)?
-                        .try_into()
-                        .unwrap();
+                if let Some(data) = self.peer.try_consume(NUM_LENGTH_BYTES) {
+                    let mut length_bytes = [0u8; NUM_LENGTH_BYTES];
+                    length_bytes.copy_from_slice(&data[..NUM_LENGTH_BYTES]);
                     let mut packet_len = self
                         .cipher
                         .as_mut()
@@ -767,9 +761,7 @@ impl MitmImpersonatorLeg {
                 }
             }
             ReceivedPacketLen(packet_len, mut stream_cipher, aad) => {
-                if self.peer.available_bytes() >= packet_len {
-                    let mut packet_bytes = self.peer.consume_bytes(packet_len).unwrap();
-
+                if let Some(mut packet_bytes) = self.peer.try_consume(packet_len) {
                     stream_cipher.decrypt_and_store_chunk(&mut packet_bytes);
 
                     let packet_type = PacketType::from_byte(&packet_bytes[0]);
@@ -792,9 +784,7 @@ impl MitmImpersonatorLeg {
                 }
             }
             ReceivedPacketContent(packet_type, expected_tag) => {
-                if self.peer.available_bytes() >= expected_tag.len() {
-                    let tag_bytes = self.peer.consume_bytes(expected_tag.len()).unwrap();
-
+                if let Some(tag_bytes) = self.peer.try_consume(expected_tag.len()) {
                     if tag_bytes != *expected_tag {
                         return Err("AEAD tag check fail".to_string());
                     }
@@ -965,7 +955,7 @@ mod mitmfakeserverbip324_tests {
     use secp256k1::rand::rngs::mock::StepRng;
     use std::str::FromStr;
 
-    use crate::external::bip324::impl_fill_bytes;
+    use crate::external::bip324::{InboundCipher, OutboundCipher, impl_fill_bytes};
 
     macro_rules! test_data {
         ($varname:ident, $name:ident { $($field:ident: $ty:ty = $val:expr),* $(,)? }) => {

@@ -26,25 +26,13 @@ const NUM_ELLIGATOR_SWIFT_BYTES: usize = 64;
 // Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH is 4,000,000 bytes (~4 MiB).
 // 14 extra bytes are for the BIP-324 header byte and 13 serialization header bytes (message type).
 const MAX_PACKET_SIZE_FOR_ALLOCATION: usize = 4000014;
-// Maximum number of garbage bytes before the terminator.
-const MAX_NUM_GARBAGE_BYTES: usize = 4095;
 // The size in bytes of the length segment of a packet
 const LENGTH_BYTES_SIZE: usize = 3;
 
-type GarbageType = Vec<u8>;
 type GarbageTerminatorType = [u8; NUM_GARBAGE_TERMINATOR_BYTES];
 type MagicType = [u8; 4];
 type AADType = Vec<u8>;
 type TagType = Vec<u8>;
-
-/// A wrapper over Err(std::io::Error(..))
-#[allow(non_snake_case)]
-fn IOError<T, E>(kind: std::io::ErrorKind, error: E) -> std::io::Result<T>
-where
-    E: Into<Box<dyn Error + Send + Sync>>,
-{
-    Err(std::io::Error::new(kind, error))
-}
 
 #[derive(Debug)]
 enum HandshakeBIP324State {
@@ -96,7 +84,7 @@ impl FakePeerRelay {
     }
 }
 
-trait FakePeerRelayWriter {
+pub trait FakePeerRelayWriter {
     fn write_key(&mut self, data: &[u8]) -> std::io::Result<usize>;
     fn set_eof_key(&mut self);
 
@@ -214,7 +202,7 @@ impl FakePeerRelayWriter for FakePeerRelay {
     }
 }
 
-trait FakePeerRelayReader {
+pub trait FakePeerRelayReader {
     fn read_key(&mut self, data: &mut [u8]) -> std::io::Result<usize>;
     fn is_eof_key(&self) -> bool;
     fn peek_len_key(&self) -> usize;

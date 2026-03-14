@@ -737,9 +737,6 @@ pub fn key_from_rng<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Result<EcdhPoint
 pub struct MitmHandshakeBridge {
     client_leg: MitmImpersonatorLeg,
     server_leg: MitmImpersonatorLeg,
-
-    relay_to_fake_server: Rc<RefCell<FakePeerRelay>>,
-    relay_to_fake_client: Rc<RefCell<FakePeerRelay>>,
 }
 
 impl MitmHandshakeBridge {
@@ -763,8 +760,6 @@ impl MitmHandshakeBridge {
         Self {
             client_leg,
             server_leg,
-            relay_to_fake_server,
-            relay_to_fake_client,
         }
     }
 

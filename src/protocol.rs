@@ -1,10 +1,22 @@
+use std::cmp;
 use std::collections::VecDeque;
+use std::error::Error;
+use std::io::{Read, Write};
 
 use bip324::Role;
 use secp256k1::{SecretKey, ellswift::ElligatorSwift};
 
 use crate::external::bip324::fschacha20poly1305::{FSChaCha20Poly1305, FSChaCha20Stream};
 use crate::external::bip324::{InboundCipher, OutboundCipher, SessionKeyMaterial};
+
+/// A wrapper over Err(std::io::Error(..))
+#[allow(non_snake_case)]
+fn IOError<T, E>(kind: std::io::ErrorKind, error: E) -> std::io::Result<T>
+where
+    E: Into<Box<dyn Error + Send + Sync>>,
+{
+    Err(std::io::Error::new(kind, error))
+}
 
 /// A point on the curve used to complete the handshake.
 #[derive(Clone)]
@@ -76,19 +88,33 @@ impl CipherSession {
     }
 }
 
+fn read_vec_dequeue_u8(stream: &mut VecDeque<u8>, buf: &mut [u8]) -> usize {
+    let limit = cmp::min(buf.len(), stream.len());
+
+    let data: Vec<_> = stream.drain(..limit).collect();
+    buf[..limit].copy_from_slice(&data);
+
+    limit
+}
+
 pub struct ProtocolBuffer {
     buf: VecDeque<u8>,
+    eof: bool,
 }
 
 impl ProtocolBuffer {
     pub fn new() -> Self {
         Self {
             buf: VecDeque::new(),
+            eof: false,
         }
     }
+
+    /*
     pub fn write(&mut self, data: &[u8]) {
         self.buf.extend(data);
     }
+    */
 
     pub fn try_consume(&mut self, amount: usize) -> Option<Vec<u8>> {
         if amount > self.buf.len() {
@@ -105,5 +131,41 @@ impl ProtocolBuffer {
     pub fn buf_ref<'a>(&'a mut self) -> &'a [u8] {
         self.buf.make_contiguous()
     }
+
+    pub fn is_eof(&self) -> bool {
+        self.eof
+    }
+
+    pub fn set_eof(&mut self) {
+        self.eof = true;
+    }
+
+    pub fn peek_len(&self) -> usize {
+        self.buf.len()
+    }
 }
 
+impl Read for ProtocolBuffer {
+    fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
+        Ok(read_vec_dequeue_u8(&mut self.buf, data))
+    }
+}
+
+impl Write for ProtocolBuffer {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.eof {
+            return IOError(
+                std::io::ErrorKind::Other,
+                "Can't write. Eof was already reached.",
+            );
+        }
+        self.buf.extend(data);
+
+        Ok(data.len())
+    }
+
+    /// Doesn't actually flush because there's no buffering
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}

@@ -75,63 +75,6 @@ fn read_vec_dequeue_u8(stream: &mut VecDeque<u8>, buf: &mut [u8]) -> usize {
     limit
 }
 
-struct DataToSend {
-    stream: VecDeque<u8>,
-    eof: bool,
-}
-
-impl DataToSend {
-    fn new() -> Self {
-        Self {
-            stream: VecDeque::new(),
-            eof: false,
-        }
-    }
-
-    fn is_eof(&self) -> bool {
-        self.eof
-    }
-
-    fn set_eof(&mut self) {
-        self.eof = true;
-    }
-
-    fn peek_len(&self) -> usize {
-        self.stream.len()
-    }
-}
-
-impl Read for DataToSend {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        Ok(read_vec_dequeue_u8(&mut self.stream, buf))
-    }
-}
-
-impl Write for DataToSend {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        if self.eof {
-            return IOError(
-                std::io::ErrorKind::Other,
-                "Can't write. Eof was already reached.",
-            );
-        }
-        self.stream.extend(data);
-
-        Ok(data.len())
-    }
-
-    /// Doesn't actually flush, because it needs a consumer to call read
-    fn flush(&mut self) -> std::io::Result<()> {
-        if self.eof {
-            return IOError(
-                std::io::ErrorKind::Other,
-                "Can't flush. Eof was already reached.",
-            );
-        }
-        Ok(())
-    }
-}
-
 struct PartialPacket {
     length_bytes: Option<VecDeque<u8>>,
     data: Option<VecDeque<u8>>,
@@ -195,9 +138,9 @@ impl PartialPacket {
 }
 
 struct FakePeerRelay {
-    key: DataToSend,
-    garbage: DataToSend,
-    terminator: DataToSend,
+    key: ProtocolBuffer,
+    garbage: ProtocolBuffer,
+    terminator: ProtocolBuffer,
     packets: Vec<PartialPacket>,
 }
 
@@ -219,9 +162,9 @@ impl FakePeerRelay {
 impl FakePeerRelay {
     fn new() -> Self {
         Self {
-            key: DataToSend::new(),
-            garbage: DataToSend::new(),
-            terminator: DataToSend::new(),
+            key: ProtocolBuffer::new(),
+            garbage: ProtocolBuffer::new(),
+            terminator: ProtocolBuffer::new(),
             packets: vec![],
         }
     }
@@ -601,7 +544,7 @@ impl MitmImpersonatorLeg {
     pub fn pass_peer_data(&mut self, data: &[u8]) -> Result<(), String> {
         use HandshakeBIP324State::*;
 
-        self.peer.write(data);
+        self.peer.write(data).unwrap();
 
         let curr_state = self.state.take();
         let (new_state, incomplete) = match curr_state {

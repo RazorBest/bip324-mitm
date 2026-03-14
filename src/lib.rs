@@ -1,3 +1,4 @@
+pub mod cipher;
 pub mod external;
 mod fmt_utils;
 pub mod protocol;
@@ -10,21 +11,17 @@ use std::io::{Read, Write};
 use std::mem;
 use std::rc::Rc;
 
-use bip324::{NUM_LENGTH_BYTES, Role};
-use secp256k1::{
-    PublicKey, Secp256k1, SecretKey,
-    ellswift::{ElligatorSwift, ElligatorSwiftParty},
-    rand::CryptoRng,
-};
+use secp256k1::ellswift::{ElligatorSwift, ElligatorSwiftParty};
 
-use crate::external::bip324::{FillBytes, PacketType, SessionKeyMaterial};
+use crate::cipher::{CipherSession, SessionKeyMaterial};
 use crate::external::chacha20_poly1305::ChaCha20Poly1305Stream;
-use crate::protocol::{CipherSession, EcdhPoint, PartialPacket, ProtocolBuffer, find_garbage};
+use crate::protocol::{
+    EcdhPoint, NUM_GARBAGE_TERMINATOR_BYTES, NUM_LENGTH_BYTES, PacketType, PartialPacket,
+    ProtocolBuffer, Role, find_garbage,
+};
 
 // Number of bytes in elligator swift key.
 const NUM_ELLIGATOR_SWIFT_BYTES: usize = 64;
-// Number of bytes for the garbage terminator.
-const NUM_GARBAGE_TERMINATOR_BYTES: usize = 16;
 // Maximum packet size for automatic allocation.
 // Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH is 4,000,000 bytes (~4 MiB).
 // 14 extra bytes are for the BIP-324 header byte and 13 serialization header bytes (message type).
@@ -737,11 +734,12 @@ impl MitmImpersonatorLeg {
 mod mitmfakeserverbip324_tests {
     use super::*;
     use hex_literal::hex;
-    use secp256k1::rand::RngCore;
     use secp256k1::rand::rngs::mock::StepRng;
+    use secp256k1::rand::{CryptoRng, RngCore};
+    use secp256k1::{PublicKey, Secp256k1, SecretKey};
     use std::str::FromStr;
 
-    use crate::external::bip324::{InboundCipher, OutboundCipher, impl_fill_bytes};
+    use crate::cipher::{InboundCipher, OutboundCipher};
 
     macro_rules! test_data {
         ($varname:ident, $name:ident { $($field:ident: $ty:ty = $val:expr),* $(,)? }) => {
@@ -759,12 +757,12 @@ mod mitmfakeserverbip324_tests {
     const HEADER_LEN: usize = 1;
     const TAG_LEN: usize = 16;
 
-    pub fn key_from_rng<Rng: FillBytes + CryptoRng>(
+    pub fn key_from_rng<Rng: RngCore + CryptoRng>(
         rng: &mut Rng,
     ) -> Result<EcdhPoint, Box<dyn Error>> {
         let curve = Secp256k1::signing_only();
         let mut secret_key_buffer = [0u8; 32];
-        rng.fill_bytes(&mut secret_key_buffer);
+        RngCore::fill_bytes(rng, &mut secret_key_buffer);
         debug_assert_ne!([0u8; 32], secret_key_buffer);
         let sk = SecretKey::from_slice(&secret_key_buffer)?;
         let pk = PublicKey::from_secret_key(&curve, &sk);
@@ -862,7 +860,6 @@ mod mitmfakeserverbip324_tests {
     const DECOY_HEADER: [u8; 1] = hex!("80");
 
     struct TestRng(StepRng);
-    impl_fill_bytes!(TestRng);
     // For passing the type checks
     impl CryptoRng for TestRng {}
 
@@ -890,9 +887,9 @@ mod mitmfakeserverbip324_tests {
         }
     }
 
-    fn secret_key_bytes_from_rng<Rng: FillBytes + CryptoRng>(rng: &mut Rng) -> [u8; 32] {
+    fn secret_key_bytes_from_rng<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> [u8; 32] {
         let mut secret_key_buffer = [0u8; 32];
-        rng.fill_bytes(&mut secret_key_buffer);
+        RngCore::fill_bytes(rng, &mut secret_key_buffer);
         debug_assert_ne!([0u8; 32], secret_key_buffer);
 
         secret_key_buffer

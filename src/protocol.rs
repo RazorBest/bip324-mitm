@@ -3,12 +3,20 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::io::{Read, Write};
 
-use bip324::Role;
-use secp256k1::{PublicKey, Secp256k1, SecretKey, ellswift::ElligatorSwift, rand::CryptoRng};
+use secp256k1::{SecretKey, ellswift::ElligatorSwift};
 
-use crate::NUM_GARBAGE_TERMINATOR_BYTES;
-use crate::external::bip324::fschacha20poly1305::{FSChaCha20Poly1305, FSChaCha20Stream};
-use crate::external::bip324::{FillBytes, InboundCipher, OutboundCipher, SessionKeyMaterial};
+/// Number of bytes for the header holding protocol flags.
+pub const NUM_HEADER_BYTES: usize = 1;
+/// Number of bytes for the encrypted length prefix of a packet.
+pub const NUM_LENGTH_BYTES: usize = 3;
+// Number of bytes for the authentication tag of a packet.
+pub const NUM_TAG_BYTES: usize = 16;
+/// Number of bytes per packet for static layout, everything not including contents.
+pub const NUM_PACKET_OVERHEAD_BYTES: usize = NUM_LENGTH_BYTES + NUM_HEADER_BYTES + NUM_TAG_BYTES;
+/// Value for header byte with the decoy flag flipped to true.
+pub const DECOY_BYTE: u8 = 128;
+// Number of bytes for the garbage terminator.
+pub const NUM_GARBAGE_TERMINATOR_BYTES: usize = 16;
 
 /// A wrapper over Err(std::io::Error(..))
 #[allow(non_snake_case)]
@@ -26,66 +34,43 @@ pub struct EcdhPoint {
     pub elligator_swift: ElligatorSwift,
 }
 
-/// Manages cipher state for a BIP-324 encrypted connection.
-#[derive(Debug, Clone)]
-pub struct CipherSession {
-    /// A unique identifier for the communication session.
-    id: [u8; 32],
-    /// Decrypts inbound packets.
-    pub inbound: InboundCipher,
-    /// Encrypts outbound packets.
-    pub outbound: OutboundCipher,
+/// Role in the handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// Started the handshake with a peer.
+    Initiator,
+    /// Responding to a handshake.
+    Responder,
 }
 
-impl CipherSession {
-    pub fn new(mut materials: SessionKeyMaterial, role: Role) -> Self {
-        if role == Role::Responder {
-            std::mem::swap(
-                &mut materials.initiator_length_key,
-                &mut materials.responder_length_key,
-            );
-            std::mem::swap(
-                &mut materials.initiator_packet_key,
-                &mut materials.responder_packet_key,
-            );
-        }
+/// A decoy packet contains bogus information, but can be
+/// used to hide the shape of the data being communicated
+/// over an encrypted channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketType {
+    /// Genuine packet contains information.
+    Genuine,
+    /// Decoy packet contains bogus information.
+    Decoy,
+}
 
-        let outbound_length_cipher = FSChaCha20Stream::new(materials.initiator_length_key);
-        let inbound_length_cipher = FSChaCha20Stream::new(materials.responder_length_key);
-        let outbound_packet_cipher = FSChaCha20Poly1305::new(materials.initiator_packet_key);
-        let inbound_packet_cipher = FSChaCha20Poly1305::new(materials.responder_packet_key);
-
-        CipherSession {
-            id: materials.session_id,
-            inbound: InboundCipher {
-                length_cipher: inbound_length_cipher,
-                packet_cipher: inbound_packet_cipher,
-            },
-            outbound: OutboundCipher {
-                length_cipher: outbound_length_cipher,
-                packet_cipher: outbound_packet_cipher,
-            },
+impl PacketType {
+    /// Check if header byte has the decoy flag flipped.
+    pub fn from_byte(header: &u8) -> Self {
+        if header == &DECOY_BYTE {
+            PacketType::Decoy
+        } else {
+            PacketType::Genuine
         }
     }
 
-    /// Unique session ID.
-    pub fn id(&self) -> &[u8; 32] {
-        &self.id
-    }
-
-    /// Get a mutable reference to the inbound cipher for decryption operations.
-    pub fn inbound(&mut self) -> &mut InboundCipher {
-        &mut self.inbound
-    }
-
-    /// Get a mutable reference to the outbound cipher for encryption operations.
-    pub fn outbound(&mut self) -> &mut OutboundCipher {
-        &mut self.outbound
-    }
-
-    /// Split the session into separate inbound and outbound ciphers.
-    pub fn into_split(self) -> (InboundCipher, OutboundCipher) {
-        (self.inbound, self.outbound)
+    /// Returns header byte based on the type.
+    #[allow(clippy::wrong_self_convention)]
+    pub fn to_byte(&self) -> u8 {
+        match self {
+            PacketType::Genuine => 0,
+            PacketType::Decoy => DECOY_BYTE,
+        }
     }
 }
 

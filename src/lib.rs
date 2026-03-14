@@ -3,7 +3,7 @@ mod fmt_utils;
 mod protocol;
 
 use std::cell::RefCell;
-use std::cmp::min;
+use std::cmp;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::io::{Read, Write};
@@ -19,7 +19,7 @@ use secp256k1::{
 
 use crate::external::bip324::{FillBytes, PacketType, SessionKeyMaterial};
 use crate::external::chacha20_poly1305::ChaCha20Poly1305Stream;
-use crate::protocol::{CipherSession, EcdhPoint};
+use crate::protocol::{CipherSession, EcdhPoint, ProtocolBuffer};
 
 // Number of bytes in elligator swift key.
 const NUM_ELLIGATOR_SWIFT_BYTES: usize = 64;
@@ -66,72 +66,8 @@ impl HandshakeBIP324State {
     }
 }
 
-#[derive(Debug)]
-enum SessionState {
-    SendingKey,
-    SendingRest,
-}
-
-struct SessionEntityTrackerBIP324 {
-    state: SessionState,
-
-    write_buf: Vec<u8>,
-    key: Option<[u8; NUM_ELLIGATOR_SWIFT_BYTES]>,
-}
-
-impl SessionEntityTrackerBIP324 {
-    pub fn new() -> Self {
-        Self {
-            state: SessionState::SendingKey,
-            write_buf: vec![],
-            key: None,
-        }
-    }
-    pub fn pass_payload(&mut self, data: &[u8]) -> Result<(), String> {
-        use SessionState::*;
-
-        self.write_buf.extend_from_slice(data);
-        match self.state {
-            SendingKey => {
-                if self.write_buf.len() < 64 {
-                    return Ok(());
-                }
-
-                let key: Vec<_> = self.write_buf.drain(0..64).collect();
-
-                self.key = Some(key.try_into().unwrap());
-                self.state = SendingRest;
-                return self.pass_payload(&[]);
-            }
-            SendingRest => (),
-        }
-
-        Ok(())
-    }
-
-    pub fn try_consume(&mut self, amount: usize) -> Option<Vec<u8>> {
-        if amount > self.write_buf.len() {
-            return None;
-        }
-
-        Some(self.write_buf.drain(0..amount).collect())
-    }
-
-    pub fn consume_all_bytes(&mut self) -> Vec<u8> {
-        self.write_buf.drain(..).collect()
-    }
-
-    pub fn available_bytes(&self) -> usize {
-        self.write_buf.len()
-    }
-
-    pub fn undo_consume(&mut self, data: Vec<u8>) {
-        self.write_buf.splice(0..0, data);
-    }
-}
-
 fn read_vec_dequeue_u8(stream: &mut VecDeque<u8>, buf: &mut [u8]) -> usize {
-    let limit = min(buf.len(), stream.len());
+    let limit = cmp::min(buf.len(), stream.len());
 
     let data: Vec<_> = stream.drain(..limit).collect();
     buf[..limit].copy_from_slice(&data);
@@ -538,13 +474,16 @@ fn key_from_rng<Rng: FillBytes + CryptoRng>(rng: &mut Rng) -> Result<EcdhPoint, 
     })
 }
 
-fn split_garbage_by_terminator(
+fn find_garbage(
     buf: &[u8],
     terminator: [u8; NUM_GARBAGE_TERMINATOR_BYTES],
 ) -> Option<(&[u8], &[u8])> {
     for (i, window) in buf.windows(NUM_GARBAGE_TERMINATOR_BYTES).enumerate() {
         if window == terminator {
-            return Some((&buf[..i], &buf[i + NUM_GARBAGE_TERMINATOR_BYTES..]));
+            return Some((
+                &buf[..i + NUM_GARBAGE_TERMINATOR_BYTES],
+                &buf[i + NUM_GARBAGE_TERMINATOR_BYTES..],
+            ));
         }
     }
 
@@ -602,7 +541,7 @@ struct MitmImpersonatorLeg {
     state: HandshakeBIP324State,
     sending_state: RelayPeerState,
 
-    peer: SessionEntityTrackerBIP324,
+    peer: ProtocolBuffer,
 
     point: EcdhPoint,
     key_to_send: Vec<u8>,
@@ -632,7 +571,7 @@ impl MitmImpersonatorLeg {
             state: HandshakeBIP324State::Initialized(magic, role),
             sending_state: RelayPeerState::new(),
             point,
-            peer: SessionEntityTrackerBIP324::new(),
+            peer: ProtocolBuffer::new(),
             key_to_send,
             garbage_terminator_to_send: vec![],
             cipher: None,
@@ -662,12 +601,15 @@ impl MitmImpersonatorLeg {
     pub fn pass_peer_data(&mut self, data: &[u8]) -> Result<(), String> {
         use HandshakeBIP324State::*;
 
-        self.peer.pass_payload(data)?;
+        self.peer.write(data);
 
         let curr_state = self.state.take();
         let (new_state, incomplete) = match curr_state {
             state @ Initialized(magic, role) => {
-                if let Some(client_key) = self.peer.key {
+                if let Some(data) = self.peer.try_consume(NUM_ELLIGATOR_SWIFT_BYTES) {
+                    let mut client_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+                    client_key.copy_from_slice(&data[..NUM_ELLIGATOR_SWIFT_BYTES]);
+
                     let session_keys =
                         generate_session_keys_ecdh(magic, role, &self.point, client_key)?;
 
@@ -693,31 +635,34 @@ impl MitmImpersonatorLeg {
                 }
             }
             state @ ReceivedKey(other_garbage_terminator) => {
-                let buf = self.peer.consume_all_bytes();
+                let buf = self.peer.buf_ref();
 
-                if let Some((garbage, rest)) =
-                    split_garbage_by_terminator(&buf, other_garbage_terminator)
-                {
-                    self.peer.undo_consume(rest.to_vec());
+                if let Some((garbage, _rest)) = find_garbage(buf, other_garbage_terminator) {
+                    let garbage_len = garbage.len();
+                    let garbage = self.peer.try_consume(garbage_len).unwrap();
                     self.relay_out
                         .borrow_mut()
-                        .write_garbage(garbage)
+                        .write_garbage(&garbage)
                         .map_err(|_| "Error writing garbage to relay")?;
 
                     let aad = garbage.to_vec();
                     (ReceivedGarbage(aad), true)
                 } else {
-                    // The last bytes might be part of a truncated garbage terminator
-                    let size = min(other_garbage_terminator.len() - 1, buf.len());
-                    self.peer.undo_consume(buf[buf.len() - size..].to_vec());
+                    // The last bytes might be part of a truncated garbage terminator, so we don't
+                    // consume everything
+                    let to_consume = if buf.len() > other_garbage_terminator.len() {
+                        buf.len() - other_garbage_terminator.len()
+                    } else {
+                        0
+                    };
+                    let partial_garbage = self.peer.try_consume(to_consume).unwrap();
 
-                    let partial_garbage = &buf[..buf.len() - size];
                     self.relay_out
                         .borrow_mut()
-                        .write_garbage(partial_garbage)
+                        .write_garbage(&partial_garbage)
                         .map_err(|_| "Error writing garbage to relay")?;
 
-                    (state, false)
+                    (ReceivedKey(other_garbage_terminator), false)
                 }
             }
             ReceivedGarbage(aad) => {
@@ -818,7 +763,7 @@ impl MitmImpersonatorLeg {
         let sending_state = self.sending_state.take();
         let (new_state, size, incomplete) = match sending_state {
             state @ SendingKey => {
-                let limit = min(buf.len(), self.key_to_send.len());
+                let limit = cmp::min(buf.len(), self.key_to_send.len());
                 let _key_buf = &mut buf[..limit];
                 let size = self.relay_in.borrow_mut().read_key(_key_buf)?;
 
@@ -844,7 +789,7 @@ impl MitmImpersonatorLeg {
                 }
             }
             state @ SendingGarbageTerminator => {
-                let limit = min(buf.len(), self.garbage_terminator_to_send.len());
+                let limit = cmp::min(buf.len(), self.garbage_terminator_to_send.len());
                 let _terminator_buf = &mut buf[..limit];
                 let size = self
                     .relay_in

@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use bip324::Role;
 use secp256k1::{SecretKey, ellswift::ElligatorSwift};
 
@@ -73,3 +75,35 @@ impl CipherSession {
         (self.inbound, self.outbound)
     }
 }
+
+pub struct ProtocolBuffer {
+    buf: VecDeque<u8>,
+}
+
+impl ProtocolBuffer {
+    pub fn new() -> Self {
+        Self {
+            buf: VecDeque::new(),
+        }
+    }
+    pub fn write(&mut self, data: &[u8]) {
+        self.buf.extend(data);
+    }
+
+    pub fn try_consume(&mut self, amount: usize) -> Option<Vec<u8>> {
+        if amount > self.buf.len() {
+            return None;
+        }
+
+        Some(self.buf.drain(0..amount).collect())
+    }
+
+    pub fn consume_all(&mut self) -> Vec<u8> {
+        self.buf.drain(..).collect()
+    }
+
+    pub fn buf_ref<'a>(&'a mut self) -> &'a [u8] {
+        self.buf.make_contiguous()
+    }
+}
+

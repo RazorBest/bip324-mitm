@@ -4,10 +4,11 @@ use std::error::Error;
 use std::io::{Read, Write};
 
 use bip324::Role;
-use secp256k1::{SecretKey, ellswift::ElligatorSwift};
+use secp256k1::{PublicKey, Secp256k1, SecretKey, ellswift::ElligatorSwift, rand::CryptoRng};
 
+use crate::NUM_GARBAGE_TERMINATOR_BYTES;
 use crate::external::bip324::fschacha20poly1305::{FSChaCha20Poly1305, FSChaCha20Stream};
-use crate::external::bip324::{InboundCipher, OutboundCipher, SessionKeyMaterial};
+use crate::external::bip324::{FillBytes, InboundCipher, OutboundCipher, SessionKeyMaterial};
 
 /// A wrapper over Err(std::io::Error(..))
 #[allow(non_snake_case)]
@@ -21,8 +22,8 @@ where
 /// A point on the curve used to complete the handshake.
 #[derive(Clone)]
 pub struct EcdhPoint {
-    pub(crate) secret_key: SecretKey,
-    pub(crate) elligator_swift: ElligatorSwift,
+    pub secret_key: SecretKey,
+    pub elligator_swift: ElligatorSwift,
 }
 
 /// Manages cipher state for a BIP-324 encrypted connection.
@@ -31,13 +32,13 @@ pub struct CipherSession {
     /// A unique identifier for the communication session.
     id: [u8; 32],
     /// Decrypts inbound packets.
-    pub(crate) inbound: InboundCipher,
+    pub inbound: InboundCipher,
     /// Encrypts outbound packets.
-    pub(crate) outbound: OutboundCipher,
+    pub outbound: OutboundCipher,
 }
 
 impl CipherSession {
-    pub(crate) fn new(mut materials: SessionKeyMaterial, role: Role) -> Self {
+    pub fn new(mut materials: SessionKeyMaterial, role: Role) -> Self {
         if role == Role::Responder {
             std::mem::swap(
                 &mut materials.initiator_length_key,
@@ -236,4 +237,20 @@ impl Default for PartialPacket {
     fn default() -> Self {
         Self::new()
     }
+}
+
+pub fn find_garbage(
+    buf: &[u8],
+    terminator: [u8; NUM_GARBAGE_TERMINATOR_BYTES],
+) -> Option<(&[u8], &[u8])> {
+    for (i, window) in buf.windows(NUM_GARBAGE_TERMINATOR_BYTES).enumerate() {
+        if window == terminator {
+            return Some((
+                &buf[..i + NUM_GARBAGE_TERMINATOR_BYTES],
+                &buf[i + NUM_GARBAGE_TERMINATOR_BYTES..],
+            ));
+        }
+    }
+
+    None
 }

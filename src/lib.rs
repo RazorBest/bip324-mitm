@@ -19,7 +19,7 @@ use secp256k1::{
 
 use crate::external::bip324::{FillBytes, PacketType, SessionKeyMaterial};
 use crate::external::chacha20_poly1305::ChaCha20Poly1305Stream;
-use crate::protocol::{CipherSession, EcdhPoint, PartialPacket, ProtocolBuffer};
+use crate::protocol::{CipherSession, EcdhPoint, PartialPacket, ProtocolBuffer, find_garbage};
 
 // Number of bytes in elligator swift key.
 const NUM_ELLIGATOR_SWIFT_BYTES: usize = 64;
@@ -329,22 +329,6 @@ impl FakePeerRelayReader for FakePeerRelay {
 
         aad
     }
-}
-
-fn find_garbage(
-    buf: &[u8],
-    terminator: [u8; NUM_GARBAGE_TERMINATOR_BYTES],
-) -> Option<(&[u8], &[u8])> {
-    for (i, window) in buf.windows(NUM_GARBAGE_TERMINATOR_BYTES).enumerate() {
-        if window == terminator {
-            return Some((
-                &buf[..i + NUM_GARBAGE_TERMINATOR_BYTES],
-                &buf[i + NUM_GARBAGE_TERMINATOR_BYTES..],
-            ));
-        }
-    }
-
-    None
 }
 
 enum RelayPeerState {
@@ -775,7 +759,9 @@ mod mitmfakeserverbip324_tests {
     const HEADER_LEN: usize = 1;
     const TAG_LEN: usize = 16;
 
-    pub fn key_from_rng<Rng: FillBytes + CryptoRng>(rng: &mut Rng) -> Result<EcdhPoint, Box<dyn Error>> {
+    pub fn key_from_rng<Rng: FillBytes + CryptoRng>(
+        rng: &mut Rng,
+    ) -> Result<EcdhPoint, Box<dyn Error>> {
         let curve = Secp256k1::signing_only();
         let mut secret_key_buffer = [0u8; 32];
         rng.fill_bytes(&mut secret_key_buffer);

@@ -331,21 +331,6 @@ impl FakePeerRelayReader for FakePeerRelay {
     }
 }
 
-fn key_from_rng<Rng: FillBytes + CryptoRng>(rng: &mut Rng) -> Result<EcdhPoint, Box<dyn Error>> {
-    let curve = Secp256k1::signing_only();
-    let mut secret_key_buffer = [0u8; 32];
-    rng.fill_bytes(&mut secret_key_buffer);
-    debug_assert_ne!([0u8; 32], secret_key_buffer);
-    let sk = SecretKey::from_slice(&secret_key_buffer)?;
-    let pk = PublicKey::from_secret_key(&curve, &sk);
-    let es = ElligatorSwift::from_pubkey(pk);
-
-    Ok(EcdhPoint {
-        secret_key: sk,
-        elligator_swift: es,
-    })
-}
-
 fn find_garbage(
     buf: &[u8],
     terminator: [u8; NUM_GARBAGE_TERMINATOR_BYTES],
@@ -789,6 +774,21 @@ mod mitmfakeserverbip324_tests {
     const DEFAULT_MAGIC: [u8; 4] = [0xF9, 0xBE, 0xB4, 0xD9];
     const HEADER_LEN: usize = 1;
     const TAG_LEN: usize = 16;
+
+    pub fn key_from_rng<Rng: FillBytes + CryptoRng>(rng: &mut Rng) -> Result<EcdhPoint, Box<dyn Error>> {
+        let curve = Secp256k1::signing_only();
+        let mut secret_key_buffer = [0u8; 32];
+        rng.fill_bytes(&mut secret_key_buffer);
+        debug_assert_ne!([0u8; 32], secret_key_buffer);
+        let sk = SecretKey::from_slice(&secret_key_buffer)?;
+        let pk = PublicKey::from_secret_key(&curve, &sk);
+        let es = ElligatorSwift::from_pubkey(pk);
+
+        Ok(EcdhPoint {
+            secret_key: sk,
+            elligator_swift: es,
+        })
+    }
 
     struct TestHandshakeParams {
         /// The seed used to derive the server key

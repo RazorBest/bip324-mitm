@@ -938,6 +938,145 @@ impl MitmHandshakeBridge {
     pub fn is_handshake_done(&self) -> bool {
         self.client_leg.is_handshake_done() && self.server_leg.is_handshake_done()
     }
+
+    pub fn to_mitm_bridge(self) -> MitmBridge {
+        if !self.is_handshake_done() {
+            panic!("Can't transform to MitmBridge if the legs didn't finish the handshake");
+        }
+
+        MitmBridge::new(
+            self.client_leg.mitm_post_handshake.unwrap(),
+            self.server_leg.mitm_post_handshake.unwrap(),
+        )
+    }
+}
+
+pub struct MitmBridge {
+    pub client_leg: MitmImpersonatorLeg,
+    pub server_leg: MitmImpersonatorLeg,
+}
+
+impl MitmBridge {
+    pub fn new(client_leg: MitmImpersonatorLeg, server_leg: MitmImpersonatorLeg) -> Self {
+        Self {
+            client_leg,
+            server_leg,
+        }
+    }
+
+    pub fn client_write(&mut self, data: &[u8]) -> Result<(), String> {
+        self.server_leg.pass_peer_data(data)
+    }
+
+    pub fn server_write(&mut self, data: &[u8]) -> Result<(), String> {
+        self.client_leg.pass_peer_data(data)
+    }
+
+    pub fn client_read(&mut self, buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+        self.server_leg.write_data(buf)
+    }
+
+    pub fn server_read(&mut self, buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+        self.client_leg.write_data(buf)
+    }
+}
+
+pub enum MitmBIP324State {
+    Handshake(Box<MitmHandshakeBridge>),
+    Data(Box<MitmBridge>),
+    Invalid,
+}
+
+pub struct MitmBIP324 {
+    pub state: MitmBIP324State,
+}
+
+impl MitmBIP324State {
+    pub fn take(&mut self) -> Self {
+        mem::replace(self, Self::Invalid)
+    }
+}
+
+impl MitmBIP324 {
+    pub fn new<Rng: RngCore + CryptoRng>(magic: MagicType, rng: &mut Rng) -> Self {
+        Self {
+            state: MitmBIP324State::Handshake(Box::new(MitmHandshakeBridge::new(magic, rng))),
+        }
+    }
+
+    fn update_state(&mut self) {
+        use MitmBIP324State::*;
+
+        match self.state.take() {
+            Handshake(handshake_bridge) => {
+                if handshake_bridge.is_handshake_done() {
+                    self.state = Data(Box::new(handshake_bridge.to_mitm_bridge()));
+                }
+            }
+            Invalid => {
+                panic!("Invalid state")
+            }
+            state => {
+                self.state = state;
+            }
+        }
+    }
+
+    pub fn client_write(&mut self, data: &[u8]) -> Result<(), String> {
+        use MitmBIP324State::*;
+
+        self.update_state();
+
+        match &mut self.state {
+            Handshake(handshake_bridge) => handshake_bridge.client_write(data),
+            Data(bridge) => bridge.client_write(data),
+            Invalid => {
+                panic!("Invalid")
+            }
+        }
+    }
+
+    pub fn server_write(&mut self, data: &[u8]) -> Result<(), String> {
+        use MitmBIP324State::*;
+
+        self.update_state();
+
+        match &mut self.state {
+            Handshake(handshake_bridge) => handshake_bridge.server_write(data),
+            Data(bridge) => bridge.server_write(data),
+            Invalid => {
+                panic!("Invalid")
+            }
+        }
+    }
+
+    pub fn client_read(&mut self, buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+        use MitmBIP324State::*;
+
+        self.update_state();
+
+        match &mut self.state {
+            Handshake(handshake_bridge) => handshake_bridge.client_read(buf),
+            Data(bridge) => bridge.client_read(buf),
+            Invalid => {
+                panic!("Invalid")
+            }
+        }
+    }
+
+    pub fn server_read(&mut self, buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+        use MitmBIP324State::*;
+
+        self.update_state();
+
+        match &mut self.state {
+            Handshake(handshake_bridge) => handshake_bridge.server_read(buf),
+            Data(bridge) => bridge.server_read(buf),
+            Invalid => {
+                panic!("Invalid")
+            }
+        }
+    }
 }
 
 #[allow(non_upper_case_globals)]

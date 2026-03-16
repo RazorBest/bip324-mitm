@@ -1,158 +1,23 @@
-// SPDX-License-Identifier: CC0-1.0
-
-//! BIP-324 encrypted transport protocol for bitcoin p2p communication.
-//!
-//! This crate implements the [BIP-324](https://github.com/bitcoin/bips/blob/master/bip-0324.mediawiki)
-//! version 2 encrypted transport protocol, which provides encryption and authentication
-//! for bitcoin p2p connections. Like TLS, it begins with a handshake establishing shared
-//! secrets, then encrypts all subsequent communication.
-//!
-//! # Quick Start
-//!
-//! For a complete encrypted connection, use the high-level APIs in the [`io`] or [`futures`] modules:
-//!
-//! ## Synchronous API (requires `std` feature)
-//!
-//! ```no_run
-//! use bip324::io::{Protocol, Payload};
-//! use std::net::TcpStream;
-//! use std::io::BufReader;
-//!
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let stream = TcpStream::connect("127.0.0.1:8333")?;
-//!
-//! // Wrap reader in BufReader for efficiency (protocol makes many small reads)
-//! let reader = BufReader::new(stream.try_clone()?);
-//! let writer = stream;
-//!
-//! // Bitcoin mainnet magic bytes
-//! let magic = [0xF9, 0xBE, 0xB4, 0xD9];
-//!
-//! let mut protocol = Protocol::new(
-//!     magic,
-//!     bip324::Role::Initiator,
-//!     None, None, // no garbage or decoys
-//!     reader,
-//!     writer,
-//! )?;
-//!
-//! // Send some example data (in practice, this would be a properly formatted bitcoin message)
-//! protocol.write(&Payload::genuine(b"hello world".to_vec()))?;
-//!
-//! let response = protocol.read()?;
-//! println!("Received {} bytes", response.contents().len());
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## Asynchronous API (requires `tokio` feature)
-//!
-//! ```ignore
-//! # #[cfg(feature = "tokio")]
-//! # #[tokio::main]
-//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use bip324::futures::Protocol;
-//! use bip324::io::Payload;
-//! use tokio::net::TcpStream;
-//! use tokio::io::BufReader;
-//!
-//! let stream = TcpStream::connect("127.0.0.1:8333").await?;
-//! let (reader, writer) = stream.into_split();
-//!
-//! // Wrap reader in BufReader for efficiency (protocol makes many small reads)
-//! let buffered_reader = BufReader::new(reader);
-//!
-//! // Bitcoin mainnet magic bytes
-//! let magic = [0xF9, 0xBE, 0xB4, 0xD9];
-//!
-//! let mut protocol = Protocol::new(
-//!     magic,
-//!     bip324::Role::Initiator,
-//!     None, None, // no garbage or decoys
-//!     buffered_reader,
-//!     writer,
-//! ).await?;
-//!
-//! // Send some example data (in practice, this would be a properly formatted bitcoin message)
-//! protocol.write(&Payload::genuine(b"hello world".to_vec())).await?;
-//!
-//! let response = protocol.read().await?;
-//! println!("Received {} bytes", response.contents().len());
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Performance Considerations
-//!
-//! The BIP-324 protocol makes multiple small reads, particularly during the handshake
-//! (reading 64-byte keys, 16-byte terminators) and for each message (3-byte length prefix).
-//! For optimal performance, wrap your reader in a `BufReader`:
-//!
-//! ```no_run
-//! # #[cfg(feature = "std")]
-//! # fn sync_example() -> Result<(), Box<dyn std::error::Error>> {
-//! use std::io::BufReader;
-//! use std::net::TcpStream;
-//!
-//! let stream = TcpStream::connect("127.0.0.1:8333")?;
-//! let buffered_reader = BufReader::new(stream.try_clone()?);
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Advanced Usage
-//!
-//! For more control, such as no-std environments, you can use the lower level components.
-//!
-//! - [`Handshake`] - Type-safe handshake state machine.
-//! - [`CipherSession`] - Managed encryption/decryption after handshake.
-//!
-//! # Protocol Details
-//!
-//! After the initial handshake, all data is encrypted in packets.
-//!
-//! | Field | Size | Description |
-//! |-------|------|-------------|
-//! | Length | 3 bytes | Encrypted length of contents |
-//! | Header | 1 byte | Protocol flags including decoy indicator |
-//! | Contents | Variable | The serialized message |
-//! | Tag | 16 bytes | Authentication tag |
-//!
-//! The protocol supports both genuine packets containing application data and decoy
-//! packets with random data for traffic analysis resistance.
-
-use core::{borrow::Borrow, fmt};
+use std::borrow::Borrow;
+use std::fmt;
 
 use bitcoin_hashes::{Hkdf, hkdf, sha256};
 use secp256k1::{
-    self, SecretKey,
+    SecretKey,
     ellswift::{ElligatorSwift, ElligatorSwiftParty},
 };
 
-use crate::bip324_external_fschacha20poly1305 as fschacha20poly1305;
-use crate::bip324_external_fschacha20poly1305::{FSChaCha20, FSChaCha20Poly1305};
+use crate::external::bip324;
+use crate::external::bip324::fschacha20poly1305::{FSChaCha20Poly1305, FSChaCha20Stream};
+use crate::protocol::{
+    NUM_GARBAGE_TERMINATOR_BYTES, NUM_HEADER_BYTES, NUM_LENGTH_BYTES, NUM_PACKET_OVERHEAD_BYTES,
+    NUM_TAG_BYTES, PacketType, Role,
+};
 
-/// Value for header byte with the decoy flag flipped to true.
-pub const DECOY_BYTE: u8 = 128;
-/// Number of bytes for the header holding protocol flags.
-pub const NUM_HEADER_BYTES: usize = 1;
-/// Number of bytes for the encrypted length prefix of a packet.
-pub const NUM_LENGTH_BYTES: usize = 3;
-
-// Number of bytes in elligator swift key.
-const NUM_ELLIGATOR_SWIFT_BYTES: usize = 64;
-// Number of bytes for the garbage terminator.
-const NUM_GARBAGE_TERMINTOR_BYTES: usize = 16;
-// Number of bytes for the authentication tag of a packet.
-const NUM_TAG_BYTES: usize = 16;
-// Number of bytes per packet for static layout, everything not including contents.
-const NUM_PACKET_OVERHEAD_BYTES: usize = NUM_LENGTH_BYTES + NUM_HEADER_BYTES + NUM_TAG_BYTES;
 // Maximum packet size for automatic allocation.
 // Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH is 4,000,000 bytes (~4 MiB).
 // 14 extra bytes are for the BIP-324 header byte and 13 serialization header bytes (message type).
 const MAX_PACKET_SIZE_FOR_ALLOCATION: usize = 4000014;
-// Version content is always empty for the current version of the protocol.
-const VERSION_CONTENT: [u8; 0] = [];
 
 /// Errors encountered throughout the lifetime of a V2 connection.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -175,60 +40,11 @@ pub enum Error {
     /// Not able to generate secret material.
     SecretGeneration(SecretGenerationError),
     /// General decryption error, channel could be out of sync.
-    Decryption(fschacha20poly1305::Error),
+    Decryption(bip324::fschacha20poly1305::Error),
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::CiphertextTooSmall => {
-                write!(
-                    f,
-                    "Ciphertext does not contain enough information, should be further extended."
-                )
-            }
-            Error::BufferTooSmall { required_bytes } => write!(
-                f,
-                "Buffer memory allocation too small, need at least {required_bytes} bytes."
-            ),
-            Error::PacketTooBig => write!(
-                f,
-                "Packet size exceeds maximum 4MiB size for automatic allocation."
-            ),
-            Error::NoGarbageTerminator => {
-                write!(
-                    f,
-                    "More than 4095 bytes of garbage received in the handshake before a terminator was sent."
-                )
-            }
-            Error::SecretGeneration(e) => write!(f, "Cannot generate secrets: {e:?}."),
-            Error::Decryption(e) => write!(f, "Decryption error: {e:?}."),
-            Error::V1Protocol => write!(f, "The remote peer is communicating on the V1 protocol."),
-            Error::TooMuchGarbage => write!(
-                f,
-                "Tried to send more than 4095 bytes of garbage in handshake."
-            ),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::CiphertextTooSmall => None,
-            Error::BufferTooSmall { .. } => None,
-            Error::PacketTooBig => None,
-            Error::NoGarbageTerminator => None,
-            Error::V1Protocol => None,
-            Error::SecretGeneration(e) => Some(e),
-            Error::Decryption(e) => Some(e),
-            Error::TooMuchGarbage => None,
-        }
-    }
-}
-
-impl From<fschacha20poly1305::Error> for Error {
-    fn from(e: fschacha20poly1305::Error) -> Self {
+impl From<bip324::fschacha20poly1305::Error> for Error {
+    fn from(e: bip324::fschacha20poly1305::Error) -> Self {
         Error::Decryption(e)
     }
 }
@@ -274,135 +90,140 @@ impl From<hkdf::MaxLengthError> for Error {
     }
 }
 
-/// All keys derived from the ECDH.
 #[derive(Clone)]
-pub struct SessionKeyMaterial {
-    /// A unique ID to identify a connection.
-    pub session_id: [u8; 32],
-    pub initiator_length_key: [u8; 32],
-    pub initiator_packet_key: [u8; 32],
-    pub responder_length_key: [u8; 32],
-    pub responder_packet_key: [u8; 32],
-    pub initiator_garbage_terminator: [u8; NUM_GARBAGE_TERMINTOR_BYTES],
-    pub responder_garbage_terminator: [u8; NUM_GARBAGE_TERMINTOR_BYTES],
+pub struct OutboundCipher {
+    pub length_cipher: FSChaCha20Stream,
+    pub packet_cipher: FSChaCha20Poly1305,
 }
 
-impl SessionKeyMaterial {
-    /// Derive session key material from ECDH shared secret.
+impl OutboundCipher {
+    /// Calculate the required encryption buffer length for given plaintext length.
+    pub const fn encryption_buffer_len(plaintext_len: usize) -> usize {
+        plaintext_len + NUM_PACKET_OVERHEAD_BYTES
+    }
+
+    pub fn encrypt_len_part_inplace(&mut self, content_len: &mut [u8]) {
+        self.length_cipher.apply_keystream(content_len);
+    }
+
+    /// Encrypt plaintext into a packet for transmission.
     ///
     /// # Arguments
     ///
-    /// * `a` - First party's ElligatorSwift public key.
-    /// * `b` - Second party's ElligatorSwift public key.
-    /// * `secret` - The secret key of the party calling this method.
-    /// * `party` - Whether the caller is party A or B in the ECDH.
-    /// * `network` - The Bitcoin network for key derivation.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the derived session key material.
+    /// * `plaintext` - Plaintext contents to be encrypted.
+    /// * `ciphertext_buffer` - Buffer to write packet bytes to which must have enough capacity
+    ///   as calculated by `encryption_buffer_len(plaintext.len())`.
+    /// * `packet_type` - Is this a genuine packet or a decoy.
+    /// * `aad` - Optional associated authenticated data.
     ///
     /// # Errors
     ///
-    /// * `SecretGeneration` - If key derivation fails.
-    pub fn from_ecdh(
-        a: ElligatorSwift,
-        b: ElligatorSwift,
-        secret: SecretKey,
-        party: ElligatorSwiftParty,
-        magic: impl Borrow<[u8; 4]>,
-    ) -> Result<Self, Error> {
-        let data = "bip324_ellswift_xonly_ecdh".as_bytes();
-        let ecdh_sk = ElligatorSwift::shared_secret(a, b, secret, party, Some(data));
-        let ikm_salt = b"bitcoin_v2_shared_secret"; // 24 bytes
-        let mut salt = [0u8; 28];
-        salt[..24].copy_from_slice(ikm_salt);
-        salt[24..].copy_from_slice(magic.borrow());
+    /// * `Error::BufferTooSmall` - Buffer does not have enough allocated memory as
+    ///   calculated by `encryption_buffer_len()`.
+    pub fn encrypt(
+        &mut self,
+        plaintext: &[u8],
+        ciphertext_buffer: &mut [u8],
+        packet_type: PacketType,
+        aad: Option<&[u8]>,
+    ) -> Result<(), Error> {
+        // Validate buffer capacity.
+        if ciphertext_buffer.len() < Self::encryption_buffer_len(plaintext.len()) {
+            return Err(Error::BufferTooSmall {
+                required_bytes: Self::encryption_buffer_len(plaintext.len()),
+            });
+        }
 
-        let hk = Hkdf::<sha256::Hash>::new(salt.as_slice(), ecdh_sk.as_secret_bytes());
-        let mut session_id = [0u8; 32];
-        let session_info = "session_id".as_bytes();
-        hk.expand(session_info, &mut session_id)?;
-        let mut initiator_length_key = [0u8; 32];
-        let intiiator_l_info = "initiator_L".as_bytes();
-        hk.expand(intiiator_l_info, &mut initiator_length_key)?;
-        let mut initiator_packet_key = [0u8; 32];
-        let intiiator_p_info = "initiator_P".as_bytes();
-        hk.expand(intiiator_p_info, &mut initiator_packet_key)?;
-        let mut responder_length_key = [0u8; 32];
-        let responder_l_info = "responder_L".as_bytes();
-        hk.expand(responder_l_info, &mut responder_length_key)?;
-        let mut responder_packet_key = [0u8; 32];
-        let responder_p_info = "responder_P".as_bytes();
-        hk.expand(responder_p_info, &mut responder_packet_key)?;
-        let mut garbage = [0u8; 32];
-        let garbage_info = "garbage_terminators".as_bytes();
-        hk.expand(garbage_info, &mut garbage)?;
-        let initiator_garbage_terminator: [u8; 16] = garbage[..16]
-            .try_into()
-            .expect("first 16 bytes of expanded garbage");
-        let responder_garbage_terminator: [u8; 16] = garbage[16..]
-            .try_into()
-            .expect("last 16 bytes of expanded garbage");
-        Ok(SessionKeyMaterial {
-            session_id,
-            initiator_length_key,
-            initiator_packet_key,
-            responder_length_key,
-            responder_packet_key,
-            initiator_garbage_terminator,
-            responder_garbage_terminator,
-        })
+        let plaintext_length = plaintext.len();
+        let header_index = NUM_LENGTH_BYTES + NUM_HEADER_BYTES - 1;
+        let plaintext_start_index = header_index + 1;
+        let plaintext_end_index = plaintext_start_index + plaintext_length;
+
+        // Set header byte.
+        ciphertext_buffer[header_index] = packet_type.to_byte();
+        ciphertext_buffer[plaintext_start_index..plaintext_end_index].copy_from_slice(plaintext);
+
+        // Encrypt header byte and plaintext in place and produce authentication tag.
+        let auth = aad.unwrap_or_default();
+        let tag = self.packet_cipher.encrypt(
+            auth,
+            &mut ciphertext_buffer[header_index..plaintext_end_index],
+        );
+
+        // Encrypt plaintext length.
+        let mut content_len = [0u8; 3];
+        content_len.copy_from_slice(&(plaintext_length as u32).to_le_bytes()[0..NUM_LENGTH_BYTES]);
+        self.length_cipher.apply_keystream(&mut content_len);
+
+        // Copy over encrypted length and the tag to the final packet (plaintext already encrypted).
+        ciphertext_buffer[0..NUM_LENGTH_BYTES].copy_from_slice(&content_len);
+        ciphertext_buffer[plaintext_end_index..(plaintext_end_index + NUM_TAG_BYTES)]
+            .copy_from_slice(&tag);
+
+        Ok(())
+    }
+
+    /// Encrypt plaintext into a packet with automatic allocation.
+    ///
+    /// This is a convenience method that handles buffer allocation automatically.
+    /// For zero-allocation scenarios, use [`Self::encrypt`] instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `plaintext` - Plaintext contents to be encrypted.
+    /// * `packet_type` - Is this a genuine packet or a decoy.
+    /// * `aad` - Optional associated authenticated data.
+    ///
+    /// # Returns
+    ///
+    /// The complete encrypted packet ready for transmission.
+    pub fn encrypt_to_vec(
+        &mut self,
+        plaintext: &[u8],
+        packet_type: PacketType,
+        aad: Option<&[u8]>,
+    ) -> std::vec::Vec<u8> {
+        let packet_len = Self::encryption_buffer_len(plaintext.len());
+        let mut ciphertext_buffer = std::vec![0u8; packet_len];
+
+        // This will never fail since we allocate the exact required size
+        self.encrypt(plaintext, &mut ciphertext_buffer, packet_type, aad)
+            .expect("encrypt should never fail with correctly sized buffer");
+
+        ciphertext_buffer
     }
 }
 
-/// Role in the handshake.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Role {
-    /// Started the handshake with a peer.
-    Initiator,
-    /// Responding to a handshake.
-    Responder,
-}
-
-/// A decoy packet contains bogus information, but can be
-/// used to hide the shape of the data being communicated
-/// over an encrypted channel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PacketType {
-    /// Genuine packet contains information.
-    Genuine,
-    /// Decoy packet contains bogus information.
-    Decoy,
-}
-
-impl PacketType {
-    /// Check if header byte has the decoy flag flipped.
-    pub fn from_byte(header: &u8) -> Self {
-        if header == &DECOY_BYTE {
-            PacketType::Decoy
-        } else {
-            PacketType::Genuine
-        }
-    }
-
-    /// Returns header byte based on the type.
-    pub fn to_byte(&self) -> u8 {
-        match self {
-            PacketType::Genuine => 0,
-            PacketType::Decoy => DECOY_BYTE,
-        }
+impl fmt::Debug for OutboundCipher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<OutboundCipher>")
     }
 }
 
 /// Decrypts packets received from the remote peer.
 #[derive(Clone)]
 pub struct InboundCipher {
-    pub length_cipher: FSChaCha20,
+    pub length_cipher: Option<FSChaCha20Stream>,
     pub packet_cipher: FSChaCha20Poly1305,
 }
 
 impl InboundCipher {
+    pub fn get_new_length_decryptor(&mut self) -> Result<LengthDecryptor, String> {
+        let Some(length_cipher) = self.length_cipher.take() else {
+            return Err("A length decryptor is already being used".to_string());
+        };
+
+        Ok(LengthDecryptor::new(length_cipher))
+    }
+
+    pub fn reown_length_cipher(&mut self, length_cipher: FSChaCha20Stream) -> Result<(), String> {
+        if self.length_cipher.is_some() {
+            return Err("Can't own a length_cipher. Already owning one".to_string());
+        }
+        self.length_cipher = Some(length_cipher);
+
+        Ok(())
+    }
     /// Decrypt the length of the packet's payload.
     ///
     /// Note that this returns the length of the remaining packet data
@@ -416,11 +237,21 @@ impl InboundCipher {
     ///
     /// The length of the rest of the packet.
     pub fn decrypt_packet_len(&mut self, mut len_bytes: [u8; NUM_LENGTH_BYTES]) -> usize {
-        self.length_cipher.crypt(&mut len_bytes);
+        self.length_cipher
+            .as_mut()
+            .unwrap()
+            .apply_keystream(&mut len_bytes);
 
         u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], 0]) as usize
             + NUM_HEADER_BYTES
             + NUM_TAG_BYTES
+    }
+
+    pub fn decrypt_len_part_inplace(&mut self, content_len: &mut [u8]) {
+        self.length_cipher
+            .as_mut()
+            .unwrap()
+            .apply_keystream(content_len);
     }
 
     /// Calculate the required decryption buffer length from packet length.
@@ -568,159 +399,178 @@ impl InboundCipher {
     }
 }
 
-/// Encrypts packets to send to the remote peer.
-#[derive(Clone)]
-pub struct OutboundCipher {
-    pub length_cipher: FSChaCha20,
-    pub packet_cipher: FSChaCha20Poly1305,
+impl fmt::Debug for InboundCipher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<InboundCipher>")
+    }
 }
 
-impl OutboundCipher {
-    /// Calculate the required encryption buffer length for given plaintext length.
-    pub const fn encryption_buffer_len(plaintext_len: usize) -> usize {
-        plaintext_len + NUM_PACKET_OVERHEAD_BYTES
+pub struct LengthDecryptor {
+    pub remaining_bytes: usize,
+    pub length_cipher: FSChaCha20Stream,
+    pub len_bytes: Vec<u8>,
+}
+
+impl LengthDecryptor {
+    pub fn new(length_cipher: FSChaCha20Stream) -> Self {
+        Self {
+            remaining_bytes: NUM_LENGTH_BYTES,
+            length_cipher,
+            len_bytes: vec![],
+        }
     }
 
-    /// Encrypt plaintext into a packet for transmission.
-    ///
-    /// # Arguments
-    ///
-    /// * `plaintext` - Plaintext contents to be encrypted.
-    /// * `ciphertext_buffer` - Buffer to write packet bytes to which must have enough capacity
-    ///   as calculated by `encryption_buffer_len(plaintext.len())`.
-    /// * `packet_type` - Is this a genuine packet or a decoy.
-    /// * `aad` - Optional associated authenticated data.
-    ///
-    /// # Errors
-    ///
-    /// * `Error::BufferTooSmall` - Buffer does not have enough allocated memory as
-    ///   calculated by `encryption_buffer_len()`.
-    pub fn encrypt(
-        &mut self,
-        plaintext: &[u8],
-        ciphertext_buffer: &mut [u8],
-        packet_type: PacketType,
-        aad: Option<&[u8]>,
-    ) -> Result<(), Error> {
-        // Validate buffer capacity.
-        if ciphertext_buffer.len() < Self::encryption_buffer_len(plaintext.len()) {
-            return Err(Error::BufferTooSmall {
-                required_bytes: Self::encryption_buffer_len(plaintext.len()),
-            });
+    pub fn decrypt_len_part_inplace(&mut self, content_len: &mut [u8]) -> Result<(), String> {
+        if content_len.len() > self.remaining_bytes {
+            return Err("Buffer too big".to_string());
         }
+        self.length_cipher.apply_keystream(content_len);
+        self.remaining_bytes -= content_len.len();
 
-        let plaintext_length = plaintext.len();
-        let header_index = NUM_LENGTH_BYTES + NUM_HEADER_BYTES - 1;
-        let plaintext_start_index = header_index + 1;
-        let plaintext_end_index = plaintext_start_index + plaintext_length;
-
-        // Set header byte.
-        ciphertext_buffer[header_index] = packet_type.to_byte();
-        ciphertext_buffer[plaintext_start_index..plaintext_end_index].copy_from_slice(plaintext);
-
-        // Encrypt header byte and plaintext in place and produce authentication tag.
-        let auth = aad.unwrap_or_default();
-        let tag = self.packet_cipher.encrypt(
-            auth,
-            &mut ciphertext_buffer[header_index..plaintext_end_index],
-        );
-
-        // Encrypt plaintext length.
-        let mut content_len = [0u8; 3];
-        content_len.copy_from_slice(&(plaintext_length as u32).to_le_bytes()[0..NUM_LENGTH_BYTES]);
-        self.length_cipher.crypt(&mut content_len);
-
-        // Copy over encrypted length and the tag to the final packet (plaintext already encrypted).
-        ciphertext_buffer[0..NUM_LENGTH_BYTES].copy_from_slice(&content_len);
-        ciphertext_buffer[plaintext_end_index..(plaintext_end_index + NUM_TAG_BYTES)]
-            .copy_from_slice(&tag);
+        self.len_bytes.extend_from_slice(content_len);
 
         Ok(())
     }
 
-    /// Encrypt plaintext into a packet with automatic allocation.
-    ///
-    /// This is a convenience method that handles buffer allocation automatically.
-    /// For zero-allocation scenarios, use [`Self::encrypt`] instead.
+    #[allow(clippy::assertions_on_constants)]
+    pub fn try_end(self) -> Result<(FSChaCha20Stream, usize), Self> {
+        if self.remaining_bytes > 0 {
+            Err(self)
+        } else {
+            debug_assert!(NUM_LENGTH_BYTES == 3);
+            debug_assert!(self.len_bytes.len() == 3);
+            let decoded_len =
+                u32::from_le_bytes([self.len_bytes[0], self.len_bytes[1], self.len_bytes[2], 0])
+                    as usize
+                    + NUM_HEADER_BYTES
+                    + NUM_TAG_BYTES;
+
+            Ok((self.length_cipher, decoded_len))
+        }
+    }
+}
+
+/// All keys derived from the ECDH.
+#[derive(Clone)]
+pub struct SessionKeyMaterial {
+    /// A unique ID to identify a connection.
+    pub session_id: [u8; 32],
+    pub initiator_length_key: [u8; 32],
+    pub initiator_packet_key: [u8; 32],
+    pub responder_length_key: [u8; 32],
+    pub responder_packet_key: [u8; 32],
+    pub initiator_garbage_terminator: [u8; NUM_GARBAGE_TERMINATOR_BYTES],
+    pub responder_garbage_terminator: [u8; NUM_GARBAGE_TERMINATOR_BYTES],
+}
+
+impl SessionKeyMaterial {
+    /// Derive session key material from ECDH shared secret.
     ///
     /// # Arguments
     ///
-    /// * `plaintext` - Plaintext contents to be encrypted.
-    /// * `packet_type` - Is this a genuine packet or a decoy.
-    /// * `aad` - Optional associated authenticated data.
+    /// * `a` - First party's ElligatorSwift public key.
+    /// * `b` - Second party's ElligatorSwift public key.
+    /// * `secret` - The secret key of the party calling this method.
+    /// * `party` - Whether the caller is party A or B in the ECDH.
+    /// * `network` - The Bitcoin network for key derivation.
     ///
     /// # Returns
     ///
-    /// The complete encrypted packet ready for transmission.
-    pub fn encrypt_to_vec(
-        &mut self,
-        plaintext: &[u8],
-        packet_type: PacketType,
-        aad: Option<&[u8]>,
-    ) -> std::vec::Vec<u8> {
-        let packet_len = Self::encryption_buffer_len(plaintext.len());
-        let mut ciphertext_buffer = std::vec![0u8; packet_len];
+    /// A `Result` containing the derived session key material.
+    ///
+    /// # Errors
+    ///
+    /// * `SecretGeneration` - If key derivation fails.
+    pub fn from_ecdh(
+        a: ElligatorSwift,
+        b: ElligatorSwift,
+        secret: SecretKey,
+        party: ElligatorSwiftParty,
+        magic: impl Borrow<[u8; 4]>,
+    ) -> Result<Self, Error> {
+        let data = "bip324_ellswift_xonly_ecdh".as_bytes();
+        let ecdh_sk = ElligatorSwift::shared_secret(a, b, secret, party, Some(data));
+        let ikm_salt = b"bitcoin_v2_shared_secret"; // 24 bytes
+        let mut salt = [0u8; 28];
+        salt[..24].copy_from_slice(ikm_salt);
+        salt[24..].copy_from_slice(magic.borrow());
 
-        // This will never fail since we allocate the exact required size
-        self.encrypt(plaintext, &mut ciphertext_buffer, packet_type, aad)
-            .expect("encrypt should never fail with correctly sized buffer");
-
-        ciphertext_buffer
+        let hk = Hkdf::<sha256::Hash>::new(salt.as_slice(), ecdh_sk.as_secret_bytes());
+        let mut session_id = [0u8; 32];
+        let session_info = "session_id".as_bytes();
+        hk.expand(session_info, &mut session_id)?;
+        let mut initiator_length_key = [0u8; 32];
+        let intiiator_l_info = "initiator_L".as_bytes();
+        hk.expand(intiiator_l_info, &mut initiator_length_key)?;
+        let mut initiator_packet_key = [0u8; 32];
+        let intiiator_p_info = "initiator_P".as_bytes();
+        hk.expand(intiiator_p_info, &mut initiator_packet_key)?;
+        let mut responder_length_key = [0u8; 32];
+        let responder_l_info = "responder_L".as_bytes();
+        hk.expand(responder_l_info, &mut responder_length_key)?;
+        let mut responder_packet_key = [0u8; 32];
+        let responder_p_info = "responder_P".as_bytes();
+        hk.expand(responder_p_info, &mut responder_packet_key)?;
+        let mut garbage = [0u8; 32];
+        let garbage_info = "garbage_terminators".as_bytes();
+        hk.expand(garbage_info, &mut garbage)?;
+        let initiator_garbage_terminator: [u8; 16] = garbage[..16]
+            .try_into()
+            .expect("first 16 bytes of expanded garbage");
+        let responder_garbage_terminator: [u8; 16] = garbage[16..]
+            .try_into()
+            .expect("last 16 bytes of expanded garbage");
+        Ok(SessionKeyMaterial {
+            session_id,
+            initiator_length_key,
+            initiator_packet_key,
+            responder_length_key,
+            responder_packet_key,
+            initiator_garbage_terminator,
+            responder_garbage_terminator,
+        })
     }
 }
 
 /// Manages cipher state for a BIP-324 encrypted connection.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct CipherSession {
     /// A unique identifier for the communication session.
     id: [u8; 32],
     /// Decrypts inbound packets.
-    inbound: InboundCipher,
+    pub inbound: InboundCipher,
     /// Encrypts outbound packets.
-    outbound: OutboundCipher,
+    pub outbound: OutboundCipher,
 }
 
 impl CipherSession {
-    pub(crate) fn new(materials: SessionKeyMaterial, role: Role) -> Self {
-        match role {
-            Role::Initiator => {
-                let initiator_length_cipher = FSChaCha20::new(materials.initiator_length_key);
-                let responder_length_cipher = FSChaCha20::new(materials.responder_length_key);
-                let initiator_packet_cipher =
-                    FSChaCha20Poly1305::new(materials.initiator_packet_key);
-                let responder_packet_cipher =
-                    FSChaCha20Poly1305::new(materials.responder_packet_key);
-                CipherSession {
-                    id: materials.session_id,
-                    inbound: InboundCipher {
-                        length_cipher: responder_length_cipher,
-                        packet_cipher: responder_packet_cipher,
-                    },
-                    outbound: OutboundCipher {
-                        length_cipher: initiator_length_cipher,
-                        packet_cipher: initiator_packet_cipher,
-                    },
-                }
-            }
-            Role::Responder => {
-                let responder_length_cipher = FSChaCha20::new(materials.responder_length_key);
-                let initiator_length_cipher = FSChaCha20::new(materials.initiator_length_key);
-                let responder_packet_cipher =
-                    FSChaCha20Poly1305::new(materials.responder_packet_key);
-                let initiator_packet_cipher =
-                    FSChaCha20Poly1305::new(materials.initiator_packet_key);
-                CipherSession {
-                    id: materials.session_id,
-                    inbound: InboundCipher {
-                        length_cipher: initiator_length_cipher,
-                        packet_cipher: initiator_packet_cipher,
-                    },
-                    outbound: OutboundCipher {
-                        length_cipher: responder_length_cipher,
-                        packet_cipher: responder_packet_cipher,
-                    },
-                }
-            }
+    pub fn new(mut materials: SessionKeyMaterial, role: Role) -> Self {
+        if role == Role::Responder {
+            std::mem::swap(
+                &mut materials.initiator_length_key,
+                &mut materials.responder_length_key,
+            );
+            std::mem::swap(
+                &mut materials.initiator_packet_key,
+                &mut materials.responder_packet_key,
+            );
+        }
+
+        let outbound_length_cipher = FSChaCha20Stream::new(materials.initiator_length_key);
+        let inbound_length_cipher = FSChaCha20Stream::new(materials.responder_length_key);
+        let outbound_packet_cipher = FSChaCha20Poly1305::new(materials.initiator_packet_key);
+        let inbound_packet_cipher = FSChaCha20Poly1305::new(materials.responder_packet_key);
+
+        CipherSession {
+            id: materials.session_id,
+            inbound: InboundCipher {
+                length_cipher: Some(inbound_length_cipher),
+                packet_cipher: inbound_packet_cipher,
+            },
+            outbound: OutboundCipher {
+                length_cipher: outbound_length_cipher,
+                packet_cipher: outbound_packet_cipher,
+            },
         }
     }
 
@@ -745,103 +595,16 @@ impl CipherSession {
     }
 }
 
-/// Fill a slice with random bytes. This trait _should_ be cryptographically secure; however, a
-/// psuedo-random number generator may be sufficient depending on your security model.
-pub trait FillBytes {
-    /// Fill a 32 byte slice with random data.
-    fn fill_bytes(&mut self, dest: &mut [u8; 32]);
-}
-
-macro_rules! impl_fill_bytes {
-    ($rng:ident) => {
-        impl FillBytes for $rng {
-            fn fill_bytes(&mut self, dest: &mut [u8; 32]) {
-                use secp256k1::rand::RngCore;
-                RngCore::fill_bytes(self, dest);
-            }
-        }
-    };
-}
-pub(super) use impl_fill_bytes;
-
-use secp256k1::rand::rngs::{StdRng, ThreadRng};
-impl_fill_bytes!(StdRng);
-impl_fill_bytes!(ThreadRng);
-
-#[cfg(all(test))]
+#[cfg(test)]
 mod tests {
-
     use super::*;
-    use bitcoin::secp256k1::SecretKey;
-    use bitcoin::secp256k1::ellswift::{ElligatorSwift, ElligatorSwiftParty};
     use bitcoin::secp256k1::rand::Rng;
     use core::str::FromStr;
     use hex::prelude::*;
-    use std::vec;
-    use std::vec::Vec;
+    use secp256k1::ellswift::ElligatorSwiftParty;
 
     const MAGIC: [u8; 4] = [0xF9, 0xBE, 0xB4, 0xD9];
-
-    fn gen_garbage(garbage_len: u32, rng: &mut impl Rng) -> Vec<u8> {
-        let buffer: Vec<u8> = (0..garbage_len).map(|_| rng.r#gen()).collect();
-        buffer
-    }
-
-    #[test]
-    fn test_cipher_session() {
-        let alice =
-            SecretKey::from_str("61062ea5071d800bbfd59e2e8b53d47d194b095ae5a4df04936b49772ef0d4d7")
-                .unwrap();
-        let elliswift_alice = ElligatorSwift::from_str("ec0adff257bbfe500c188c80b4fdd640f6b45a482bbc15fc7cef5931deff0aa186f6eb9bba7b85dc4dcc28b28722de1e3d9108b985e2967045668f66098e475b").unwrap();
-        let elliswift_bob = ElligatorSwift::from_str("a4a94dfce69b4a2a0a099313d10f9f7e7d649d60501c9e1d274c300e0d89aafaffffffffffffffffffffffffffffffffffffffffffffffffffffffff8faf88d5").unwrap();
-        let session_keys = SessionKeyMaterial::from_ecdh(
-            elliswift_alice,
-            elliswift_bob,
-            alice,
-            ElligatorSwiftParty::A,
-            MAGIC,
-        )
-        .unwrap();
-        let mut alice_cipher = CipherSession::new(session_keys.clone(), Role::Initiator);
-        let mut bob_cipher = CipherSession::new(session_keys, Role::Responder);
-        let message = b"Bitcoin rox!".to_vec();
-
-        let mut enc_packet = vec![0u8; OutboundCipher::encryption_buffer_len(message.len())];
-        alice_cipher
-            .outbound()
-            .encrypt(&message, &mut enc_packet, PacketType::Decoy, None)
-            .unwrap();
-
-        let plaintext_len = bob_cipher
-            .inbound()
-            .decrypt_packet_len(enc_packet[0..NUM_LENGTH_BYTES].try_into().unwrap());
-        let mut plaintext_buffer = vec![0u8; InboundCipher::decryption_buffer_len(plaintext_len)];
-        let packet_type = bob_cipher
-            .inbound()
-            .decrypt(&enc_packet[NUM_LENGTH_BYTES..], &mut plaintext_buffer, None)
-            .unwrap();
-        assert_eq!(PacketType::Decoy, packet_type);
-        assert_eq!(message, plaintext_buffer[1..].to_vec()); // Skip header byte
-
-        let message = b"Windows sox!".to_vec();
-        let packet_len = OutboundCipher::encryption_buffer_len(message.len());
-        let mut enc_packet = vec![0u8; packet_len];
-        bob_cipher
-            .outbound()
-            .encrypt(&message, &mut enc_packet, PacketType::Genuine, None)
-            .unwrap();
-
-        let plaintext_len = alice_cipher
-            .inbound()
-            .decrypt_packet_len(enc_packet[0..NUM_LENGTH_BYTES].try_into().unwrap());
-        let mut plaintext_buffer = vec![0u8; InboundCipher::decryption_buffer_len(plaintext_len)];
-        let packet_type = alice_cipher
-            .inbound()
-            .decrypt(&enc_packet[NUM_LENGTH_BYTES..], &mut plaintext_buffer, None)
-            .unwrap();
-        assert_eq!(PacketType::Genuine, packet_type);
-        assert_eq!(message, plaintext_buffer[1..].to_vec()); // Skip header byte
-    }
+    const VERSION_CONTENT: [u8; 0] = [];
 
     #[test]
     fn test_decrypt_in_place() {
@@ -955,6 +718,11 @@ mod tests {
             .inbound()
             .decrypt_to_vec(&large_ciphertext, None);
         assert_eq!(result, Err(Error::PacketTooBig));
+    }
+
+    fn gen_garbage(garbage_len: u32, rng: &mut impl Rng) -> Vec<u8> {
+        let buffer: Vec<u8> = (0..garbage_len).map(|_| rng.r#gen()).collect();
+        buffer
     }
 
     #[test]

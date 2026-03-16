@@ -10,8 +10,8 @@ use secp256k1::{
 use crate::external::bip324;
 use crate::external::bip324::fschacha20poly1305::{FSChaCha20Poly1305, FSChaCha20Stream};
 use crate::protocol::{
-    NUM_GARBAGE_TERMINATOR_BYTES, NUM_HEADER_BYTES, NUM_LENGTH_BYTES, NUM_PACKET_OVERHEAD_BYTES,
-    NUM_TAG_BYTES, PacketType, Role,
+    EcdhPoint, MagicType, NUM_ELLIGATOR_SWIFT_BYTES, NUM_GARBAGE_TERMINATOR_BYTES,
+    NUM_HEADER_BYTES, NUM_LENGTH_BYTES, NUM_PACKET_OVERHEAD_BYTES, NUM_TAG_BYTES, PacketType, Role,
 };
 
 // Maximum packet size for automatic allocation.
@@ -532,6 +532,38 @@ impl SessionKeyMaterial {
     }
 }
 
+fn generate_session_keys_ecdh(
+    magic: [u8; 4],
+    role: Role,
+    point: &EcdhPoint,
+    client_key: &[u8; NUM_ELLIGATOR_SWIFT_BYTES],
+) -> Result<SessionKeyMaterial, String> {
+    let their_ellswift = ElligatorSwift::from_array(*client_key);
+
+    let (initiator_ellswift, responder_ellswift, secret, party) = match role {
+        Role::Initiator => (
+            point.elligator_swift,
+            their_ellswift,
+            point.secret_key,
+            ElligatorSwiftParty::A,
+        ),
+        Role::Responder => (
+            their_ellswift,
+            point.elligator_swift,
+            point.secret_key,
+            ElligatorSwiftParty::B,
+        ),
+    };
+
+    let skm =
+        SessionKeyMaterial::from_ecdh(initiator_ellswift, responder_ellswift, secret, party, magic)
+            .map_err(|_| "Error creating the shared key".to_string());
+
+    let skm = skm.unwrap();
+
+    Ok(skm) // TODO: remove me
+}
+
 /// Manages cipher state for a BIP-324 encrypted connection.
 #[derive(Debug, Clone)]
 pub struct CipherSession {
@@ -541,10 +573,13 @@ pub struct CipherSession {
     pub inbound: InboundCipher,
     /// Encrypts outbound packets.
     pub outbound: OutboundCipher,
+    pub inbound_garbage_terminator: [u8; NUM_GARBAGE_TERMINATOR_BYTES],
+    pub outbound_garbage_terminator: [u8; NUM_GARBAGE_TERMINATOR_BYTES],
 }
 
 impl CipherSession {
     pub fn new(mut materials: SessionKeyMaterial, role: Role) -> Self {
+        // Change the material contents s.t. we look like the "Initiator"
         if role == Role::Responder {
             std::mem::swap(
                 &mut materials.initiator_length_key,
@@ -553,6 +588,10 @@ impl CipherSession {
             std::mem::swap(
                 &mut materials.initiator_packet_key,
                 &mut materials.responder_packet_key,
+            );
+            std::mem::swap(
+                &mut materials.initiator_garbage_terminator,
+                &mut materials.responder_garbage_terminator,
             );
         }
 
@@ -571,7 +610,22 @@ impl CipherSession {
                 length_cipher: outbound_length_cipher,
                 packet_cipher: outbound_packet_cipher,
             },
+            inbound_garbage_terminator: materials.responder_garbage_terminator,
+            outbound_garbage_terminator: materials.initiator_garbage_terminator,
         }
+    }
+
+    pub fn new_from_shares(
+        magic: MagicType,
+        role: Role,
+        secret_point: EcdhPoint,
+        other_key_ellswift: &[u8; NUM_ELLIGATOR_SWIFT_BYTES],
+    ) -> Result<Self, String> {
+        let session_keys =
+            generate_session_keys_ecdh(magic, role, &secret_point, other_key_ellswift)
+                .map_err(|_| "Can't generate secret key")?;
+
+        Ok(Self::new(session_keys, role))
     }
 
     /// Unique session ID.

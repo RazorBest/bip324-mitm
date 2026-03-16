@@ -18,6 +18,21 @@ pub const DECOY_BYTE: u8 = 128;
 // Number of bytes for the garbage terminator.
 pub const NUM_GARBAGE_TERMINATOR_BYTES: usize = 16;
 
+/// The "Magic Bytes" used by Bitcoin to identify the mainnet network
+pub const MAINNET_MAGIC: [u8; 4] = [0xF9, 0xBE, 0xB4, 0xD9];
+/// The "Magic Bytes" used by Bitcoin to identify the testnet network
+pub const TESTNET_MAGIC: [u8; 4] = [0x0B, 0x11, 0x09, 0x07];
+/// The "Magic Bytes" used by Bitcoin to identify the regtest network
+pub const REGTEST_MAGIC: [u8; 4] = [0xFA, 0xBF, 0xB5, 0xDA];
+// Number of bytes in elligator swift key.
+pub const NUM_ELLIGATOR_SWIFT_BYTES: usize = 64;
+pub const NUM_SECRET_BYTES: usize = 32;
+
+pub type MagicType = [u8; 4];
+pub type GarbageTerminatorType = [u8; NUM_GARBAGE_TERMINATOR_BYTES];
+pub type AADType = Vec<u8>;
+pub type TagType = Vec<u8>;
+
 /// A wrapper over Err(std::io::Error(..))
 #[allow(non_snake_case)]
 fn IOError<T, E>(kind: std::io::ErrorKind, error: E) -> std::io::Result<T>

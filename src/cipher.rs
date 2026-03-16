@@ -427,17 +427,18 @@ impl LengthDecryptor {
         self.length_cipher.apply_keystream(content_len);
         self.remaining_bytes -= content_len.len();
 
-        self.len_bytes.extend_from_slice(&content_len);
+        self.len_bytes.extend_from_slice(content_len);
 
         Ok(())
     }
 
+    #[allow(clippy::assertions_on_constants)]
     pub fn try_end(self) -> Result<(FSChaCha20Stream, usize), Self> {
-        debug_assert!(NUM_LENGTH_BYTES == 3);
-        debug_assert!(self.len_bytes.len() == 3);
         if self.remaining_bytes > 0 {
             Err(self)
         } else {
+            debug_assert!(NUM_LENGTH_BYTES == 3);
+            debug_assert!(self.len_bytes.len() == 3);
             let decoded_len =
                 u32::from_le_bytes([self.len_bytes[0], self.len_bytes[1], self.len_bytes[2], 0])
                     as usize

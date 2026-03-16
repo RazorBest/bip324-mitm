@@ -203,11 +203,27 @@ impl fmt::Debug for OutboundCipher {
 /// Decrypts packets received from the remote peer.
 #[derive(Clone)]
 pub struct InboundCipher {
-    pub length_cipher: FSChaCha20Stream,
+    pub length_cipher: Option<FSChaCha20Stream>,
     pub packet_cipher: FSChaCha20Poly1305,
 }
 
 impl InboundCipher {
+    pub fn get_new_length_decryptor(&mut self) -> Result<LengthDecryptor, String> {
+        let Some(length_cipher) = self.length_cipher.take() else {
+            return Err("A length decryptor is already being used".to_string());
+        };
+
+        Ok(LengthDecryptor::new(length_cipher))
+    }
+
+    pub fn reown_length_cipher(&mut self, length_cipher: FSChaCha20Stream) -> Result<(), String> {
+        if self.length_cipher.is_some() {
+            return Err("Can't own a length_cipher. Already owning one".to_string());
+        }
+        self.length_cipher = Some(length_cipher);
+
+        Ok(())
+    }
     /// Decrypt the length of the packet's payload.
     ///
     /// Note that this returns the length of the remaining packet data
@@ -221,11 +237,21 @@ impl InboundCipher {
     ///
     /// The length of the rest of the packet.
     pub fn decrypt_packet_len(&mut self, mut len_bytes: [u8; NUM_LENGTH_BYTES]) -> usize {
-        self.length_cipher.apply_keystream(&mut len_bytes);
+        self.length_cipher
+            .as_mut()
+            .unwrap()
+            .apply_keystream(&mut len_bytes);
 
         u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], 0]) as usize
             + NUM_HEADER_BYTES
             + NUM_TAG_BYTES
+    }
+
+    pub fn decrypt_len_part_inplace(&mut self, content_len: &mut [u8]) {
+        self.length_cipher
+            .as_mut()
+            .unwrap()
+            .apply_keystream(content_len);
     }
 
     /// Calculate the required decryption buffer length from packet length.
@@ -379,6 +405,50 @@ impl fmt::Debug for InboundCipher {
     }
 }
 
+pub struct LengthDecryptor {
+    pub remaining_bytes: usize,
+    pub length_cipher: FSChaCha20Stream,
+    pub len_bytes: Vec<u8>,
+}
+
+impl LengthDecryptor {
+    pub fn new(length_cipher: FSChaCha20Stream) -> Self {
+        Self {
+            remaining_bytes: NUM_LENGTH_BYTES,
+            length_cipher,
+            len_bytes: vec![],
+        }
+    }
+
+    pub fn decrypt_len_part_inplace(&mut self, content_len: &mut [u8]) -> Result<(), String> {
+        if content_len.len() > self.remaining_bytes {
+            return Err("Buffer too big".to_string());
+        }
+        self.length_cipher.apply_keystream(content_len);
+        self.remaining_bytes -= content_len.len();
+
+        self.len_bytes.extend_from_slice(&content_len);
+
+        Ok(())
+    }
+
+    pub fn try_end(self) -> Result<(FSChaCha20Stream, usize), Self> {
+        debug_assert!(NUM_LENGTH_BYTES == 3);
+        debug_assert!(self.len_bytes.len() == 3);
+        if self.remaining_bytes > 0 {
+            Err(self)
+        } else {
+            let decoded_len =
+                u32::from_le_bytes([self.len_bytes[0], self.len_bytes[1], self.len_bytes[2], 0])
+                    as usize
+                    + NUM_HEADER_BYTES
+                    + NUM_TAG_BYTES;
+
+            Ok((self.length_cipher, decoded_len))
+        }
+    }
+}
+
 /// All keys derived from the ECDH.
 #[derive(Clone)]
 pub struct SessionKeyMaterial {
@@ -493,7 +563,7 @@ impl CipherSession {
         CipherSession {
             id: materials.session_id,
             inbound: InboundCipher {
-                length_cipher: inbound_length_cipher,
+                length_cipher: Some(inbound_length_cipher),
                 packet_cipher: inbound_packet_cipher,
             },
             outbound: OutboundCipher {

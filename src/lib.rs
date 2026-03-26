@@ -2,6 +2,7 @@ pub mod cipher;
 pub mod external;
 mod fmt_utils;
 pub mod protocol;
+mod state_machine;
 
 use std::cell::RefCell;
 use std::cmp;
@@ -19,32 +20,18 @@ use crate::cipher::{CipherSession, InboundCipher, LengthDecryptor, OutboundCiphe
 use crate::external::chacha20_poly1305::ChaCha20Poly1305Stream;
 use crate::protocol::{
     AADType, EcdhPoint, GarbageTerminatorType, MAINNET_MAGIC, MagicType, NUM_ELLIGATOR_SWIFT_BYTES,
-    NUM_GARBAGE_TERMINATOR_BYTES, NUM_LENGTH_BYTES, NUM_SECRET_BYTES, NUM_TAG_BYTES, PartialPacket,
+    NUM_LENGTH_BYTES, NUM_SECRET_BYTES, NUM_TAG_BYTES, PartialPacket,
     ProtocolBuffer, REGTEST_MAGIC, Role, TESTNET_MAGIC, TagType, find_garbage,
+};
+use crate::state_machine::{
+    BufReader, BufWriter, HasFinal, ProtocolReadParser, ProtocolStatus, ProtocolWriteParser,
+    StreamReadParser, StreamWriteParser,
 };
 
 // Maximum packet size for automatic allocation.
 // Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH is 4,000,000 bytes (~4 MiB).
 // 14 extra bytes are for the BIP-324 header byte and 13 serialization header bytes (message type).
 const MAX_PACKET_SIZE_FOR_ALLOCATION: usize = 4000014;
-
-#[derive(Debug)]
-enum HandshakeBIP324State {
-    ReceivingKey(EcdhPoint),
-    ReceivingGarbage(GarbageTerminatorType),
-    HandshakeDone,
-    Invalid,
-}
-
-impl HandshakeBIP324State {
-    fn take(&mut self) -> Self {
-        mem::replace(self, Self::Invalid)
-    }
-
-    fn handshake_done(&self) -> bool {
-        matches!(self, Self::HandshakeDone)
-    }
-}
 
 struct FakePeerRelay {
     key: ProtocolBuffer,
@@ -311,29 +298,6 @@ impl FakePeerRelayReader for FakePeerRelay {
     }
 }
 
-#[derive(PartialEq)]
-enum HandshakeRelayPeerState {
-    SendingKey,
-    SendingGarbage,
-    SendingGarbageTerminator,
-    HandshakeDone,
-    Invalid,
-}
-
-impl HandshakeRelayPeerState {
-    fn new() -> Self {
-        Self::SendingKey
-    }
-
-    fn take(&mut self) -> Self {
-        mem::replace(self, Self::Invalid)
-    }
-
-    fn handshake_done(&self) -> bool {
-        *self == Self::HandshakeDone
-    }
-}
-
 enum RelayPeerState {
     SendingLength(usize, Vec<u8>),
     SendingPayload(usize, ChaCha20Poly1305Stream),
@@ -351,13 +315,56 @@ impl RelayPeerState {
     }
 }
 
+#[derive(PartialEq)]
+pub enum HandshakeRelayPeerState {
+    SendingKey,
+    SendingGarbage,
+    SendingGarbageTerminator,
+    HandshakeDone,
+    Invalid,
+}
+
+impl HandshakeRelayPeerState {
+    fn new() -> Self {
+        Self::SendingKey
+    }
+
+    fn take(&mut self) -> Self {
+        mem::replace(self, Self::Invalid)
+    }
+}
+
+impl HasFinal for HandshakeRelayPeerState {
+    fn is_final(&self) -> bool {
+        matches!(self, Self::HandshakeDone)
+    }
+}
+
+#[derive(Debug)]
+pub enum HandshakeBIP324State {
+    ReceivingKey(EcdhPoint, usize),
+    ReceivingGarbage(GarbageTerminatorType),
+    HandshakeDone(AADType),
+    Invalid,
+}
+
+impl HandshakeBIP324State {
+    pub fn take(&mut self) -> Self {
+        mem::replace(self, Self::Invalid)
+    }
+}
+
+impl HasFinal for HandshakeBIP324State {
+    fn is_final(&self) -> bool {
+        matches!(self, Self::HandshakeDone(_))
+    }
+}
+
 pub struct MitmHandshakeImpersonatorLeg {
     role: Role,
     magic: MagicType,
     state: HandshakeBIP324State,
     sending_state: HandshakeRelayPeerState,
-
-    peer: ProtocolBuffer,
 
     key_to_send: Vec<u8>,
     garbage_terminator_to_send: Vec<u8>,
@@ -366,7 +373,10 @@ pub struct MitmHandshakeImpersonatorLeg {
     relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
 
     other_key: Option<[u8; NUM_ELLIGATOR_SWIFT_BYTES]>,
-    mitm_post_handshake: Option<MitmImpersonatorLeg>,
+
+    read_buffer: Vec<u8>,
+
+    cipher: Option<CipherSession>,
 }
 
 impl MitmHandshakeImpersonatorLeg {
@@ -387,15 +397,15 @@ impl MitmHandshakeImpersonatorLeg {
         Self {
             role,
             magic,
-            state: HandshakeBIP324State::ReceivingKey(point),
+            state: HandshakeBIP324State::ReceivingKey(point, NUM_ELLIGATOR_SWIFT_BYTES),
             sending_state: HandshakeRelayPeerState::new(),
-            peer: ProtocolBuffer::new(),
             key_to_send,
             garbage_terminator_to_send: vec![],
             relay_in,
             relay_out,
             other_key: None,
-            mitm_post_handshake: None,
+            read_buffer: vec![],
+            cipher: None,
         }
     }
 
@@ -422,15 +432,8 @@ impl MitmHandshakeImpersonatorLeg {
             CipherSession::new_from_shares(self.magic, self.role, point, &self.other_key.unwrap())?;
         let inbound_garbage_terminator = cipher.inbound_garbage_terminator;
         let outbound_garbage_terminator = cipher.outbound_garbage_terminator;
-        let (inbound_cipher, outbound_cipher) = cipher.into_split();
-        self.mitm_post_handshake = Some(MitmImpersonatorLeg::new(
-            vec![],
-            self.relay_in.clone(),
-            self.relay_out.clone(),
-            inbound_cipher,
-            outbound_cipher,
-        ));
 
+        self.cipher = Some(cipher);
         self.garbage_terminator_to_send = outbound_garbage_terminator.to_vec();
 
         Ok(inbound_garbage_terminator)
@@ -439,9 +442,7 @@ impl MitmHandshakeImpersonatorLeg {
     pub fn set_secret(&mut self, secret: [u8; NUM_SECRET_BYTES]) -> Result<(), String> {
         use HandshakeBIP324State::*;
 
-        if self.key_to_send.len() < NUM_ELLIGATOR_SWIFT_BYTES
-            || !matches!(self.state, HandshakeBIP324State::HandshakeDone)
-        {
+        if self.key_to_send.len() < NUM_ELLIGATOR_SWIFT_BYTES || self.state.is_final() {
             return Err(
                 "Can't change secret. Public key has already started to be sent".to_string(),
             );
@@ -454,8 +455,8 @@ impl MitmHandshakeImpersonatorLeg {
 
         self.key_to_send = key_to_send;
         match self.state.take() {
-            ReceivingKey(_old_point) => {
-                self.state = ReceivingKey(secret_key);
+            ReceivingKey(_old_point, remaining) => {
+                self.state = ReceivingKey(secret_key, remaining);
             }
             ReceivingGarbage(_old_other_garbage_terminator) => {
                 let inbound_garbage_terminator = self.on_share_received(secret_key)?;
@@ -470,192 +471,258 @@ impl MitmHandshakeImpersonatorLeg {
         Ok(())
     }
 
-    pub fn pass_peer_data(&mut self, data: &[u8]) -> Result<(), String> {
-        use HandshakeBIP324State::*;
+    pub fn is_handshake_done(&self) -> bool {
+        self.sending_state.is_final() && self.state.is_final()
+    }
 
-        if matches!(self.state, HandshakeDone) {
-            return self
-                .mitm_post_handshake
-                .as_mut()
-                .unwrap()
-                .pass_peer_data(data);
+    pub fn next_phase(self) -> Option<MitmImpersonatorLeg> {
+        if !self.is_handshake_done() {
+            return None;
         }
 
-        self.peer
-            .write(data)
-            .map_err(|_| "Peer buffer write error")?;
+        let (inbound_cipher, outbound_cipher) = self.cipher?.into_split();
 
-        let curr_state = self.state.take();
-        let (new_state, incomplete) = match curr_state {
-            ReceivingKey(point) => {
-                if let Some(key_data) = self.peer.try_consume(NUM_ELLIGATOR_SWIFT_BYTES) {
-                    let mut other_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-                    other_key.copy_from_slice(&key_data[..NUM_ELLIGATOR_SWIFT_BYTES]);
-                    self.other_key = Some(other_key);
+        Some(MitmImpersonatorLeg::new(
+            vec![],
+            self.relay_in.clone(),
+            self.relay_out.clone(),
+            inbound_cipher,
+            outbound_cipher,
+        ))
+    }
+}
 
-                    // The amount of bytes in the key that just came from the new data, and weren't
-                    // relayed yet
-                    let new_bytes_in_key = NUM_ELLIGATOR_SWIFT_BYTES
-                        - (NUM_ELLIGATOR_SWIFT_BYTES + self.peer.peek_len() - data.len());
-                    self.relay_out
-                        .borrow_mut()
-                        .write_key(&data[..new_bytes_in_key])
-                        .map_err(|_| "Error writing key to relay")?;
+impl ProtocolReadParser for MitmHandshakeImpersonatorLeg {
+    type State = HandshakeBIP324State;
+    type Error = ();
 
+    fn transition(
+        &mut self,
+        state: Self::State,
+        data: &mut dyn BufReader,
+    ) -> (Self::State, Result<ProtocolStatus, Self::Error>) {
+        use HandshakeBIP324State::*;
+
+        match state {
+            ReceivingKey(point, mut remaining) => {
+                let mut key_buf = vec![0u8; remaining];
+                // TODO: replace unwrap
+                let size = data.read(&mut key_buf).unwrap();
+                remaining -= size;
+
+                self.read_buffer.extend_from_slice(&key_buf[..size]);
+                // TODO: replace unwrap
+                self.relay_out
+                    .borrow_mut()
+                    .write_key(&key_buf[..size])
+                    .map_err(|_| "Error writing key to relay")
+                    .unwrap();
+
+                if remaining == 0 {
                     self.relay_out.borrow_mut().set_eof_key();
 
-                    let inbound_garbage_terminator = self.on_share_received(point)?;
+                    let mut other_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+                    other_key.copy_from_slice(&std::mem::take(&mut self.read_buffer));
+                    self.other_key = Some(other_key);
 
-                    (ReceivingGarbage(inbound_garbage_terminator), true)
+                    // TODO: remove unwrap
+                    let inbound_garbage_terminator = self.on_share_received(point).unwrap();
+
+                    (
+                        ReceivingGarbage(inbound_garbage_terminator),
+                        Ok(ProtocolStatus::Continue),
+                    )
                 } else {
-                    self.relay_out
-                        .borrow_mut()
-                        .write_key(data)
-                        .map_err(|_| "Error writing key to relay")?;
-
-                    (ReceivingKey(point), false)
+                    (ReceivingKey(point, remaining), Ok(ProtocolStatus::End))
                 }
             }
+            // This uses a peek-then-read strategy
             state @ ReceivingGarbage(other_garbage_terminator) => {
-                // Peek the buffer instead of consuming it
-                let buf = self.peer.buf_ref();
+                // The length under which we don't know if an array of data is a garbage terminator
+                let insurance_len = other_garbage_terminator.len() - 1;
+                let prevlen = self.read_buffer.len();
+                let mut relay_out = self.relay_out.borrow_mut();
 
-                // Search for the garbage terminator. If found, consume it.
-                if let Some((garbage, _rest)) = find_garbage(buf, other_garbage_terminator) {
-                    let mut relay_out = self.relay_out.borrow_mut();
-                    let garbage_len = garbage.len() - NUM_GARBAGE_TERMINATOR_BYTES;
-                    let garbage = self.peer.try_consume(garbage_len).unwrap();
-                    relay_out
-                        .write_garbage(&garbage)
-                        .map_err(|_| "Error writing garbage to relay")?;
-                    relay_out.set_eof_garbage();
+                // If the read buffer has data that can still be part of the garbage terminator
+                let mut found = {
+                    let data_buf = data.buf_ref();
+                    let mut to_consume = cmp::min(data_buf.len(), insurance_len);
 
-                    let garbage_terminator =
-                        self.peer.try_consume(NUM_GARBAGE_TERMINATOR_BYTES).unwrap();
-                    relay_out
-                        .write_terminator(&garbage_terminator)
-                        .map_err(|_| "Error writing garbage terminator to relay")?;
-                    relay_out.set_eof_terminator();
+                    self.read_buffer.extend_from_slice(&data_buf[..to_consume]);
 
-                    let aad = garbage.to_vec();
-                    self.mitm_post_handshake.as_mut().unwrap().set_aad(aad);
+                    // If terminator found, actually consume the buffer
+                    if let Some((_garbage, rest)) =
+                        find_garbage(&self.read_buffer, other_garbage_terminator)
+                    {
+                        to_consume -= rest.len();
+                        // TODO: replace unwrap
+                        let _ = data.read(&mut vec![0u8; to_consume]).unwrap();
 
-                    (HandshakeDone, true)
-                } else {
-                    // The last bytes might be part of a truncated garbage terminator, so we don't
-                    // consume everything
-                    let to_consume = if buf.len() > other_garbage_terminator.len() {
-                        buf.len() - other_garbage_terminator.len()
+                        // Remove the final bytes that are not part of the garbage
+                        self.read_buffer
+                            .resize(self.read_buffer.len() - rest.len(), 0u8);
+
+                        true
+                    // If terminator not found, restore the read buffer
                     } else {
-                        0
+                        self.read_buffer
+                            .resize(self.read_buffer.len() - to_consume, 0u8);
+
+                        false
+                    }
+                };
+
+                // If still not found, look for the garbage terminator in the new data
+                found = if !found {
+                    let data_buf = data.buf_ref();
+                    let res = find_garbage(data_buf, other_garbage_terminator);
+
+                    let (to_consume, found) = if let Some((garbage, _rest)) = res {
+                        (garbage.len(), true)
+                    } else {
+                        (data_buf.len(), false)
                     };
-                    let partial_garbage = self.peer.try_consume(to_consume).unwrap();
 
-                    self.relay_out
-                        .borrow_mut()
-                        .write_garbage(&partial_garbage)
-                        .map_err(|_| "Error writing garbage to relay")?;
+                    let mut buf = vec![0u8; to_consume];
+                    data.read_exact(&mut buf).unwrap();
+                    self.read_buffer.extend(buf);
 
-                    (state, false)
+                    found
+                } else {
+                    found
+                };
+
+                if found {
+                    // Here, we expect self.read_buffer to contain the garbage, including the
+                    // terminator
+
+                    let currlen = self.read_buffer.len();
+                    let garbage_len = currlen - other_garbage_terminator.len();
+                    let lhs = cmp::max(prevlen, insurance_len) - insurance_len;
+                    let new_range = lhs..garbage_len;
+                    relay_out
+                        .write_garbage(&self.read_buffer[new_range])
+                        // TODO: replace unwrap
+                        .map_err(|_| "Error writing garbage terminator to relay")
+                        .unwrap();
+
+                    relay_out
+                        .write_terminator(&self.read_buffer[garbage_len..])
+                        // TODO: replace unwrap
+                        .map_err(|_| "Error writing garbage terminator to relay")
+                        .unwrap();
+
+                    let aad: Vec<_> = self.read_buffer.splice(..garbage_len, []).collect();
+
+                    (HandshakeDone(aad), Ok(ProtocolStatus::End))
+                } else {
+                    let currlen = self.read_buffer.len();
+                    let lhs = cmp::max(prevlen, insurance_len) - insurance_len;
+                    let rhs = cmp::max(currlen, insurance_len) - insurance_len;
+                    // The range of data that wasn't relayed and we're sure it's garbage, and is not part of the terminator
+                    let new_range = lhs..rhs;
+                    relay_out
+                        .write_garbage(&self.read_buffer[new_range])
+                        // TODO: replace unwrap
+                        .map_err(|_| "Error writing garbage terminator to relay")
+                        .unwrap();
+
+                    (state, Ok(ProtocolStatus::End))
                 }
             }
+            state @ HandshakeDone(_) => (state, Ok(ProtocolStatus::End)),
             Invalid => {
                 panic!("Invalid protocol state");
             }
-            _ => {
-                panic!("Unhandled state")
-            }
-        };
-
-        self.state = new_state;
-
-        if matches!(self.state, HandshakeDone) && self.peer.peek_len() > 0 {
-            return self
-                .mitm_post_handshake
-                .as_mut()
-                .unwrap()
-                .pass_peer_data(data);
         }
-
-        if incomplete {
-            return self.pass_peer_data(&[]);
-        }
-
-        Ok(())
     }
 
-    /// Writes the data from the impersonator to the peer
-    pub fn write_data(&mut self, buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+    fn take_state(&mut self) -> Self::State {
+        self.state.take()
+    }
+
+    fn set_state(&mut self, state: Self::State) {
+        self.state = state;
+    }
+}
+
+impl ProtocolWriteParser for MitmHandshakeImpersonatorLeg {
+    type State = HandshakeRelayPeerState;
+    type Error = ();
+
+    fn transition(
+        &mut self,
+        state: Self::State,
+        data: &mut dyn BufWriter,
+    ) -> (Self::State, Result<ProtocolStatus, Self::Error>) {
         use HandshakeRelayPeerState::*;
 
-        if matches!(self.sending_state, HandshakeDone) {
-            return self.mitm_post_handshake.as_mut().unwrap().write_data(buf);
-        }
-
-        let sending_state = self.sending_state.take();
-        let (new_state, size, incomplete) = match sending_state {
+        match state {
             state @ SendingKey => {
-                let limit = cmp::min(buf.len(), self.key_to_send.len());
-                let _key_buf = &mut buf[..limit];
-                let size = self.relay_in.borrow_mut().read_key(_key_buf)?;
+                let limit = cmp::min(data.remaining(), self.key_to_send.len());
+                let mut _key_buf = vec![0u8; limit];
+                // TODO: replace unwrap
+                let size = self.relay_in.borrow_mut().read_key(&mut _key_buf).unwrap();
 
-                // The key is replaced by ours. We're not using the original one
-                let data_to_send: Vec<u8> = self.key_to_send.drain(..size).collect();
-                buf[..size].copy_from_slice(&data_to_send);
+                data.write_all(&self.key_to_send[..size]).unwrap();
+                self.key_to_send.splice(..size, []);
 
                 if self.key_to_send.is_empty() {
-                    (SendingGarbage, size, true)
+                    (SendingGarbage, Ok(ProtocolStatus::Continue))
                 } else {
-                    (state, size, false)
+                    (state, Ok(ProtocolStatus::End))
                 }
             }
             state @ SendingGarbage => {
-                let size = self.relay_in.borrow_mut().read_garbage(buf)?;
+                let limit = data.remaining();
+                let mut buf = vec![0u8; limit];
+                // TODO: replace unwrap
+                let size = self.relay_in.borrow_mut().read_garbage(&mut buf).unwrap();
+
+                data.write_all(&buf[..size]).unwrap();
 
                 if self.relay_in.borrow().peek_len_garbage() == 0
                     && self.relay_in.borrow().is_eof_garbage()
                 {
-                    (SendingGarbageTerminator, size, true)
+                    (SendingGarbageTerminator, Ok(ProtocolStatus::Continue))
                 } else {
-                    (state, size, false)
+                    (state, Ok(ProtocolStatus::End))
                 }
             }
             state @ SendingGarbageTerminator => {
-                let limit = cmp::min(buf.len(), self.garbage_terminator_to_send.len());
-                let _terminator_buf = &mut buf[..limit];
+                let limit = cmp::min(data.remaining(), self.garbage_terminator_to_send.len());
+                let mut _terminator_buf = vec![0u8; limit];
                 let size = self
                     .relay_in
                     .borrow_mut()
-                    .read_terminator(_terminator_buf)?;
+                    // TODO: replace unwrap
+                    .read_terminator(&mut _terminator_buf)
+                    .unwrap();
 
                 // The terminator is replaced by ours. We're not using the original one
-                let data_to_send: Vec<u8> = self.garbage_terminator_to_send.drain(..size).collect();
-                buf[..size].copy_from_slice(&data_to_send);
+                data.write_all(&self.garbage_terminator_to_send[..size])
+                    .unwrap();
+                self.garbage_terminator_to_send.splice(..size, []);
 
                 if self.garbage_terminator_to_send.is_empty() {
-                    (HandshakeDone, size, true)
+                    (HandshakeDone, Ok(ProtocolStatus::End))
                 } else {
-                    (state, size, false)
+                    (state, Ok(ProtocolStatus::End))
                 }
             }
+            state @ HandshakeDone => (state, Ok(ProtocolStatus::End)),
             Invalid => {
                 panic!("Invalid server state")
             }
-            _ => {
-                panic!("Unhandled state")
-            }
-        };
-
-        self.sending_state = new_state;
-        if incomplete {
-            return Ok(size + self.write_data(&mut buf[size..])?);
         }
-
-        Ok(size)
     }
 
-    pub fn is_handshake_done(&self) -> bool {
-        self.sending_state.handshake_done() && self.state.handshake_done()
+    fn take_state(&mut self) -> Self::State {
+        self.sending_state.take()
+    }
+
+    fn set_state(&mut self, state: Self::State) {
+        self.sending_state = state;
     }
 }
 
@@ -985,20 +1052,36 @@ impl MitmHandshakeBridge {
         self.client_leg.set_secret(secret)
     }
 
-    pub fn client_write(&mut self, data: &[u8]) -> Result<(), String> {
-        self.server_leg.pass_peer_data(data)
+    pub fn client_write(&mut self, mut data: &[u8]) -> Result<(), String> {
+        self.server_leg
+            .consume(&mut data)
+            .map_err(|_| "Server leg error".to_string())
     }
 
-    pub fn server_write(&mut self, data: &[u8]) -> Result<(), String> {
-        self.client_leg.pass_peer_data(data)
+    pub fn server_write(&mut self, mut data: &[u8]) -> Result<(), String> {
+        self.client_leg
+            .consume(&mut data)
+            .map_err(|_| "Client leg error".to_string())
     }
 
-    pub fn client_read(&mut self, buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
-        self.server_leg.write_data(buf)
+    pub fn client_read(&mut self, mut buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+        let initial_buf_len = buf.len();
+        let res = self.server_leg.produce(&mut buf);
+        let written = initial_buf_len - buf.len();
+
+        Ok(res
+            .map(|_| written)
+            .map_err(|_| "Server leg error".to_string())?)
     }
 
-    pub fn server_read(&mut self, buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
-        self.client_leg.write_data(buf)
+    pub fn server_read(&mut self, mut buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+        let initial_buf_len = buf.len();
+        let res = self.client_leg.produce(&mut buf);
+        let written = initial_buf_len - buf.len();
+
+        Ok(res
+            .map(|_| written)
+            .map_err(|_| "Client leg error".to_string())?)
     }
 
     pub fn is_handshake_done(&self) -> bool {
@@ -1011,8 +1094,8 @@ impl MitmHandshakeBridge {
         }
 
         MitmBridge::new(
-            self.client_leg.mitm_post_handshake.unwrap(),
-            self.server_leg.mitm_post_handshake.unwrap(),
+            self.client_leg.next_phase().unwrap(),
+            self.server_leg.next_phase().unwrap(),
         )
     }
 }
@@ -1543,8 +1626,10 @@ mod mitmfakepeerbip324_tests {
         let (mut server, _, _) = get_mitm_fake_server();
 
         // Send one key byte
+        let buf = [0xa3];
+        let mut bufref = &buf[..];
         server
-            .pass_peer_data(&[0xa3])
+            .consume(&mut bufref)
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.state,
@@ -1552,8 +1637,10 @@ mod mitmfakepeerbip324_tests {
         ));
 
         // Send another key byte
+        let buf = [0xa3];
+        let mut bufref = &buf[..];
         server
-            .pass_peer_data(&[0xa3])
+            .consume(&mut bufref)
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.state,
@@ -1561,8 +1648,10 @@ mod mitmfakepeerbip324_tests {
         ));
 
         // Send all the key bytes, except for the last one
+        let buf = [0x73; NUM_ELLIGATOR_SWIFT_BYTES - 2 - 1];
+        let mut bufref = &buf[..];
         server
-            .pass_peer_data(&[0x73; NUM_ELLIGATOR_SWIFT_BYTES - 2 - 1])
+            .consume(&mut bufref)
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.state,
@@ -1570,8 +1659,10 @@ mod mitmfakepeerbip324_tests {
         ));
 
         // Send all the key bytes, except for the last one
+        let buf = [0x29];
+        let mut bufref = &buf[..];
         server
-            .pass_peer_data(&[0x29])
+            .consume(&mut bufref)
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.state,
@@ -1584,8 +1675,10 @@ mod mitmfakepeerbip324_tests {
         let (mut server, _, _) = get_mitm_fake_server();
 
         // Send all the key bytes
+        let buf = [0x73; NUM_ELLIGATOR_SWIFT_BYTES];
+        let mut bufref = &buf[..];
         server
-            .pass_peer_data(&[0x73; NUM_ELLIGATOR_SWIFT_BYTES])
+            .consume(&mut bufref)
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.state,
@@ -1598,8 +1691,10 @@ mod mitmfakepeerbip324_tests {
         let (mut server, _, _) = get_mitm_fake_server();
 
         // Send more than the key bytes
+        let buf = [0x73; NUM_ELLIGATOR_SWIFT_BYTES + 10];
+        let mut bufref = &buf[..];
         server
-            .pass_peer_data(&[0x73; NUM_ELLIGATOR_SWIFT_BYTES + 10])
+            .consume(&mut bufref)
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.state,
@@ -1614,8 +1709,10 @@ mod mitmfakepeerbip324_tests {
         let (mut server, _, _) = get_mitm_fake_server();
 
         // Send all the key bytes
+        let buf = [0x73; NUM_ELLIGATOR_SWIFT_BYTES];
+        let mut bufref = &buf[..];
         server
-            .pass_peer_data(&[0x73; NUM_ELLIGATOR_SWIFT_BYTES])
+            .consume(&mut bufref)
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.state,
@@ -1623,8 +1720,11 @@ mod mitmfakepeerbip324_tests {
         ));
 
         let mut buf = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+        let buf_len = buf.len();
         let initial_buf = buf.clone();
-        let size = server.write_data(&mut buf).expect("Error on write_data");
+        let mut bufref = &mut buf[..];
+        server.produce(&mut bufref).expect("Error on produce");
+        let size = buf_len - bufref.len();
         assert_eq!(size, 0, "Expected write_data to not write anything");
         assert_eq!(buf, initial_buf, "Expected the buffer to stay empty");
     }
@@ -1649,24 +1749,19 @@ mod mitmfakepeerbip324_tests {
             "The generated secret key is different from the expected one"
         );
 
+        let mut client_keyref = &client_key[..];
         server
-            .pass_peer_data(&client_key)
+            .consume(&mut client_keyref)
             .expect("Error on pass_peer_data");
         let HandshakeBIP324State::ReceivingGarbage(other_garbage_terminator) = server.state else {
             panic!("Wrong state after receiving key");
         };
 
-        let mitm_post_handshake = server.mitm_post_handshake.as_ref().unwrap();
+        // let mitm_post_handshake = server.next_phase().unwrap();
+        let cipher = server.cipher.unwrap();
+        let (inbound_cipher, outbound_cipher) = cipher.into_split();
 
-        let MitmImpersonatorLegState::ReceivingPacketLen(length_decryptor) =
-            &mitm_post_handshake.state
-        else {
-            panic!("Wrong state after receiving key in MitmPostHandshake");
-        };
-
-        let inbound_cipher = &mitm_post_handshake.inbound_cipher;
-        let outbound_cipher = &mitm_post_handshake.outbound_cipher;
-        assert_eq!(length_decryptor.length_cipher.key_bytes, initiator_l);
+        assert_eq!(inbound_cipher.length_cipher.unwrap().key_bytes, initiator_l);
         assert_eq!(inbound_cipher.packet_cipher.key_bytes, initiator_p);
         assert_eq!(outbound_cipher.length_cipher.key_bytes, responder_l);
         assert_eq!(outbound_cipher.packet_cipher.key_bytes, responder_p);
@@ -1680,8 +1775,10 @@ mod mitmfakepeerbip324_tests {
         let (mut server, relay_in, _) = get_mitm_fake_server();
 
         // Send all the key bytes
+        let buf = [0x73; NUM_ELLIGATOR_SWIFT_BYTES];
+        let mut bufref = &buf[..];
         server
-            .pass_peer_data(&[0x73; NUM_ELLIGATOR_SWIFT_BYTES])
+            .consume(&mut bufref)
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.state,
@@ -1696,14 +1793,15 @@ mod mitmfakepeerbip324_tests {
                 .borrow_mut()
                 .write_key(&buf)
                 .expect("Write to relay_in must to fail");
-            let size = server
-                .write_data(&mut out_buf[i..])
-                .expect("Error on write_data");
+
+            let mut writer = &mut out_buf[i..i + 1];
+            server.produce(&mut writer).expect("Error on produce");
+            let size = 1 - writer.len();
             assert_eq!(size, 1, "Expected write_data to write one byte at step {i}");
 
-            let size = server
-                .write_data(&mut out_buf[i..])
-                .expect("Error on write_data");
+            let mut writer = &mut out_buf[i..i + 1];
+            server.produce(&mut writer).expect("Error on produce");
+            let size = 1 - writer.len();
             assert_eq!(size, 0, "Expected write_data to not write byte at step {i}");
         }
 
@@ -1724,9 +1822,10 @@ mod mitmfakepeerbip324_tests {
             .expect("Write must not fail");
 
         let mut sent_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-        let size = server
-            .write_data(&mut sent_key)
-            .expect("Error on write_data");
+        let sent_key_len = sent_key.len();
+        let mut sent_keyref = &mut sent_key[..];
+        server.produce(&mut sent_keyref).expect("Error on produce");
+        let size = sent_key_len - sent_keyref.len();
         assert_eq!(
             size, NUM_ELLIGATOR_SWIFT_BYTES,
             "Fake server must send the entire key"
@@ -1744,8 +1843,10 @@ mod mitmfakepeerbip324_tests {
             .expect("Write must not fail");
 
         // Client sends something
+        let buf = [0x73; 3];
+        let mut bufref = &buf[..];
         server
-            .pass_peer_data(&[0x73; 3])
+            .consume(&mut bufref)
             .expect("Error on pass_peer_data");
 
         // Server sends something again
@@ -1755,14 +1856,17 @@ mod mitmfakepeerbip324_tests {
             .expect("Write must not fail");
 
         // Client sends something again
+        let buf = [0x73; 4];
+        let mut bufref = &buf[..];
         server
-            .pass_peer_data(&[0x73; 4])
+            .consume(&mut bufref)
             .expect("Error on pass_peer_data");
 
         let mut sent_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-        let size = server
-            .write_data(&mut sent_key)
-            .expect("Error on write_data");
+        let sent_key_len = sent_key.len();
+        let mut sent_keyref = &mut sent_key[..];
+        server.produce(&mut sent_keyref).expect("Error on produce");
+        let size = sent_key_len - sent_keyref.len();
         assert_eq!(size, 4, "Fake server must send 4 byte keys")
     }
 
@@ -1788,9 +1892,10 @@ mod mitmfakepeerbip324_tests {
             .expect("Write must not fail");
 
         let mut sent_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-        let size = server
-            .write_data(&mut sent_key)
-            .expect("Error on write_data");
+        let sent_key_len = sent_key.len();
+        let mut sent_keyref = &mut sent_key[..];
+        server.produce(&mut sent_keyref).expect("Error on produce");
+        let size = sent_key_len - sent_keyref.len();
         assert_eq!(
             size, NUM_ELLIGATOR_SWIFT_BYTES,
             "Fake server must send the entire key"
@@ -1818,9 +1923,10 @@ mod mitmfakepeerbip324_tests {
 
         // Fake server sends key
         let mut sent_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-        let size = server
-            .write_data(&mut sent_key)
-            .expect("Error on write_data");
+        let sent_key_len = sent_key.len();
+        let mut sent_keyref = &mut sent_key[..];
+        server.produce(&mut sent_keyref).expect("Error on produce");
+        let size = sent_key_len - sent_keyref.len();
         assert_eq!(
             size, NUM_ELLIGATOR_SWIFT_BYTES,
             "Fake server must send the entire key"
@@ -1828,9 +1934,12 @@ mod mitmfakepeerbip324_tests {
 
         // Fake server sends garbage
         let mut sent_garbage = [0u8; 128];
-        let size = server
-            .write_data(&mut sent_garbage)
-            .expect("Error on write_data");
+        let sent_garbage_len = sent_garbage.len();
+        let mut sent_garbageref = &mut sent_garbage[..];
+        server
+            .produce(&mut sent_garbageref)
+            .expect("Error on produce");
+        let size = sent_garbage_len - sent_garbageref.len();
         assert_eq!(
             sent_garbage[..size],
             real_garbage,
@@ -1843,8 +1952,10 @@ mod mitmfakepeerbip324_tests {
         let (mut server, relay_in, _) = get_mitm_fake_server();
 
         // Client sends key
+        let buf = [0x73; NUM_ELLIGATOR_SWIFT_BYTES - 1];
+        let mut bufref = &buf[..];
         server
-            .pass_peer_data(&[0x73; NUM_ELLIGATOR_SWIFT_BYTES - 1])
+            .consume(&mut bufref)
             .expect("Error on pass_peer_data");
 
         // Real server sends the key
@@ -1863,9 +1974,10 @@ mod mitmfakepeerbip324_tests {
 
         // Fake server sends key
         let mut sent_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-        let size = server
-            .write_data(&mut sent_key)
-            .expect("Error on write_data");
+        let sent_key_len = sent_key.len();
+        let mut sent_keyref = &mut sent_key[..];
+        server.produce(&mut sent_keyref).expect("Error on produce");
+        let size = sent_key_len - sent_keyref.len();
         assert_eq!(
             size, NUM_ELLIGATOR_SWIFT_BYTES,
             "Fake server must send the entire key"
@@ -1873,9 +1985,12 @@ mod mitmfakepeerbip324_tests {
 
         // Fake server sends garbage
         let mut sent_garbage = [0u8; 128];
-        let size = server
-            .write_data(&mut sent_garbage)
-            .expect("Error on write_data");
+        let sent_garbage_len = sent_garbage.len();
+        let mut sent_garbageref = &mut sent_garbage[..];
+        server
+            .produce(&mut sent_garbageref)
+            .expect("Error on produce");
+        let size = sent_garbage_len - sent_garbageref.len();
         assert_eq!(
             sent_garbage[..size],
             real_garbage,
@@ -1888,8 +2003,10 @@ mod mitmfakepeerbip324_tests {
         let (mut server, relay_in, _) = get_mitm_fake_server();
 
         // Client sends partial key
+        let buf = [0x73; NUM_ELLIGATOR_SWIFT_BYTES];
+        let mut bufref = &buf[..];
         server
-            .pass_peer_data(&[0x73; NUM_ELLIGATOR_SWIFT_BYTES])
+            .consume(&mut bufref)
             .expect("Error on pass_peer_data");
 
         // Real server sends the key
@@ -1908,9 +2025,10 @@ mod mitmfakepeerbip324_tests {
 
         // Fake server sends key
         let mut sent_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-        let size = server
-            .write_data(&mut sent_key)
-            .expect("Error on write_data");
+        let sent_key_len = sent_key.len();
+        let mut sent_keyref = &mut sent_key[..];
+        server.produce(&mut sent_keyref).expect("Error on produce");
+        let size = sent_key_len - sent_keyref.len();
         assert_eq!(
             size, NUM_ELLIGATOR_SWIFT_BYTES,
             "Fake server must send the entire key"
@@ -1918,9 +2036,12 @@ mod mitmfakepeerbip324_tests {
 
         // Fake server sends garbage
         let mut sent_garbage = [0u8; 128];
-        let size = server
-            .write_data(&mut sent_garbage)
-            .expect("Error on write_data");
+        let sent_garbage_len = sent_garbage.len();
+        let mut sent_garbageref = &mut sent_garbage[..];
+        server
+            .produce(&mut sent_garbageref)
+            .expect("Error on produce");
+        let size = sent_garbage_len - sent_garbageref.len();
         assert_eq!(
             sent_garbage[..size],
             real_garbage,
@@ -1945,8 +2066,9 @@ mod mitmfakepeerbip324_tests {
         );
 
         // Real client sends the key
+        let mut client_keyref = &client_key[..];
         server
-            .pass_peer_data(&client_key)
+            .consume(&mut client_keyref)
             .expect("Error on pass_peer_data");
 
         // Real server sends the key
@@ -1968,14 +2090,15 @@ mod mitmfakepeerbip324_tests {
         let garbage_terminator = [75u8; NUM_GARBAGE_TERMINATOR_BYTES];
         relay_in
             .borrow_mut()
-            .write_terminator(&garbage)
+            .write_terminator(&garbage_terminator)
             .expect("Write must not fail");
         relay_in.borrow_mut().set_eof_terminator();
 
         let mut sent_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-        let size = server
-            .write_data(&mut sent_key)
-            .expect("Error on write_data");
+        let sent_key_len = sent_key.len();
+        let mut sent_keyref = &mut sent_key[..];
+        server.produce(&mut sent_keyref).expect("Error on produce");
+        let size = sent_key_len - sent_keyref.len();
         assert_eq!(
             size, NUM_ELLIGATOR_SWIFT_BYTES,
             "Fake server must send the entire key"
@@ -1984,9 +2107,12 @@ mod mitmfakepeerbip324_tests {
 
         let expected_len = garbage.len() + garbage_terminator.len();
         let mut sent_garbage = [0u8; 200];
-        let size = server
-            .write_data(&mut sent_garbage)
-            .expect("Error on write_data");
+        let sent_garbage_len = sent_garbage.len();
+        let mut sent_garbageref = &mut sent_garbage[..];
+        server
+            .produce(&mut sent_garbageref)
+            .expect("Error on produce");
+        let size = sent_garbage_len - sent_garbageref.len();
         assert_eq!(
             size, expected_len,
             "Fake server must send the entire garbage"
@@ -2026,8 +2152,9 @@ mod mitmfakepeerbip324_tests {
         };
 
         // Other sends the key
+        let mut in_ellswift_theirsref = &in_ellswift_theirs[..];
         impersonator
-            .pass_peer_data(&in_ellswift_theirs)
+            .consume(&mut in_ellswift_theirsref)
             .expect("Error on pass_peer_data");
 
         // Other sends the garbage
@@ -2042,13 +2169,15 @@ mod mitmfakepeerbip324_tests {
             .expect("Write must not fail");
 
         // Other sends the garbage terminator
+        let mut mid_recv_garbage_terminatorref = &mid_recv_garbage_terminator[..];
         impersonator
-            .pass_peer_data(&mid_recv_garbage_terminator)
+            .consume(&mut mid_recv_garbage_terminatorref)
             .expect("Error on pass_peer_data");
 
         // Other seends a packet
+        let mut out_ciphertextref = &out_ciphertext[..];
         impersonator
-            .pass_peer_data(&out_ciphertext)
+            .consume(&mut out_ciphertextref)
             .expect("Error on pass_peer_data");
 
         // Real self sends the entire garbage
@@ -2106,9 +2235,10 @@ mod mitmfakepeerbip324_tests {
         {
             let buf_len = NUM_ELLIGATOR_SWIFT_BYTES;
             let mut buf = vec![0u8; buf_len];
-            let size = impersonator
-                .write_data(&mut buf)
-                .expect("Error on write_data");
+            let buf_len = buf.len();
+            let mut bufref = &mut buf[..];
+            impersonator.produce(&mut bufref).expect("Error on produce");
+            let size = buf_len - bufref.len();
             assert_eq!(size, buf_len, "Buffer was not filled");
             assert_eq!(buf, in_ellswift_ours);
         }
@@ -2117,27 +2247,33 @@ mod mitmfakepeerbip324_tests {
         {
             let buf_len = garbage.len();
             let mut buf = vec![0u8; buf_len];
-            let size = impersonator
-                .write_data(&mut buf)
-                .expect("Error on write_data");
+            let buf_len = buf.len();
+            let mut bufref = &mut buf[..];
+            impersonator.produce(&mut bufref).expect("Error on produce");
+            let size = buf_len - bufref.len();
             assert_eq!(size, buf_len, "Buffer was not filled");
             assert_eq!(buf, garbage, "Garbage is incorrect");
 
             let mut term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
-            let size = impersonator
-                .write_data(&mut term)
-                .expect("Error on write_data");
+            let term_len = term.len();
+            let mut termref = &mut term[..];
+            impersonator
+                .produce(&mut termref)
+                .expect("Error on produce");
+            let size = term_len - termref.len();
             assert_eq!(size, term.len(), "Buffer was not filled");
             assert_eq!(term, mid_send_garbage_terminator);
         }
+
+        let mut impersonator = impersonator.next_phase().unwrap();
 
         for _ in 0..in_idx {
             // Read decoy packet. This includes: packet length (0), header, version contents and aead.
             let expected_len = NUM_LENGTH_BYTES + HEADER_LEN + TAG_LEN;
             let mut buf = vec![0u8; expected_len];
-            let size = impersonator
-                .write_data(&mut buf)
-                .expect("Error on write_data");
+            let buf_len = buf.len();
+            let mut bufref = &mut buf[..];
+            let size = impersonator.write_data(bufref).expect("Error on produce");
             assert_eq!(
                 size, expected_len,
                 "Fake peer didn't send the expected amount of bytes"
@@ -2147,9 +2283,9 @@ mod mitmfakepeerbip324_tests {
         // Read packet. This includes: packet length, header, version contents and aead.
         let expected_len = NUM_LENGTH_BYTES + HEADER_LEN + in_contents.len() + TAG_LEN;
         let mut buf = vec![0u8; expected_len + 100];
-        let size = impersonator
-            .write_data(&mut buf)
-            .expect("Error on write_data");
+        let buf_len = buf.len();
+        let mut bufref = &mut buf[..];
+        let size = impersonator.write_data(bufref).expect("Error on produce");
         assert_eq!(
             size,
             out_ciphertext.len(),

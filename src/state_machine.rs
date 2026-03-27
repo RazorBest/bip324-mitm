@@ -128,7 +128,7 @@ pub trait HasFinal {
 
 impl BufReader for &[u8] {
     fn buf_ref(&mut self) -> &[u8] {
-        return self;
+        self
     }
 }
 

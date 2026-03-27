@@ -633,23 +633,9 @@ impl CipherSession {
         &self.id
     }
 
-    /// Get a mutable reference to the inbound cipher for decryption operations.
-    /*
-    pub fn inbound(&mut self) -> &mut InboundCipher {
-        self.inbound.as_mut().unwrap()
-    }
-    */
-
     pub fn consume_inbound(&mut self) -> Option<InboundCipher> {
         self.inbound.take()
     }
-
-    /// Get a mutable reference to the outbound cipher for encryption operations.
-    /*
-    pub fn outbound(&mut self) -> &mut OutboundCipher {
-        self.outbound.as_mut().unwrap()
-    }
-    */
 
     pub fn consume_outbound(&mut self) -> Option<OutboundCipher> {
         self.outbound.take()

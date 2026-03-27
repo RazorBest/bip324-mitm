@@ -1,3 +1,5 @@
+use std::cmp;
+use std::io;
 use std::io::{Read, Write};
 
 pub(crate) enum ProtocolStatus {
@@ -115,6 +117,9 @@ pub trait BufReader: Read {
 
 pub trait BufWriter: Write {
     fn remaining(&self) -> usize;
+    /// Advances the buffer cursor as if a write was done, but returns a slice reference
+    /// to that buffer, letting the user fill it. This can be used to bypass one copy.
+    fn prewrite(&mut self, amount: usize) -> io::Result<&mut [u8]>;
 }
 
 pub trait HasFinal {
@@ -130,5 +135,15 @@ impl BufReader for &[u8] {
 impl BufWriter for &mut [u8] {
     fn remaining(&self) -> usize {
         self.len()
+    }
+
+    fn prewrite(&mut self, amount: usize) -> io::Result<&mut [u8]> {
+        let size = cmp::min(amount, self.len());
+
+        let tmp_slice = std::mem::take(self);
+        let (used, rest) = tmp_slice.split_at_mut(size);
+        *self = rest;
+
+        Ok(used)
     }
 }

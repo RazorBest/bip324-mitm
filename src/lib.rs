@@ -97,6 +97,7 @@ impl HasFinal for DataBIP324State {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum ReaderLegState {
     Handshake(MitmHandshakeImpersonatorLegReader),
     Data(MitmImpersonatorLegReader),
@@ -109,6 +110,7 @@ impl HasFinal for ReaderLegState {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum WriterLegState {
     Handshake(MitmHandshakeImpersonatorLegWriter),
     Data(MitmImpersonatorLegWriter),

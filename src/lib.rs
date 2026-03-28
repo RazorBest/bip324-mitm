@@ -2,14 +2,12 @@ pub mod cipher;
 pub mod external;
 mod fmt_utils;
 pub mod protocol;
-mod state_machine;
+pub mod relay;
+pub mod state_machine;
 
 use std::cell::RefCell;
 use std::cmp;
-use std::collections::VecDeque;
 use std::error::Error;
-use std::io::{Read, Write};
-use std::mem;
 use std::rc::Rc;
 
 use secp256k1::ellswift::ElligatorSwift;
@@ -20,9 +18,10 @@ use crate::cipher::{CipherSession, InboundCipher, LengthDecryptor, OutboundCiphe
 use crate::external::chacha20_poly1305::ChaCha20Poly1305Stream;
 use crate::protocol::{
     AADType, EcdhPoint, GarbageTerminatorType, MAINNET_MAGIC, MagicType, NUM_ELLIGATOR_SWIFT_BYTES,
-    NUM_LENGTH_BYTES, NUM_SECRET_BYTES, NUM_TAG_BYTES, PartialPacket, ProtocolBuffer,
-    REGTEST_MAGIC, Role, TESTNET_MAGIC, TagType, find_garbage,
+    NUM_LENGTH_BYTES, NUM_SECRET_BYTES, NUM_TAG_BYTES, REGTEST_MAGIC, Role, TESTNET_MAGIC, TagType,
+    find_garbage,
 };
+use crate::relay::{FakePeerRelay, FakePeerRelayReader, FakePeerRelayWriter};
 use crate::state_machine::{
     BufReader, BufWriter, HasFinal, ProtocolReadParser, ProtocolStatus, ProtocolWriteParser,
     StreamReadParser, StreamWriteParser,
@@ -33,325 +32,20 @@ use crate::state_machine::{
 // 14 extra bytes are for the BIP-324 header byte and 13 serialization header bytes (message type).
 const MAX_PACKET_SIZE_FOR_ALLOCATION: usize = 4000014;
 
-struct FakePeerRelay {
-    key: ProtocolBuffer,
-    garbage: ProtocolBuffer,
-    terminator: ProtocolBuffer,
-    packets: Vec<PartialPacket>,
-}
-
-impl FakePeerRelay {
-    fn remove_first_packet_if_consumed(&mut self) {
-        if self.packets.is_empty() {
-            return;
-        }
-        let packet = &self.packets[0];
-        let packet_is_empty = packet.is_empty();
-        let is_consumed = packet_is_empty && self.packets.len() > 1;
-
-        if is_consumed {
-            self.packets.splice(..1, []);
-        }
-    }
-}
-
-impl FakePeerRelay {
-    fn new() -> Self {
-        Self {
-            key: ProtocolBuffer::new(),
-            garbage: ProtocolBuffer::new(),
-            terminator: ProtocolBuffer::new(),
-            packets: vec![],
-        }
-    }
-}
-
-pub trait FakePeerRelayWriter {
-    fn write_key(&mut self, data: &[u8]) -> std::io::Result<usize>;
-    fn set_eof_key(&mut self);
-
-    fn write_garbage(&mut self, data: &[u8]) -> std::io::Result<usize>;
-    fn set_eof_garbage(&mut self);
-
-    fn write_terminator(&mut self, data: &[u8]) -> std::io::Result<usize>;
-    fn set_eof_terminator(&mut self);
-
-    /// Writes the length section of a packet. BIP-324 decodes it as a 3 byte little-endian integer.
-    fn write_length_bytes(&mut self, data: &[u8]);
-    /// Writes the payload section of a packet
-    fn write_data_bytes(&mut self, data: &[u8]);
-    fn write_tag_bytes(&mut self, data: &[u8]);
-    fn set_aad(&mut self, data: &[u8]);
-}
-
-impl FakePeerRelayWriter for FakePeerRelay {
-    fn write_key(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.key.write(data)
-    }
-
-    fn set_eof_key(&mut self) {
-        self.key.set_eof();
-    }
-
-    fn write_garbage(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.garbage.write(data)
-    }
-
-    fn set_eof_garbage(&mut self) {
-        self.garbage.set_eof();
-    }
-
-    fn write_terminator(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.terminator.write(data)
-    }
-
-    fn set_eof_terminator(&mut self) {
-        self.terminator.set_eof();
-    }
-
-    fn write_length_bytes(&mut self, data: &[u8]) {
-        if data.is_empty() {
-            return;
-        }
-
-        if self.packets.is_empty()
-            || self.packets[self.packets.len() - 1].data.is_some()
-            || self.packets[self.packets.len() - 1].tag.is_some()
-        {
-            self.packets.push(PartialPacket::new());
-        }
-
-        let packets_len = self.packets.len();
-        let last_packet = &mut self.packets[packets_len - 1];
-
-        if last_packet.length_bytes.is_none() {
-            last_packet.length_bytes = Some(VecDeque::new());
-        }
-
-        let length_bytes = &mut last_packet.length_bytes.as_mut().unwrap();
-        length_bytes.extend(data);
-    }
-
-    fn write_data_bytes(&mut self, data: &[u8]) {
-        if data.is_empty() {
-            return;
-        }
-
-        if self.packets.is_empty() || self.packets[self.packets.len() - 1].tag.is_some() {
-            self.packets.push(PartialPacket::new());
-        }
-
-        let packets_len = self.packets.len();
-        let last_packet = &mut self.packets[packets_len - 1];
-
-        if last_packet.data.is_none() {
-            last_packet.data = Some(VecDeque::new());
-        }
-
-        let packet_data = &mut last_packet.data.as_mut().unwrap();
-        packet_data.extend(data);
-    }
-
-    fn write_tag_bytes(&mut self, data: &[u8]) {
-        if data.is_empty() {
-            return;
-        }
-
-        if self.packets.is_empty() {
-            self.packets.push(PartialPacket::new());
-        }
-
-        let packets_len = self.packets.len();
-        let last_packet = &mut self.packets[packets_len - 1];
-
-        if last_packet.tag.is_none() {
-            last_packet.tag = Some(VecDeque::new());
-        }
-
-        let packet_tag = &mut last_packet.tag.as_mut().unwrap();
-        packet_tag.extend(data);
-    }
-
-    fn set_aad(&mut self, aad: &[u8]) {
-        if self.packets.is_empty() {
-            self.packets.push(PartialPacket::new());
-        }
-
-        let packets_len = self.packets.len();
-        let last_packet = &mut self.packets[packets_len - 1];
-
-        last_packet.set_aad(aad);
-    }
-}
-
-pub trait FakePeerRelayReader {
-    fn read_key(&mut self, data: &mut [u8]) -> std::io::Result<usize>;
-    fn is_eof_key(&self) -> bool;
-    fn peek_len_key(&self) -> usize;
-
-    fn read_garbage(&mut self, data: &mut [u8]) -> std::io::Result<usize>;
-    fn is_eof_garbage(&self) -> bool;
-    fn peek_len_garbage(&self) -> usize;
-
-    fn read_terminator(&mut self, data: &mut [u8]) -> std::io::Result<usize>;
-    fn is_eof_terminator(&self) -> bool;
-    fn peek_len_terminator(&self) -> usize;
-
-    fn read_length_bytes(&mut self, data: &mut [u8]) -> usize;
-    fn peek_length_bytes(&self) -> usize;
-    fn read_data_bytes(&mut self, buf: &mut [u8]) -> usize;
-    fn peek_data_bytes(&self) -> usize;
-    fn read_tag_bytes(&mut self, buf: &mut [u8]) -> usize;
-    fn peek_tag_bytes(&self) -> usize;
-    fn read_aad(&mut self) -> Option<Vec<u8>>;
-    fn peek_aad_bytes(&self) -> usize;
-}
-
-impl FakePeerRelayReader for FakePeerRelay {
-    fn read_key(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
-        self.key.read(data)
-    }
-
-    fn is_eof_key(&self) -> bool {
-        self.key.is_eof()
-    }
-
-    fn peek_len_key(&self) -> usize {
-        self.key.peek_len()
-    }
-
-    fn read_garbage(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
-        self.garbage.read(data)
-    }
-
-    fn is_eof_garbage(&self) -> bool {
-        self.garbage.is_eof()
-    }
-
-    fn peek_len_garbage(&self) -> usize {
-        self.garbage.peek_len()
-    }
-
-    fn read_terminator(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
-        self.terminator.read(data)
-    }
-
-    fn is_eof_terminator(&self) -> bool {
-        self.terminator.is_eof()
-    }
-
-    fn peek_len_terminator(&self) -> usize {
-        self.terminator.peek_len()
-    }
-
-    fn read_length_bytes(&mut self, data: &mut [u8]) -> usize {
-        if self.packets.is_empty() {
-            return 0;
-        }
-
-        let packet = &mut self.packets[0];
-        let size = packet.read_length_bytes(data);
-
-        self.remove_first_packet_if_consumed();
-
-        size
-    }
-
-    fn peek_length_bytes(&self) -> usize {
-        if self.packets.is_empty() {
-            return 0;
-        }
-
-        self.packets[0].peek_length_bytes()
-    }
-
-    fn read_data_bytes(&mut self, data: &mut [u8]) -> usize {
-        if self.packets.is_empty() {
-            return 0;
-        }
-
-        let packet = &mut self.packets[0];
-        let size = packet.read_data_bytes(data);
-
-        self.remove_first_packet_if_consumed();
-
-        size
-    }
-
-    fn peek_data_bytes(&self) -> usize {
-        if self.packets.is_empty() {
-            return 0;
-        }
-
-        self.packets[0].peek_data_bytes()
-    }
-
-    fn read_tag_bytes(&mut self, data: &mut [u8]) -> usize {
-        if self.packets.is_empty() {
-            return 0;
-        }
-
-        let packet = &mut self.packets[0];
-        let size = packet.read_tag_bytes(data);
-
-        self.remove_first_packet_if_consumed();
-
-        size
-    }
-
-    fn peek_tag_bytes(&self) -> usize {
-        if self.packets.is_empty() {
-            return 0;
-        }
-
-        self.packets[0].peek_tag_bytes()
-    }
-
-    fn read_aad(&mut self) -> Option<Vec<u8>> {
-        if self.packets.is_empty() {
-            return None;
-        }
-
-        let packet = &mut self.packets[0];
-        let aad = packet.read_aad();
-
-        let packet_is_empty = packet.is_empty();
-        let is_consumed = packet_is_empty && self.packets.len() > 1;
-
-        if is_consumed {
-            self.packets.splice(..1, []);
-        }
-
-        aad
-    }
-
-    fn peek_aad_bytes(&self) -> usize {
-        if self.packets.is_empty() {
-            return 0;
-        }
-
-        self.packets[0].peek_aad()
-    }
-}
-
-pub enum RelayPeerState {
+pub enum LegWriterState {
     SendingLength(usize, Vec<u8>),
     SendingPayload(usize, ChaCha20Poly1305Stream),
     SendingTag(Vec<u8>),
-    Invalid,
 }
 
-impl RelayPeerState {
+impl LegWriterState {
     fn new() -> Self {
         Self::SendingLength(NUM_LENGTH_BYTES, vec![])
     }
-
-    fn take(&mut self) -> Self {
-        mem::replace(self, Self::Invalid)
-    }
 }
 
-impl HasFinal for RelayPeerState {
+impl HasFinal for LegWriterState {
+    /// Always returns false
     fn is_final(&self) -> bool {
         false
     }
@@ -363,16 +57,11 @@ pub enum HandshakeRelayPeerState {
     SendingGarbage,
     SendingGarbageTerminator,
     HandshakeDone,
-    Invalid,
 }
 
 impl HandshakeRelayPeerState {
     fn new() -> Self {
         Self::SendingKey
-    }
-
-    fn take(&mut self) -> Self {
-        mem::replace(self, Self::Invalid)
     }
 }
 
@@ -387,13 +76,6 @@ pub enum HandshakeBIP324State {
     ReceivingKey(EcdhPoint, usize),
     ReceivingGarbage(GarbageTerminatorType),
     HandshakeDone(AADType),
-    Invalid,
-}
-
-impl HandshakeBIP324State {
-    pub fn take(&mut self) -> Self {
-        mem::replace(self, Self::Invalid)
-    }
 }
 
 impl HasFinal for HandshakeBIP324State {
@@ -406,16 +88,10 @@ pub enum DataBIP324State {
     ReceivingPacketLen(LengthDecryptor),
     ReceivingPacketContent(ChaCha20Poly1305Stream),
     ReceivingPacketTag(TagType),
-    Invalid,
-}
-
-impl DataBIP324State {
-    fn take(&mut self) -> Self {
-        mem::replace(self, Self::Invalid)
-    }
 }
 
 impl HasFinal for DataBIP324State {
+    /// Always returns false
     fn is_final(&self) -> bool {
         false
     }
@@ -424,16 +100,10 @@ impl HasFinal for DataBIP324State {
 pub enum ReaderLegState {
     Handshake(MitmHandshakeImpersonatorLegReader),
     Data(MitmImpersonatorLegReader),
-    Invalid,
-}
-
-impl ReaderLegState {
-    fn take(&mut self) -> Self {
-        mem::replace(self, Self::Invalid)
-    }
 }
 
 impl HasFinal for ReaderLegState {
+    /// Always returns false
     fn is_final(&self) -> bool {
         false
     }
@@ -442,13 +112,6 @@ impl HasFinal for ReaderLegState {
 pub enum WriterLegState {
     Handshake(MitmHandshakeImpersonatorLegWriter),
     Data(MitmImpersonatorLegWriter),
-    Invalid,
-}
-
-impl WriterLegState {
-    fn take(&mut self) -> Self {
-        mem::replace(self, Self::Invalid)
-    }
 }
 
 impl HasFinal for WriterLegState {
@@ -458,8 +121,8 @@ impl HasFinal for WriterLegState {
 }
 
 pub struct MitmHandshakeImpersonatorLeg {
-    reader_leg_state: ReaderLegState,
-    writer_leg_state: WriterLegState,
+    reader_leg_state: Option<ReaderLegState>,
+    writer_leg_state: Option<WriterLegState>,
 }
 
 impl MitmHandshakeImpersonatorLeg {
@@ -495,8 +158,8 @@ impl MitmHandshakeImpersonatorLeg {
         );
 
         Self {
-            reader_leg_state: ReaderLegState::Handshake(reader_leg),
-            writer_leg_state: WriterLegState::Handshake(writer_leg),
+            reader_leg_state: Some(ReaderLegState::Handshake(reader_leg)),
+            writer_leg_state: Some(WriterLegState::Handshake(writer_leg)),
         }
     }
 
@@ -520,7 +183,7 @@ impl MitmHandshakeImpersonatorLeg {
 
     pub fn set_secret(&mut self, secret: [u8; NUM_SECRET_BYTES]) -> Result<(), String> {
         match &mut self.reader_leg_state {
-            ReaderLegState::Handshake(reader_leg) => reader_leg.set_secret(secret),
+            Some(ReaderLegState::Handshake(reader_leg)) => reader_leg.set_secret(secret),
             _ => Err("Invalid state for set_secret".to_string()),
         }
     }
@@ -555,18 +218,15 @@ impl ProtocolReadParser for MitmHandshakeImpersonatorLeg {
 
                 (Data(reader_leg), Ok(ProtocolStatus::End))
             }
-            Invalid => {
-                panic!("Invalid state")
-            }
         }
     }
 
     fn take_state(&mut self) -> Self::State {
-        self.reader_leg_state.take()
+        self.reader_leg_state.take().unwrap()
     }
 
     fn set_state(&mut self, state: Self::State) {
-        self.reader_leg_state = state;
+        self.reader_leg_state = Some(state);
     }
 }
 
@@ -599,25 +259,22 @@ impl ProtocolWriteParser for MitmHandshakeImpersonatorLeg {
 
                 (Data(writer_leg), Ok(ProtocolStatus::End))
             }
-            Invalid => {
-                panic!("Invalid state")
-            }
         }
     }
 
     fn take_state(&mut self) -> Self::State {
-        self.writer_leg_state.take()
+        self.writer_leg_state.take().unwrap()
     }
 
     fn set_state(&mut self, state: Self::State) {
-        self.writer_leg_state = state;
+        self.writer_leg_state = Some(state);
     }
 }
 
 pub struct MitmHandshakeImpersonatorLegReader {
     role: Role,
     magic: MagicType,
-    state: HandshakeBIP324State,
+    state: Option<HandshakeBIP324State>,
 
     relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
 
@@ -643,7 +300,10 @@ impl MitmHandshakeImpersonatorLegReader {
         Self {
             role,
             magic,
-            state: HandshakeBIP324State::ReceivingKey(secret_key, NUM_ELLIGATOR_SWIFT_BYTES),
+            state: Some(HandshakeBIP324State::ReceivingKey(
+                secret_key,
+                NUM_ELLIGATOR_SWIFT_BYTES,
+            )),
             key_to_send,
             garbage_terminator_to_send,
             relay_out,
@@ -669,7 +329,9 @@ impl MitmHandshakeImpersonatorLegReader {
     pub fn set_secret(&mut self, secret: [u8; NUM_SECRET_BYTES]) -> Result<(), String> {
         use HandshakeBIP324State::*;
 
-        if self.key_to_send.borrow().len() < NUM_ELLIGATOR_SWIFT_BYTES || self.state.is_final() {
+        if self.key_to_send.borrow().len() < NUM_ELLIGATOR_SWIFT_BYTES
+            || self.state.as_ref().unwrap().is_final()
+        {
             return Err(
                 "Can't change secret. Public key has already started to be sent".to_string(),
             );
@@ -682,13 +344,13 @@ impl MitmHandshakeImpersonatorLegReader {
 
         self.key_to_send.replace(key_to_send);
         match self.state.take() {
-            ReceivingKey(_old_point, remaining) => {
-                self.state = ReceivingKey(secret_key, remaining);
+            Some(ReceivingKey(_old_point, remaining)) => {
+                self.state = Some(ReceivingKey(secret_key, remaining));
             }
-            ReceivingGarbage(_old_other_garbage_terminator) => {
+            Some(ReceivingGarbage(_old_other_garbage_terminator)) => {
                 let inbound_garbage_terminator = self.on_share_received(secret_key)?;
 
-                self.state = ReceivingGarbage(inbound_garbage_terminator);
+                self.state = Some(ReceivingGarbage(inbound_garbage_terminator));
             }
             state => {
                 panic!("Can't change secret for state: {state:?}")
@@ -699,11 +361,15 @@ impl MitmHandshakeImpersonatorLegReader {
     }
 
     pub fn is_final(&self) -> bool {
-        self.state.is_final()
+        if let Some(state) = &self.state {
+            state.is_final()
+        } else {
+            false
+        }
     }
 
     pub fn next_phase(self) -> Option<MitmImpersonatorLegReader> {
-        let HandshakeBIP324State::HandshakeDone(aad) = self.state else {
+        let Some(HandshakeBIP324State::HandshakeDone(aad)) = self.state else {
             return None;
         };
 
@@ -865,23 +531,20 @@ impl ProtocolReadParser for MitmHandshakeImpersonatorLegReader {
                 }
             }
             state @ HandshakeDone(_) => (state, Ok(ProtocolStatus::End)),
-            Invalid => {
-                panic!("Invalid protocol state");
-            }
         }
     }
 
     fn take_state(&mut self) -> Self::State {
-        self.state.take()
+        self.state.take().unwrap()
     }
 
     fn set_state(&mut self, state: Self::State) {
-        self.state = state;
+        self.state = Some(state);
     }
 }
 
 pub struct MitmHandshakeImpersonatorLegWriter {
-    state: HandshakeRelayPeerState,
+    state: Option<HandshakeRelayPeerState>,
 
     relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
 
@@ -898,7 +561,7 @@ impl MitmHandshakeImpersonatorLegWriter {
         garbage_terminator_to_send: Rc<RefCell<Vec<u8>>>,
     ) -> Self {
         Self {
-            state: HandshakeRelayPeerState::new(),
+            state: Some(HandshakeRelayPeerState::new()),
             relay_in,
             key_to_send,
             cipher,
@@ -907,7 +570,11 @@ impl MitmHandshakeImpersonatorLegWriter {
     }
 
     pub fn is_final(&self) -> bool {
-        self.state.is_final()
+        if let Some(state) = &self.state {
+            state.is_final()
+        } else {
+            false
+        }
     }
 
     pub fn next_phase(self) -> Option<MitmImpersonatorLegWriter> {
@@ -998,23 +665,20 @@ impl ProtocolWriteParser for MitmHandshakeImpersonatorLegWriter {
                 }
             }
             state @ HandshakeDone => (state, Ok(ProtocolStatus::End)),
-            Invalid => {
-                panic!("Invalid server state")
-            }
         }
     }
 
     fn take_state(&mut self) -> Self::State {
-        self.state.take()
+        self.state.take().unwrap()
     }
 
     fn set_state(&mut self, state: Self::State) {
-        self.state = state;
+        self.state = Some(state);
     }
 }
 
 pub struct MitmImpersonatorLegReader {
-    state: DataBIP324State,
+    state: Option<DataBIP324State>,
     remaining: usize,
     aad: Vec<u8>,
 
@@ -1034,7 +698,7 @@ impl MitmImpersonatorLegReader {
             .expect("The inbound cipher can't create a length decryptor");
         relay_out.borrow_mut().set_aad(&aad);
         Self {
-            state: DataBIP324State::ReceivingPacketLen(length_decryptor),
+            state: Some(DataBIP324State::ReceivingPacketLen(length_decryptor)),
             remaining: NUM_LENGTH_BYTES,
             aad,
             inbound_cipher,
@@ -1159,9 +823,6 @@ impl ProtocolReadParser for MitmImpersonatorLegReader {
                     (ReceivingPacketTag(expected_tag), Ok(ProtocolStatus::End))
                 }
             }
-            Invalid => {
-                panic!("Invalid protocol state");
-            }
         };
 
         if res.is_ok() {
@@ -1175,16 +836,16 @@ impl ProtocolReadParser for MitmImpersonatorLegReader {
     }
 
     fn take_state(&mut self) -> Self::State {
-        self.state.take()
+        self.state.take().unwrap()
     }
 
     fn set_state(&mut self, state: Self::State) {
-        self.state = state;
+        self.state = Some(state);
     }
 }
 
 pub struct MitmImpersonatorLegWriter {
-    state: RelayPeerState,
+    state: Option<LegWriterState>,
 
     outbound_cipher: OutboundCipher,
     relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
@@ -1196,7 +857,7 @@ impl MitmImpersonatorLegWriter {
         outbound_cipher: OutboundCipher,
     ) -> Self {
         Self {
-            state: RelayPeerState::new(),
+            state: Some(LegWriterState::new()),
             outbound_cipher,
             relay_in,
         }
@@ -1204,7 +865,7 @@ impl MitmImpersonatorLegWriter {
 }
 
 impl ProtocolWriteParser for MitmImpersonatorLegWriter {
-    type State = RelayPeerState;
+    type State = LegWriterState;
     type Error = ();
 
     fn transition(
@@ -1212,7 +873,7 @@ impl ProtocolWriteParser for MitmImpersonatorLegWriter {
         state: Self::State,
         data: &mut dyn BufWriter,
     ) -> (Self::State, Result<ProtocolStatus, Self::Error>) {
-        use RelayPeerState::*;
+        use LegWriterState::*;
 
         let mut relay_in = self.relay_in.borrow_mut();
 
@@ -1301,18 +962,16 @@ impl ProtocolWriteParser for MitmImpersonatorLegWriter {
                     (SendingTag(tag), Ok(ProtocolStatus::End))
                 }
             }
-            Invalid => {
-                panic!("Invalid peer state")
-            }
         }
     }
 
     fn take_state(&mut self) -> Self::State {
-        self.state.take()
+        // TODO: remove unwrap
+        self.state.take().unwrap()
     }
 
     fn set_state(&mut self, state: Self::State) {
-        self.state = state;
+        self.state = Some(state);
     }
 }
 
@@ -1349,8 +1008,8 @@ impl MitmBridge {
         client_secret_key: [u8; NUM_SECRET_BYTES],
         server_secret_key: [u8; NUM_SECRET_BYTES],
     ) -> Result<Self, String> {
-        let relay_to_fake_server = Rc::new(RefCell::new(FakePeerRelay::new()));
-        let relay_to_fake_client = Rc::new(RefCell::new(FakePeerRelay::new()));
+        let relay_to_fake_server = Rc::new(RefCell::new(FakePeerRelay::default()));
+        let relay_to_fake_client = Rc::new(RefCell::new(FakePeerRelay::default()));
         let client_leg = MitmHandshakeImpersonatorLeg::new_fake_client(
             magic,
             relay_to_fake_client.clone(),
@@ -1376,8 +1035,8 @@ impl MitmBridge {
         client_secret_key: EcdhPoint,
         server_secret_key: EcdhPoint,
     ) -> Self {
-        let relay_to_fake_server = Rc::new(RefCell::new(FakePeerRelay::new()));
-        let relay_to_fake_client = Rc::new(RefCell::new(FakePeerRelay::new()));
+        let relay_to_fake_server = Rc::new(RefCell::new(FakePeerRelay::default()));
+        let relay_to_fake_client = Rc::new(RefCell::new(FakePeerRelay::default()));
         let client_leg = MitmHandshakeImpersonatorLeg::new_fake_client(
             magic,
             relay_to_fake_client.clone(),
@@ -1759,8 +1418,8 @@ mod mitmfakepeerbip324_tests {
         Rc<RefCell<FakePeerRelay>>,
         Rc<RefCell<FakePeerRelay>>,
     ) {
-        let relay_in = Rc::new(RefCell::new(FakePeerRelay::new()));
-        let relay_out = Rc::new(RefCell::new(FakePeerRelay::new()));
+        let relay_in = Rc::new(RefCell::new(FakePeerRelay::default()));
+        let relay_out = Rc::new(RefCell::new(FakePeerRelay::default()));
 
         // Initialize the secret key with the given bytes
         let sk = SecretKey::from_slice(&secret_key_bytes).unwrap();
@@ -1871,10 +1530,12 @@ mod mitmfakepeerbip324_tests {
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.reader_leg_state,
-            ReaderLegState::Handshake(MitmHandshakeImpersonatorLegReader {
-                state: HandshakeBIP324State::ReceivingKey(..),
-                ..
-            })
+            Some(ReaderLegState::Handshake(
+                MitmHandshakeImpersonatorLegReader {
+                    state: Some(HandshakeBIP324State::ReceivingKey(..)),
+                    ..
+                }
+            ))
         ));
 
         // Send another key byte
@@ -1885,10 +1546,12 @@ mod mitmfakepeerbip324_tests {
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.reader_leg_state,
-            ReaderLegState::Handshake(MitmHandshakeImpersonatorLegReader {
-                state: HandshakeBIP324State::ReceivingKey(..),
-                ..
-            })
+            Some(ReaderLegState::Handshake(
+                MitmHandshakeImpersonatorLegReader {
+                    state: Some(HandshakeBIP324State::ReceivingKey(..)),
+                    ..
+                }
+            ))
         ));
 
         // Send all the key bytes, except for the last one
@@ -1899,10 +1562,12 @@ mod mitmfakepeerbip324_tests {
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.reader_leg_state,
-            ReaderLegState::Handshake(MitmHandshakeImpersonatorLegReader {
-                state: HandshakeBIP324State::ReceivingKey(..),
-                ..
-            })
+            Some(ReaderLegState::Handshake(
+                MitmHandshakeImpersonatorLegReader {
+                    state: Some(HandshakeBIP324State::ReceivingKey(..)),
+                    ..
+                }
+            ))
         ));
 
         // Send all the key bytes, except for the last one
@@ -1913,10 +1578,12 @@ mod mitmfakepeerbip324_tests {
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.reader_leg_state,
-            ReaderLegState::Handshake(MitmHandshakeImpersonatorLegReader {
-                state: HandshakeBIP324State::ReceivingGarbage(..),
-                ..
-            })
+            Some(ReaderLegState::Handshake(
+                MitmHandshakeImpersonatorLegReader {
+                    state: Some(HandshakeBIP324State::ReceivingGarbage(..)),
+                    ..
+                }
+            ))
         ));
     }
 
@@ -1932,10 +1599,12 @@ mod mitmfakepeerbip324_tests {
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.reader_leg_state,
-            ReaderLegState::Handshake(MitmHandshakeImpersonatorLegReader {
-                state: HandshakeBIP324State::ReceivingGarbage(..),
-                ..
-            })
+            Some(ReaderLegState::Handshake(
+                MitmHandshakeImpersonatorLegReader {
+                    state: Some(HandshakeBIP324State::ReceivingGarbage(..)),
+                    ..
+                }
+            ))
         ));
     }
 
@@ -1951,10 +1620,12 @@ mod mitmfakepeerbip324_tests {
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.reader_leg_state,
-            ReaderLegState::Handshake(MitmHandshakeImpersonatorLegReader {
-                state: HandshakeBIP324State::ReceivingGarbage(..),
-                ..
-            })
+            Some(ReaderLegState::Handshake(
+                MitmHandshakeImpersonatorLegReader {
+                    state: Some(HandshakeBIP324State::ReceivingGarbage(..)),
+                    ..
+                }
+            ))
         ));
     }
 
@@ -1972,10 +1643,12 @@ mod mitmfakepeerbip324_tests {
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.reader_leg_state,
-            ReaderLegState::Handshake(MitmHandshakeImpersonatorLegReader {
-                state: HandshakeBIP324State::ReceivingGarbage(..),
-                ..
-            })
+            Some(ReaderLegState::Handshake(
+                MitmHandshakeImpersonatorLegReader {
+                    state: Some(HandshakeBIP324State::ReceivingGarbage(..)),
+                    ..
+                }
+            ))
         ));
 
         let mut buf = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
@@ -2004,7 +1677,7 @@ mod mitmfakepeerbip324_tests {
 
         let (mut server, _, _) = get_mitm_fake_server_deterministic_insecurerng(server_seed);
 
-        let ReaderLegState::Handshake(reader_leg) = &server.reader_leg_state else {
+        let Some(ReaderLegState::Handshake(reader_leg)) = &server.reader_leg_state else {
             panic!("Wrong leg state");
         };
 
@@ -2019,15 +1692,16 @@ mod mitmfakepeerbip324_tests {
             .consume(&mut client_keyref)
             .expect("Error on pass_peer_data");
 
-        let ReaderLegState::Handshake(reader_leg) = &server.reader_leg_state else {
+        let Some(ReaderLegState::Handshake(reader_leg)) = &server.reader_leg_state else {
             panic!("Wrong leg state");
         };
-        let HandshakeBIP324State::ReceivingGarbage(other_garbage_terminator) = reader_leg.state
+        let Some(HandshakeBIP324State::ReceivingGarbage(other_garbage_terminator)) =
+            reader_leg.state
         else {
             panic!("Wrong state after receiving key");
         };
 
-        let ReaderLegState::Handshake(reader_leg) = server.reader_leg_state else {
+        let Some(ReaderLegState::Handshake(reader_leg)) = server.reader_leg_state else {
             panic!("Wrong leg state");
         };
 
@@ -2055,10 +1729,12 @@ mod mitmfakepeerbip324_tests {
             .expect("Error on pass_peer_data");
         assert!(matches!(
             server.reader_leg_state,
-            ReaderLegState::Handshake(MitmHandshakeImpersonatorLegReader {
-                state: HandshakeBIP324State::ReceivingGarbage(..),
-                ..
-            })
+            Some(ReaderLegState::Handshake(
+                MitmHandshakeImpersonatorLegReader {
+                    state: Some(HandshakeBIP324State::ReceivingGarbage(..)),
+                    ..
+                }
+            ))
         ));
 
         let buf = [0u8];

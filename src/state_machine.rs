@@ -2,7 +2,7 @@ use std::cmp;
 use std::io;
 use std::io::{Read, Write};
 
-pub(crate) enum ProtocolStatus {
+pub enum ProtocolStatus {
     Continue,
     End,
 }

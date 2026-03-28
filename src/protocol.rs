@@ -196,6 +196,14 @@ impl PartialPacket {
         read_vec_dequeue_u8(length_bytes, buf)
     }
 
+    pub fn peek_length_bytes(&self) -> usize {
+        let Some(length_bytes) = &self.length_bytes else {
+            return 0;
+        };
+
+        length_bytes.len()
+    }
+
     pub fn read_data_bytes(&mut self, buf: &mut [u8]) -> usize {
         let Some(data) = &mut self.data else {
             return 0;
@@ -204,12 +212,28 @@ impl PartialPacket {
         read_vec_dequeue_u8(data, buf)
     }
 
+    pub fn peek_data_bytes(&self) -> usize {
+        let Some(data) = &self.data else {
+            return 0;
+        };
+
+        data.len()
+    }
+
     pub fn read_tag_bytes(&mut self, buf: &mut [u8]) -> usize {
         let Some(tag) = &mut self.tag else {
             return 0;
         };
 
         read_vec_dequeue_u8(tag, buf)
+    }
+
+    pub fn peek_tag_bytes(&self) -> usize {
+        let Some(tag) = &self.tag else {
+            return 0;
+        };
+
+        tag.len()
     }
 
     pub fn set_aad(&mut self, data: &[u8]) {
@@ -223,6 +247,13 @@ impl PartialPacket {
 
     pub fn read_aad(&mut self) -> Option<Vec<u8>> {
         self.aad.take().map(Vec::<_>::from)
+    }
+
+    pub fn peek_aad(&self) -> usize {
+        match &self.aad {
+            Some(v) => v.len(),
+            None => 0,
+        }
     }
 
     pub fn is_empty(&self) -> bool {

@@ -620,10 +620,10 @@ impl CipherSession {
         role: Role,
         secret_point: EcdhPoint,
         other_key_ellswift: &[u8; NUM_ELLIGATOR_SWIFT_BYTES],
-    ) -> Result<Self, String> {
+    ) -> Result<Self, (EcdhPoint, String)> {
         let session_keys =
             generate_session_keys_ecdh(magic, role, &secret_point, other_key_ellswift)
-                .map_err(|_| "Can't generate secret key")?;
+                .map_err(|_| (secret_point, "Can't generate secret key".to_string()))?;
 
         Ok(Self::new(session_keys, role))
     }

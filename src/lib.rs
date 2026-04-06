@@ -13,13 +13,14 @@ use std::rc::Rc;
 use secp256k1::ellswift::ElligatorSwift;
 use secp256k1::rand::{CryptoRng, RngCore};
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
+use thiserror::Error;
 
 use crate::cipher::{CipherSession, InboundCipher, LengthDecryptor, OutboundCipher};
 use crate::external::chacha20_poly1305::ChaCha20Poly1305Stream;
 use crate::protocol::{
     AADType, EcdhPoint, GarbageTerminatorType, MAINNET_MAGIC, MagicType, NUM_ELLIGATOR_SWIFT_BYTES,
-    NUM_LENGTH_BYTES, NUM_SECRET_BYTES, NUM_TAG_BYTES, REGTEST_MAGIC, Role, TESTNET_MAGIC, TagType,
-    find_garbage,
+    NUM_GARBAGE_CONTENT_LIMIT, NUM_GARBAGE_TERMINATOR_BYTES, NUM_LENGTH_BYTES, NUM_SECRET_BYTES,
+    NUM_TAG_BYTES, REGTEST_MAGIC, Role, TESTNET_MAGIC, TagType, find_garbage,
 };
 use crate::relay::{FakePeerRelay, FakePeerRelayReader, FakePeerRelayWriter};
 use crate::state_machine::{
@@ -31,6 +32,26 @@ use crate::state_machine::{
 // Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH is 4,000,000 bytes (~4 MiB).
 // 14 extra bytes are for the BIP-324 header byte and 13 serialization header bytes (message type).
 const MAX_PACKET_SIZE_FOR_ALLOCATION: usize = 4000014;
+
+#[derive(Error, Debug)]
+pub enum BIP324MitmError {
+    #[error("IO Read error")]
+    ReadError(std::io::Error),
+
+    #[error("IO Write error")]
+    WriteError(std::io::Error),
+
+    #[error("Key generation error")]
+    KeyGenerationError,
+
+    #[error("Garbage limit exceeded error")]
+    GarbageLimitExceededError,
+
+    #[error("Illegal state")]
+    IllegalState(String),
+}
+
+use BIP324MitmError::*;
 
 pub enum LegWriterState {
     SendingLength(usize, Vec<u8>),
@@ -122,12 +143,12 @@ impl HasFinal for WriterLegState {
     }
 }
 
-pub struct MitmHandshakeImpersonatorLeg {
+pub struct MitmImpersonatorLeg {
     reader_leg_state: Option<ReaderLegState>,
     writer_leg_state: Option<WriterLegState>,
 }
 
-impl MitmHandshakeImpersonatorLeg {
+impl MitmImpersonatorLeg {
     pub fn new(
         role: Role,
         magic: MagicType,
@@ -183,17 +204,23 @@ impl MitmHandshakeImpersonatorLeg {
         Self::new(Role::Initiator, magic, relay_in, relay_out, secret_key)
     }
 
-    pub fn set_secret(&mut self, secret: [u8; NUM_SECRET_BYTES]) -> Result<(), String> {
+    pub fn set_secret(
+        &mut self,
+        secret: [u8; NUM_SECRET_BYTES],
+    ) -> Result<(), ([u8; NUM_SECRET_BYTES], BIP324MitmError)> {
         match &mut self.reader_leg_state {
             Some(ReaderLegState::Handshake(reader_leg)) => reader_leg.set_secret(secret),
-            _ => Err("Invalid state for set_secret".to_string()),
+            _ => Err((
+                secret,
+                IllegalState("Invalid state for set_secret".to_string()),
+            )),
         }
     }
 }
 
-impl ProtocolReadParser for MitmHandshakeImpersonatorLeg {
+impl ProtocolReadParser for MitmImpersonatorLeg {
     type State = ReaderLegState;
-    type Error = ();
+    type Error = BIP324MitmError;
 
     fn transition(
         &mut self,
@@ -205,7 +232,9 @@ impl ProtocolReadParser for MitmHandshakeImpersonatorLeg {
         match state {
             Handshake(mut reader_leg) => {
                 // TODO: replace unwrap
-                reader_leg.consume(data).unwrap();
+                if let Err(err) = reader_leg.consume(data) {
+                    return (Handshake(reader_leg), Err(err));
+                }
 
                 if reader_leg.is_final() {
                     let new_reader_leg = reader_leg.next_phase().unwrap();
@@ -232,9 +261,9 @@ impl ProtocolReadParser for MitmHandshakeImpersonatorLeg {
     }
 }
 
-impl ProtocolWriteParser for MitmHandshakeImpersonatorLeg {
+impl ProtocolWriteParser for MitmImpersonatorLeg {
     type State = WriterLegState;
-    type Error = ();
+    type Error = BIP324MitmError;
 
     fn transition(
         &mut self,
@@ -315,9 +344,18 @@ impl MitmHandshakeImpersonatorLegReader {
         }
     }
 
-    fn on_share_received(&mut self, point: EcdhPoint) -> Result<GarbageTerminatorType, String> {
-        let cipher =
-            CipherSession::new_from_shares(self.magic, self.role, point, &self.other_key.unwrap())?;
+    fn on_share_received(
+        &mut self,
+        point: EcdhPoint,
+    ) -> Result<GarbageTerminatorType, (EcdhPoint, BIP324MitmError)> {
+        let Some(other_key) = &self.other_key else {
+            return Err((
+                point,
+                IllegalState("on_share_received called with empty other_key".to_string()),
+            ));
+        };
+        let cipher = CipherSession::new_from_shares(self.magic, self.role, point, other_key)
+            .map_err(|(point, _)| (point, KeyGenerationError))?;
         let inbound_garbage_terminator = cipher.inbound_garbage_terminator;
         let outbound_garbage_terminator = cipher.outbound_garbage_terminator;
 
@@ -328,19 +366,29 @@ impl MitmHandshakeImpersonatorLegReader {
         Ok(inbound_garbage_terminator)
     }
 
-    pub fn set_secret(&mut self, secret: [u8; NUM_SECRET_BYTES]) -> Result<(), String> {
+    pub fn set_secret(
+        &mut self,
+        secret: [u8; NUM_SECRET_BYTES],
+    ) -> Result<(), ([u8; NUM_SECRET_BYTES], BIP324MitmError)> {
         use HandshakeBIP324State::*;
 
         if self.key_to_send.borrow().len() < NUM_ELLIGATOR_SWIFT_BYTES
             || self.state.as_ref().unwrap().is_final()
         {
-            return Err(
-                "Can't change secret. Public key has already started to be sent".to_string(),
-            );
+            return Err((
+                secret,
+                IllegalState(
+                    "Can't change secret. Public key has already started to be sent".to_string(),
+                ),
+            ));
         }
 
-        let secret_key = key_from_secret_bytes(secret)
-            .map_err(|_| "Can't generate EC scalar from secret key bytes")?;
+        let secret_key = key_from_secret_bytes(secret).map_err(|_| {
+            (
+                secret,
+                IllegalState("Can't generate EC scalar from secret key bytes".to_string()),
+            )
+        })?;
         let mut key_to_send = vec![];
         key_to_send.extend_from_slice(&secret_key.elligator_swift.to_array());
 
@@ -350,7 +398,9 @@ impl MitmHandshakeImpersonatorLegReader {
                 self.state = Some(ReceivingKey(secret_key, remaining));
             }
             Some(ReceivingGarbage(_old_other_garbage_terminator)) => {
-                let inbound_garbage_terminator = self.on_share_received(secret_key)?;
+                let inbound_garbage_terminator = self
+                    .on_share_received(secret_key)
+                    .map_err(|(_, err)| (secret, err))?;
 
                 self.state = Some(ReceivingGarbage(inbound_garbage_terminator));
             }
@@ -394,7 +444,7 @@ impl MitmHandshakeImpersonatorLegReader {
 
 impl ProtocolReadParser for MitmHandshakeImpersonatorLegReader {
     type State = HandshakeBIP324State;
-    type Error = ();
+    type Error = BIP324MitmError;
 
     fn transition(
         &mut self,
@@ -406,8 +456,15 @@ impl ProtocolReadParser for MitmHandshakeImpersonatorLegReader {
         match state {
             ReceivingKey(point, mut remaining) => {
                 let mut key_buf = vec![0u8; remaining];
-                // TODO: replace unwrap
-                let size = data.read(&mut key_buf).unwrap();
+                let size = match data.read(&mut key_buf) {
+                    Ok(size) => size,
+                    Err(err) => {
+                        return (
+                            ReceivingKey(point, remaining),
+                            Err(BIP324MitmError::ReadError(err)),
+                        );
+                    }
+                };
                 remaining -= size;
 
                 self.read_buffer.extend_from_slice(&key_buf[..size]);
@@ -425,8 +482,12 @@ impl ProtocolReadParser for MitmHandshakeImpersonatorLegReader {
                     other_key.copy_from_slice(&std::mem::take(&mut self.read_buffer));
                     self.other_key = Some(other_key);
 
-                    // TODO: remove unwrap
-                    let inbound_garbage_terminator = self.on_share_received(point).unwrap();
+                    let inbound_garbage_terminator = match self.on_share_received(point) {
+                        Ok(ret) => ret,
+                        Err((point, err)) => {
+                            return (ReceivingKey(point, remaining), Err(err));
+                        }
+                    };
 
                     (
                         ReceivingGarbage(inbound_garbage_terminator),
@@ -492,6 +553,11 @@ impl ProtocolReadParser for MitmHandshakeImpersonatorLegReader {
                     found
                 };
 
+                if self.read_buffer.len() > NUM_GARBAGE_CONTENT_LIMIT + NUM_GARBAGE_TERMINATOR_BYTES
+                {
+                    return (state, Err(GarbageLimitExceededError));
+                }
+
                 if found {
                     // Here, we expect self.read_buffer to contain the garbage, including the
                     // terminator
@@ -515,6 +581,7 @@ impl ProtocolReadParser for MitmHandshakeImpersonatorLegReader {
                     relay_out.set_eof_terminator();
 
                     let aad: Vec<_> = self.read_buffer.splice(..garbage_len, []).collect();
+                    self.read_buffer.clear();
 
                     (HandshakeDone(aad), Ok(ProtocolStatus::End))
                 } else {
@@ -999,27 +1066,27 @@ pub fn key_from_secret_bytes(
     })
 }
 
-pub struct MitmBridge {
-    pub client_leg: MitmHandshakeImpersonatorLeg,
-    pub server_leg: MitmHandshakeImpersonatorLeg,
+pub struct MitmBIP324 {
+    pub client_leg: MitmImpersonatorLeg,
+    pub server_leg: MitmImpersonatorLeg,
 }
 
-impl MitmBridge {
-    pub fn new_from_secrets(
+impl MitmBIP324 {
+    pub fn new_from_magic_and_secrets(
         magic: MagicType,
         client_secret_key: [u8; NUM_SECRET_BYTES],
         server_secret_key: [u8; NUM_SECRET_BYTES],
     ) -> Result<Self, String> {
         let relay_to_fake_server = Rc::new(RefCell::new(FakePeerRelay::default()));
         let relay_to_fake_client = Rc::new(RefCell::new(FakePeerRelay::default()));
-        let client_leg = MitmHandshakeImpersonatorLeg::new_fake_client(
+        let client_leg = MitmImpersonatorLeg::new_fake_client(
             magic,
             relay_to_fake_client.clone(),
             relay_to_fake_server.clone(),
             key_from_secret_bytes(client_secret_key)
                 .map_err(|_| "Can't generate client secret_key")?,
         );
-        let server_leg = MitmHandshakeImpersonatorLeg::new_fake_server(
+        let server_leg = MitmImpersonatorLeg::new_fake_server(
             magic,
             relay_to_fake_server.clone(),
             relay_to_fake_client.clone(),
@@ -1032,6 +1099,27 @@ impl MitmBridge {
         })
     }
 
+    pub fn new_from_secrets(
+        client_secret_key: [u8; NUM_SECRET_BYTES],
+        server_secret_key: [u8; NUM_SECRET_BYTES],
+    ) -> Result<Self, String> {
+        Self::new_from_magic_and_secrets(MAINNET_MAGIC, client_secret_key, server_secret_key)
+    }
+
+    pub fn new_testnet_from_secrets(
+        client_secret_key: [u8; NUM_SECRET_BYTES],
+        server_secret_key: [u8; NUM_SECRET_BYTES],
+    ) -> Result<Self, String> {
+        Self::new_from_magic_and_secrets(TESTNET_MAGIC, client_secret_key, server_secret_key)
+    }
+
+    pub fn new_regtest_from_secrets(
+        client_secret_key: [u8; NUM_SECRET_BYTES],
+        server_secret_key: [u8; NUM_SECRET_BYTES],
+    ) -> Result<Self, String> {
+        Self::new_from_magic_and_secrets(REGTEST_MAGIC, client_secret_key, server_secret_key)
+    }
+
     pub fn new_from_ecdh_points(
         magic: MagicType,
         client_secret_key: EcdhPoint,
@@ -1039,13 +1127,13 @@ impl MitmBridge {
     ) -> Self {
         let relay_to_fake_server = Rc::new(RefCell::new(FakePeerRelay::default()));
         let relay_to_fake_client = Rc::new(RefCell::new(FakePeerRelay::default()));
-        let client_leg = MitmHandshakeImpersonatorLeg::new_fake_client(
+        let client_leg = MitmImpersonatorLeg::new_fake_client(
             magic,
             relay_to_fake_client.clone(),
             relay_to_fake_server.clone(),
             client_secret_key,
         );
-        let server_leg = MitmHandshakeImpersonatorLeg::new_fake_server(
+        let server_leg = MitmImpersonatorLeg::new_fake_server(
             magic,
             relay_to_fake_server.clone(),
             relay_to_fake_client.clone(),
@@ -1057,7 +1145,62 @@ impl MitmBridge {
         }
     }
 
-    pub fn new<Rng: RngCore + CryptoRng>(magic: MagicType, rng: &mut Rng) -> Result<Self, String> {
+    pub fn new_from_magic_and_key_info(
+        magic: MagicType,
+        client_key: UserKeyInfo,
+        server_key: UserKeyInfo,
+    ) -> Result<Self, String> {
+        let client_ecdh_key = client_key
+            .try_into_echd_point()
+            .map_err(|_| "Client KeyInfo is invalid")?;
+        let server_ecdh_key = server_key
+            .try_into_echd_point()
+            .map_err(|_| "Client KeyInfo is invalid")?;
+
+        Ok(Self::new_from_ecdh_points(
+            magic,
+            client_ecdh_key,
+            server_ecdh_key,
+        ))
+    }
+
+    pub fn new_from_key_info(
+        client_key: UserKeyInfo,
+        server_key: UserKeyInfo,
+    ) -> Result<Self, String> {
+        Self::new_from_magic_and_key_info(MAINNET_MAGIC, client_key, server_key)
+    }
+
+    pub fn new_testnet_from_key_info(
+        client_key: UserKeyInfo,
+        server_key: UserKeyInfo,
+    ) -> Result<Self, String> {
+        Self::new_from_magic_and_key_info(TESTNET_MAGIC, client_key, server_key)
+    }
+
+    pub fn new_regtest_from_key_info(
+        client_key: UserKeyInfo,
+        server_key: UserKeyInfo,
+    ) -> Result<Self, String> {
+        Self::new_from_magic_and_key_info(REGTEST_MAGIC, client_key, server_key)
+    }
+
+    pub fn new<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Result<Self, String> {
+        Self::new_from_magic(MAINNET_MAGIC, rng)
+    }
+
+    pub fn new_testnet<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Result<Self, String> {
+        Self::new_from_magic(TESTNET_MAGIC, rng)
+    }
+
+    pub fn new_regtest<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Result<Self, String> {
+        Self::new_from_magic(REGTEST_MAGIC, rng)
+    }
+
+    pub fn new_from_magic<Rng: RngCore + CryptoRng>(
+        magic: MagicType,
+        rng: &mut Rng,
+    ) -> Result<Self, String> {
         let mut client_secret_key = [0u8; 32];
         RngCore::fill_bytes(rng, &mut client_secret_key);
         debug_assert_ne!([0u8; NUM_SECRET_BYTES], client_secret_key);
@@ -1065,47 +1208,45 @@ impl MitmBridge {
         RngCore::fill_bytes(rng, &mut server_secret_key);
         debug_assert_ne!([0u8; NUM_SECRET_BYTES], server_secret_key);
 
-        Self::new_from_secrets(magic, client_secret_key, server_secret_key)
+        Self::new_from_magic_and_secrets(magic, client_secret_key, server_secret_key)
     }
 
-    pub fn set_server_secret(&mut self, secret: [u8; NUM_SECRET_BYTES]) -> Result<(), String> {
+    pub fn set_server_secret(
+        &mut self,
+        secret: [u8; NUM_SECRET_BYTES],
+    ) -> Result<(), ([u8; NUM_SECRET_BYTES], BIP324MitmError)> {
         self.server_leg.set_secret(secret)
     }
 
-    pub fn set_client_secret(&mut self, secret: [u8; NUM_SECRET_BYTES]) -> Result<(), String> {
+    pub fn set_client_secret(
+        &mut self,
+        secret: [u8; NUM_SECRET_BYTES],
+    ) -> Result<(), ([u8; NUM_SECRET_BYTES], BIP324MitmError)> {
         self.client_leg.set_secret(secret)
     }
 
-    pub fn client_write(&mut self, mut data: &[u8]) -> Result<(), String> {
-        self.server_leg
-            .consume(&mut data)
-            .map_err(|_| "Server leg error".to_string())
+    pub fn client_write(&mut self, mut data: &[u8]) -> Result<(), BIP324MitmError> {
+        self.server_leg.consume(&mut data)
     }
 
-    pub fn server_write(&mut self, mut data: &[u8]) -> Result<(), String> {
-        self.client_leg
-            .consume(&mut data)
-            .map_err(|_| "Client leg error".to_string())
+    pub fn server_write(&mut self, mut data: &[u8]) -> Result<(), BIP324MitmError> {
+        self.client_leg.consume(&mut data)
     }
 
-    pub fn client_read(&mut self, mut buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+    pub fn client_read(&mut self, mut buf: &mut [u8]) -> Result<usize, BIP324MitmError> {
         let initial_buf_len = buf.len();
         let res = self.server_leg.produce(&mut buf);
         let written = initial_buf_len - buf.len();
 
-        Ok(res
-            .map(|_| written)
-            .map_err(|_| "Server leg error".to_string())?)
+        res.map(|_| written)
     }
 
-    pub fn server_read(&mut self, mut buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+    pub fn server_read(&mut self, mut buf: &mut [u8]) -> Result<usize, BIP324MitmError> {
         let initial_buf_len = buf.len();
         let res = self.client_leg.produce(&mut buf);
         let written = initial_buf_len - buf.len();
 
-        Ok(res
-            .map(|_| written)
-            .map_err(|_| "Client leg error".to_string())?)
+        res.map(|_| written)
     }
 }
 
@@ -1151,113 +1292,6 @@ impl UserKeyInfo {
             secret_key: sk,
             elligator_swift,
         })
-    }
-}
-
-pub struct MitmBIP324 {
-    pub bridge: MitmBridge,
-}
-
-impl MitmBIP324 {
-    pub fn new<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Self {
-        Self::new_from_magic(MAINNET_MAGIC, rng)
-    }
-
-    pub fn new_testnet<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Self {
-        Self::new_from_magic(TESTNET_MAGIC, rng)
-    }
-
-    pub fn new_regtest<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Self {
-        Self::new_from_magic(REGTEST_MAGIC, rng)
-    }
-
-    pub fn new_from_magic<Rng: RngCore + CryptoRng>(magic: MagicType, rng: &mut Rng) -> Self {
-        let bridge = MitmBridge::new(magic, rng).expect("MitmHandshakeBridge creation failed unexpectedly. The chance of generating an invalid key is negligible");
-        Self { bridge }
-    }
-
-    pub fn new_from_secrets(
-        client_secret_key: [u8; NUM_SECRET_BYTES],
-        server_secret_key: [u8; NUM_SECRET_BYTES],
-    ) -> Result<Self, String> {
-        Self::new_from_magic_and_secrets(MAINNET_MAGIC, client_secret_key, server_secret_key)
-    }
-
-    pub fn new_testnet_from_secrets(
-        client_secret_key: [u8; NUM_SECRET_BYTES],
-        server_secret_key: [u8; NUM_SECRET_BYTES],
-    ) -> Result<Self, String> {
-        Self::new_from_magic_and_secrets(TESTNET_MAGIC, client_secret_key, server_secret_key)
-    }
-
-    pub fn new_regtest_from_secrets(
-        client_secret_key: [u8; NUM_SECRET_BYTES],
-        server_secret_key: [u8; NUM_SECRET_BYTES],
-    ) -> Result<Self, String> {
-        Self::new_from_magic_and_secrets(REGTEST_MAGIC, client_secret_key, server_secret_key)
-    }
-
-    pub fn new_from_magic_and_secrets(
-        magic: MagicType,
-        client_secret_key: [u8; NUM_SECRET_BYTES],
-        server_secret_key: [u8; NUM_SECRET_BYTES],
-    ) -> Result<Self, String> {
-        let bridge = MitmBridge::new_from_secrets(magic, client_secret_key, server_secret_key)?;
-        Ok(Self { bridge })
-    }
-
-    pub fn new_from_key_info(
-        client_key: UserKeyInfo,
-        server_key: UserKeyInfo,
-    ) -> Result<Self, String> {
-        Self::new_from_magic_and_key_info(MAINNET_MAGIC, client_key, server_key)
-    }
-
-    pub fn new_testnet_from_key_info(
-        client_key: UserKeyInfo,
-        server_key: UserKeyInfo,
-    ) -> Result<Self, String> {
-        Self::new_from_magic_and_key_info(TESTNET_MAGIC, client_key, server_key)
-    }
-
-    pub fn new_regtest_from_key_info(
-        client_key: UserKeyInfo,
-        server_key: UserKeyInfo,
-    ) -> Result<Self, String> {
-        Self::new_from_magic_and_key_info(REGTEST_MAGIC, client_key, server_key)
-    }
-
-    pub fn new_from_magic_and_key_info(
-        magic: MagicType,
-        client_key: UserKeyInfo,
-        server_key: UserKeyInfo,
-    ) -> Result<Self, String> {
-        let client_ecdh_key = client_key
-            .try_into_echd_point()
-            .map_err(|_| "Client KeyInfo is invalid")?;
-        let server_ecdh_key = server_key
-            .try_into_echd_point()
-            .map_err(|_| "Client KeyInfo is invalid")?;
-
-        let bridge = MitmBridge::new_from_ecdh_points(magic, client_ecdh_key, server_ecdh_key);
-
-        Ok(Self { bridge })
-    }
-
-    pub fn client_write(&mut self, data: &[u8]) -> Result<(), String> {
-        self.bridge.client_write(data)
-    }
-
-    pub fn server_write(&mut self, data: &[u8]) -> Result<(), String> {
-        self.bridge.server_write(data)
-    }
-
-    pub fn client_read(&mut self, buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
-        self.bridge.client_read(buf)
-    }
-
-    pub fn server_read(&mut self, buf: &mut [u8]) -> Result<usize, Box<dyn Error>> {
-        self.bridge.server_read(buf)
     }
 }
 
@@ -1416,7 +1450,7 @@ mod mitmfakepeerbip324_tests {
         ellswift_bytes: Option<[u8; 64]>,
         role: Role,
     ) -> (
-        MitmHandshakeImpersonatorLeg,
+        MitmImpersonatorLeg,
         Rc<RefCell<FakePeerRelay>>,
         Rc<RefCell<FakePeerRelay>>,
     ) {
@@ -1447,7 +1481,7 @@ mod mitmfakepeerbip324_tests {
             elligator_swift,
         };
 
-        let server = MitmHandshakeImpersonatorLeg::new(
+        let server = MitmImpersonatorLeg::new(
             role,
             DEFAULT_MAGIC,
             relay_in.clone(),
@@ -1462,7 +1496,7 @@ mod mitmfakepeerbip324_tests {
         secret_key_bytes: [u8; 32],
         ellswift_bytes: Option<[u8; 64]>,
     ) -> (
-        MitmHandshakeImpersonatorLeg,
+        MitmImpersonatorLeg,
         Rc<RefCell<FakePeerRelay>>,
         Rc<RefCell<FakePeerRelay>>,
     ) {
@@ -1473,7 +1507,7 @@ mod mitmfakepeerbip324_tests {
         secret_key_bytes: [u8; 32],
         ellswift_bytes: Option<[u8; 64]>,
     ) -> (
-        MitmHandshakeImpersonatorLeg,
+        MitmImpersonatorLeg,
         Rc<RefCell<FakePeerRelay>>,
         Rc<RefCell<FakePeerRelay>>,
     ) {
@@ -1481,7 +1515,7 @@ mod mitmfakepeerbip324_tests {
     }
 
     fn get_mitm_fake_server() -> (
-        MitmHandshakeImpersonatorLeg,
+        MitmImpersonatorLeg,
         Rc<RefCell<FakePeerRelay>>,
         Rc<RefCell<FakePeerRelay>>,
     ) {
@@ -1493,7 +1527,7 @@ mod mitmfakepeerbip324_tests {
 
     #[allow(dead_code)]
     fn get_mitm_fake_client() -> (
-        MitmHandshakeImpersonatorLeg,
+        MitmImpersonatorLeg,
         Rc<RefCell<FakePeerRelay>>,
         Rc<RefCell<FakePeerRelay>>,
     ) {
@@ -1510,7 +1544,7 @@ mod mitmfakepeerbip324_tests {
     fn get_mitm_fake_server_deterministic_insecurerng(
         seed: u64,
     ) -> (
-        MitmHandshakeImpersonatorLeg,
+        MitmImpersonatorLeg,
         Rc<RefCell<FakePeerRelay>>,
         Rc<RefCell<FakePeerRelay>>,
     ) {
@@ -2364,5 +2398,49 @@ mod mitmfakepeerbip324_tests {
                 "a8785af31c029efc82fa9fc677d7118031358d7c6a25b5779a9b900e5ccd94aac97eb36a3c5dbcdb2ca5843cc4c2fe0aaa46d10eb3d233a81c3dde476da00eef2222222222222244737108aec5f8b6c1c277b31bbce9c1"
             )
         );
+    }
+
+    #[test]
+    fn random_data_1() {
+        let mut rng = secp256k1::rand::thread_rng();
+        let mut mitm = MitmBIP324::new(&mut rng).unwrap();
+
+        mitm.client_write(&hex!("b4916771c194e010218a41e980586d27ae39e8432c9c33c0158fc0f8aba7dc9446b96091e73ea8b85e072d6cb7d420836bb84dc1c90a0e472c6f74bfff16c4b6")).unwrap();
+        mitm.server_write(&hex!("262a2fb35253bc482fccd412c2a4203cc69071a0c67f0da66fb4b0439fd2ac17622a8e252cbddae6094440cd5a5458db28c285d57e1e436417d1eaf6541d58d3")).unwrap();
+
+        let garbage = vec![38u8; 4112];
+        let res = mitm.client_write(&garbage);
+        assert!(matches!(res, Err(GarbageLimitExceededError)));
+
+        let garbage = vec![28u8; 4112];
+        let res = mitm.server_write(&garbage);
+        assert!(matches!(res, Err(GarbageLimitExceededError)));
+    }
+
+    #[test]
+    fn random_data_2() {
+        let mut rng = secp256k1::rand::thread_rng();
+        let mut mitm = MitmBIP324::new(&mut rng).unwrap();
+
+        mitm.client_write(&hex!("b4916771c194e010218a41e980586d27ae39e8432c9c33c0158fc0f8aba7dc9446b96091e73ea8b85e072d6cb7d420836bb84dc1c90a0e472c6f74bfff16c4b6")).unwrap();
+
+        let garbage = vec![38u8; 4112];
+        let res = mitm.client_write(&garbage);
+        assert!(matches!(res, Err(GarbageLimitExceededError)));
+    }
+
+    #[test]
+    fn random_data_3() {
+        let mut rng = secp256k1::rand::thread_rng();
+        let mut mitm = MitmBIP324::new(&mut rng).unwrap();
+
+        mitm.client_write(&hex!("b4916771c194e010218a41e980586d27ae39e8432c9c33c0158fc0f8aba7dc9446b96091e73ea8b85e072d6cb7d420836bb84dc1c90a0e472c6f74bfff16c4b6")).unwrap();
+
+        let garbage = vec![38u8; 4111];
+        mitm.client_write(&garbage).unwrap();
+
+        let last_byte = vec![1u8; 1];
+        let res = mitm.client_write(&last_byte);
+        assert!(matches!(res, Err(GarbageLimitExceededError)));
     }
 }

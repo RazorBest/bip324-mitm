@@ -17,6 +17,9 @@ pub const NUM_PACKET_OVERHEAD_BYTES: usize = NUM_LENGTH_BYTES + NUM_HEADER_BYTES
 pub const DECOY_BYTE: u8 = 128;
 // Number of bytes for the garbage terminator.
 pub const NUM_GARBAGE_TERMINATOR_BYTES: usize = 16;
+/// The max number of bytes of arbitrary data that can be sent after a public key. Doesn't include
+/// the garbage terminator bytes.
+pub const NUM_GARBAGE_CONTENT_LIMIT: usize = 4095;
 
 /// The "Magic Bytes" used by Bitcoin to identify the mainnet network
 pub const MAINNET_MAGIC: [u8; 4] = [0xF9, 0xBE, 0xB4, 0xD9];

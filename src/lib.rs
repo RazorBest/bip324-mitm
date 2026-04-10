@@ -1,3 +1,4 @@
+pub mod bip324;
 pub mod cipher;
 pub mod external;
 mod fmt_utils;

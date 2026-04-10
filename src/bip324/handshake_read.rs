@@ -160,6 +160,21 @@ impl HandshakeReadParser {
         self.state.as_ref().is_some_and(|s| s.is_final())
     }
 
+    pub fn is_receiving_key(&self) -> bool {
+        matches!(self.state, Some(HandshakeReadState::ReceivingKey(..)))
+    }
+
+    pub fn is_receiving_garbage(&self) -> bool {
+        matches!(self.state, Some(HandshakeReadState::ReceivingGarbage(_)))
+    }
+
+    pub fn inbound_garbage_terminator(&self) -> Option<&GarbageTerminatorType> {
+        match self.state.as_ref()? {
+            HandshakeReadState::ReceivingGarbage(gt) => Some(gt),
+            _ => None,
+        }
+    }
+
     pub fn take_aad(&mut self) -> Option<AADType> {
         let state = self.state.take()?;
         match state {

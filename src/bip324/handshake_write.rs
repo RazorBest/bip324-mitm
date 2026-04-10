@@ -61,8 +61,24 @@ impl HandshakeWriteParser {
         self.outbound_cipher.take()
     }
 
+    pub fn has_outbound_cipher(&self) -> bool {
+        self.outbound_cipher.is_some()
+    }
+
     pub fn is_done(&self) -> bool {
         self.state.as_ref().is_some_and(|s| s.is_final())
+    }
+
+    pub fn is_sending_key(&self) -> bool {
+        matches!(self.state, Some(HandshakeWriteState::SendingKey))
+    }
+
+    pub fn is_sending_garbage(&self) -> bool {
+        matches!(self.state, Some(HandshakeWriteState::SendingGarbage))
+    }
+
+    pub fn is_sending_terminator(&self) -> bool {
+        matches!(self.state, Some(HandshakeWriteState::SendingGarbageTerminator))
     }
 }
 

@@ -30,11 +30,6 @@ use crate::state_machine::{
     StreamReadParser, StreamWriteParser,
 };
 
-// Maximum packet size for automatic allocation.
-// Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH is 4,000,000 bytes (~4 MiB).
-// 14 extra bytes are for the BIP-324 header byte and 13 serialization header bytes (message type).
-const MAX_PACKET_SIZE_FOR_ALLOCATION: usize = 4000014;
-
 #[derive(Error, Debug)]
 pub enum BIP324MitmError {
     #[error("IO Read error")]

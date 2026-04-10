@@ -17,7 +17,7 @@ pub enum DataReadState {
 }
 
 impl HasFinal for DataReadState {
-    /// Always returns false -- packet reading loops forever
+    /// Always returns false - packet reading loops forever
     fn is_final(&self) -> bool {
         false
     }

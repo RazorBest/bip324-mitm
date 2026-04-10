@@ -259,8 +259,9 @@ impl ProtocolReadParser for HandshakeReadParser {
                         find_garbage(&self.read_buffer, other_garbage_terminator)
                     {
                         to_consume -= rest.len();
-                        // TODO: replace unwrap
-                        let _ = data.read(&mut vec![0u8; to_consume]).unwrap();
+                        let _ = data
+                            .read(&mut vec![0u8; to_consume])
+                            .expect("BufReader advance should not fail: to_consume <= buf_ref().len()");
 
                         // Remove the final bytes that are not part of the garbage
                         self.read_buffer

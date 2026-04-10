@@ -96,23 +96,25 @@ impl ProtocolReadParser for DataReadParser {
 
         let (next_state, res) = match state {
             ReceivingPacketLen(mut length_decryptor) => {
-                // TODO: replace unwrap
                 length_decryptor
                     .decrypt_len_part_inplace(&mut data_to_process)
-                    .unwrap();
+                    .expect("decrypt_len_part_inplace cannot fail: to_consume <= remaining_bytes");
 
                 self.output_length_bytes.extend_from_slice(&data_to_process);
 
                 match length_decryptor.try_end() {
                     Ok((length_cipher, packet_len)) => {
-                        // TODO: replace unwrap
                         self.inbound_cipher
                             .reown_length_cipher(length_cipher)
-                            .unwrap();
+                            .expect("reown_length_cipher cannot fail: cipher was extracted in new()");
 
                         if packet_len > MAX_PACKET_SIZE_FOR_ALLOCATION {
-                            // TODO: replace panic
-                            panic!("Packet too big");
+                            self.remaining += to_consume;
+                            let length_decryptor = self
+                                .inbound_cipher
+                                .get_new_length_decryptor()
+                                .expect("length cipher is available after reown");
+                            return (ReceivingPacketLen(length_decryptor), Err(()));
                         }
 
                         let stream_cipher = self
@@ -162,8 +164,8 @@ impl ProtocolReadParser for DataReadParser {
             }
             ReceivingPacketTag(mut expected_tag) => {
                 if data_to_process != expected_tag[..data_to_process.len()] {
-                    // TODO: replace panic
-                    panic!("AEAD tag check fail");
+                    self.remaining += to_consume;
+                    return (ReceivingPacketTag(expected_tag), Err(()));
                 }
                 expected_tag.drain(..data_to_process.len());
 
@@ -187,9 +189,10 @@ impl ProtocolReadParser for DataReadParser {
         };
 
         if res.is_ok() {
-            let _ = data.read(&mut vec![0u8; to_consume]).unwrap();
+            let _ = data
+                .read(&mut vec![0u8; to_consume])
+                .expect("BufReader advance should not fail: to_consume <= buf_ref().len()");
         } else {
-            // TODO: see if you can represent this through typing
             self.remaining += to_consume;
         }
 
@@ -382,10 +385,9 @@ mod tests {
         );
     }
 
-    // 5. Feed correct length + content, then corrupt tag bytes. Verify panic.
+    // 5. Feed correct length + content, then corrupt tag bytes. Verify Err is returned.
     #[test]
-    #[should_panic(expected = "AEAD tag check fail")]
-    fn test_corrupt_tag_panics() {
+    fn test_corrupt_tag_returns_err() {
         let (mut alice_out, bob_in) = make_cipher_pair();
 
         let plaintext = b"tag corruption test";
@@ -399,7 +401,8 @@ mod tests {
 
         let mut parser = DataReadParser::new(vec![], bob_in);
         let mut data = &ciphertext[..];
-        parser.consume(&mut data).unwrap();
+        let result = parser.consume(&mut data);
+        assert!(result.is_err(), "Expected Err on corrupt AEAD tag");
     }
 
     // 6. Use known session keys. Verify the parser decodes the known ciphertext vector.

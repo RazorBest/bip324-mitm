@@ -200,13 +200,14 @@ impl ProtocolReadParser for MitmImpersonatorLeg {
 
         match state {
             Handshake(mut reader_leg) => {
-                // TODO: replace unwrap
                 if let Err(err) = reader_leg.consume(data) {
                     return (Handshake(reader_leg), Err(err));
                 }
 
                 if reader_leg.is_final() {
-                    let (new_reader_leg, outbound_cipher) = reader_leg.next_phase().unwrap();
+                    let (new_reader_leg, outbound_cipher) = reader_leg
+                        .next_phase()
+                        .expect("next_phase() returns Some when is_final() is true");
                     // Route outbound cipher to the writer's handshake parser
                     if let Some(WriterLegState::Handshake(ref mut writer_leg)) =
                         self.writer_leg_state
@@ -219,8 +220,7 @@ impl ProtocolReadParser for MitmImpersonatorLeg {
                 }
             }
             Data(mut reader_leg) => {
-                // TODO: replace unwrap
-                reader_leg.consume(data).unwrap();
+                reader_leg.consume(data).expect("data reader step should not fail");
 
                 (Data(reader_leg), Ok(ProtocolStatus::End))
             }
@@ -249,12 +249,13 @@ impl ProtocolWriteParser for MitmImpersonatorLeg {
 
         match state {
             Handshake(mut writer_leg) => {
-                // TODO: replace unwrap
-                writer_leg.produce(data).unwrap();
+                writer_leg.produce(data).expect("handshake writer step should not fail");
 
                 if writer_leg.is_final() {
                     if writer_leg.parser.has_outbound_cipher() {
-                        let new_writer_leg = writer_leg.next_phase().unwrap();
+                        let new_writer_leg = writer_leg
+                            .next_phase()
+                            .expect("next_phase() returns Some when has_outbound_cipher() is true");
                         (Data(new_writer_leg), Ok(ProtocolStatus::End))
                     } else {
                         // Cipher not yet forwarded from reader; stay in handshake
@@ -265,8 +266,7 @@ impl ProtocolWriteParser for MitmImpersonatorLeg {
                 }
             }
             Data(mut writer_leg) => {
-                // TODO: replace unwrap
-                writer_leg.produce(data).unwrap();
+                writer_leg.produce(data).expect("data writer step should not fail");
 
                 (Data(writer_leg), Ok(ProtocolStatus::End))
             }

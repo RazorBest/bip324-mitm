@@ -85,13 +85,14 @@ impl ProtocolWriteParser for DataWriteParser {
                     return (SendingLength(remaining, written), Ok(ProtocolStatus::End));
                 }
 
-                // TODO: replace unwrap
-                let buf = data.prewrite(self.input_length_bytes.len()).unwrap();
+                let buf = match data.prewrite(self.input_length_bytes.len()) {
+                    Ok(buf) => buf,
+                    Err(_) => return (SendingLength(remaining, written), Err(())),
+                };
                 let size = buf.len();
 
                 if size > remaining {
-                    // TODO: replace panic
-                    panic!("Received too many length bytes from the input buffer");
+                    return (SendingLength(remaining, written), Err(()));
                 }
 
                 // Capture plaintext before encrypting
@@ -131,13 +132,14 @@ impl ProtocolWriteParser for DataWriteParser {
                     );
                 }
 
-                // TODO: replace unwrap
-                let buf = data.prewrite(self.input_data_bytes.len()).unwrap();
+                let buf = match data.prewrite(self.input_data_bytes.len()) {
+                    Ok(buf) => buf,
+                    Err(_) => return (SendingPayload(remaining, stream_cipher), Err(())),
+                };
                 let size = buf.len();
 
-                // TODO: replace panic
                 if size > remaining {
-                    panic!("Received too many data bytes from the input buffer");
+                    return (SendingPayload(remaining, stream_cipher), Err(()));
                 }
 
                 buf.copy_from_slice(&self.input_data_bytes[..size]);
@@ -162,13 +164,14 @@ impl ProtocolWriteParser for DataWriteParser {
                     return (SendingTag(tag), Ok(ProtocolStatus::End));
                 }
 
-                // TODO: replace unwrap
-                let buf = data.prewrite(self.input_tag_bytes.len()).unwrap();
+                let buf = match data.prewrite(self.input_tag_bytes.len()) {
+                    Ok(buf) => buf,
+                    Err(_) => return (SendingTag(tag), Err(())),
+                };
                 let size = buf.len();
 
                 if size > tag.len() {
-                    // TODO: replace panic
-                    panic!("Received too many tag bytes from the input buffer");
+                    return (SendingTag(tag), Err(()));
                 }
 
                 // Consume relay tag bytes for pacing, then overwrite with computed tag
@@ -188,8 +191,7 @@ impl ProtocolWriteParser for DataWriteParser {
     }
 
     fn take_state(&mut self) -> Self::State {
-        // TODO: remove unwrap
-        self.state.take().unwrap()
+        self.state.take().expect("DataWriteParser state should not be None")
     }
 
     fn set_state(&mut self, state: Self::State) {

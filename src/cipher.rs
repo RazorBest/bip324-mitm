@@ -557,11 +557,9 @@ fn generate_session_keys_ecdh(
 
     let skm =
         SessionKeyMaterial::from_ecdh(initiator_ellswift, responder_ellswift, secret, party, magic)
-            .map_err(|_| "Error creating the shared key".to_string());
+            .map_err(|_| "Error creating the shared key".to_string())?;
 
-    let skm = skm.unwrap();
-
-    Ok(skm) // TODO: remove me
+    Ok(skm)
 }
 
 /// Manages cipher state for a BIP-324 encrypted connection.
@@ -643,8 +641,10 @@ impl CipherSession {
 
     /// Split the session into separate inbound and outbound ciphers.
     pub fn into_split(self) -> (InboundCipher, OutboundCipher) {
-        // TODO: replace unwrap
-        (self.inbound.unwrap(), self.outbound.unwrap())
+        (
+            self.inbound.expect("inbound cipher was consumed before into_split"),
+            self.outbound.expect("outbound cipher was consumed before into_split"),
+        )
     }
 }
 

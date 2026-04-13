@@ -203,13 +203,7 @@ impl ProtocolReadParser for MitmImpersonatorLeg {
                 }
 
                 if reader_leg.is_final() {
-                    let (new_reader_leg, outbound_cipher) = reader_leg.next_phase().unwrap();
-                    // Route outbound cipher to the writer's handshake parser
-                    if let Some(WriterLegState::Handshake(ref mut writer_leg)) =
-                        self.writer_leg_state
-                    {
-                        writer_leg.parser.set_outbound_cipher(outbound_cipher);
-                    }
+                    let new_reader_leg = reader_leg.next_phase().unwrap();
                     (Data(new_reader_leg), Ok(ProtocolStatus::End))
                 } else {
                     (Handshake(reader_leg), Ok(ProtocolStatus::End))
@@ -335,14 +329,12 @@ impl MitmHandshakeImpersonatorLegReader {
         self.parser.inbound_garbage_terminator()
     }
 
-    pub fn next_phase(mut self) -> Option<(MitmImpersonatorLegReader, OutboundCipher)> {
+    pub fn next_phase(self) -> Option<MitmImpersonatorLegReader> {
         if !self.parser.is_handshake_done() {
             return None;
         }
-        let aad = self.parser.take_aad().unwrap_or_default();
-        let (inbound_cipher, outbound_cipher) = self.parser.take_ciphers()?;
-        let reader = MitmImpersonatorLegReader::new(aad, self.relay_out, inbound_cipher);
-        Some((reader, outbound_cipher))
+        let (data_parser, aad) = self.parser.into_data_reader();
+        Some(MitmImpersonatorLegReader::new_from_parser(self.relay_out, data_parser, &aad))
     }
 }
 
@@ -409,9 +401,12 @@ impl MitmHandshakeImpersonatorLegWriter {
         self.parser.is_done()
     }
 
-    pub fn next_phase(mut self) -> Option<MitmImpersonatorLegWriter> {
-        let outbound_cipher = self.parser.take_outbound_cipher()?;
-        Some(MitmImpersonatorLegWriter::new(self.relay_in, outbound_cipher))
+    pub fn next_phase(self) -> Option<MitmImpersonatorLegWriter> {
+        if !self.parser.has_outbound_cipher() {
+            return None;
+        }
+        let data_writer = self.parser.into_data_writer();
+        Some(MitmImpersonatorLegWriter::new_from_parser(self.relay_in, data_writer))
     }
 }
 
@@ -489,6 +484,19 @@ impl MitmImpersonatorLegReader {
         relay_out.borrow_mut().set_aad(&aad);
         Self { parser, relay_out }
     }
+
+    /// Create a data-phase reader from an already-built `DataReadParser`.
+    ///
+    /// `aad` must be the same garbage content that was fed to `DataReadParser::new()` so that
+    /// the relay is informed of the connection's AAD before the first packet arrives.
+    pub(crate) fn new_from_parser(
+        relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
+        parser: DataReadParser,
+        aad: &[u8],
+    ) -> Self {
+        relay_out.borrow_mut().set_aad(aad);
+        Self { parser, relay_out }
+    }
 }
 
 impl StreamReadParser for MitmImpersonatorLegReader {
@@ -531,6 +539,13 @@ impl MitmImpersonatorLegWriter {
         outbound_cipher: OutboundCipher,
     ) -> Self {
         let parser = DataWriteParser::new(outbound_cipher);
+        Self { parser, relay_in }
+    }
+
+    pub(crate) fn new_from_parser(
+        relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
+        parser: DataWriteParser,
+    ) -> Self {
         Self { parser, relay_in }
     }
 }

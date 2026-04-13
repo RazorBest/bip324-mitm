@@ -5,6 +5,7 @@ use crate::cipher::OutboundCipher;
 use crate::protocol::{NUM_ELLIGATOR_SWIFT_BYTES, NUM_GARBAGE_TERMINATOR_BYTES};
 use crate::state_machine::{BufWriter, HasFinal, ProtocolStatus, ProtocolWriteParser};
 use super::SharedHandshakeState;
+use super::data_write::DataWriteParser;
 
 pub enum HandshakeWriteState {
     SendingKey,
@@ -59,7 +60,7 @@ impl HandshakeWriteParser {
     }
 
     pub fn has_outbound_cipher(&self) -> bool {
-        self.outbound_cipher.is_some()
+        self.outbound_cipher.is_some() || self.shared.borrow().outbound_cipher.is_some()
     }
 
     pub fn is_done(&self) -> bool {
@@ -76,6 +77,21 @@ impl HandshakeWriteParser {
 
     pub fn is_sending_terminator(&self) -> bool {
         matches!(self.state, Some(HandshakeWriteState::SendingGarbageTerminator))
+    }
+
+    pub fn into_data_writer(mut self) -> DataWriteParser {
+        assert!(
+            self.is_done(),
+            "Handshake must be done before transitioning to data phase"
+        );
+
+        let outbound_cipher = self
+            .outbound_cipher
+            .take()
+            .or_else(|| self.shared.borrow_mut().outbound_cipher.take())
+            .expect("Outbound cipher must be available for data phase");
+
+        DataWriteParser::new(outbound_cipher)
     }
 
     /// Inject an outbound garbage terminator directly into shared state.

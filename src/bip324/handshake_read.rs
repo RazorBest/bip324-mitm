@@ -8,6 +8,7 @@ use crate::protocol::{
 };
 use crate::state_machine::{BufReader, HasFinal, ProtocolReadParser, ProtocolStatus};
 use super::{Bip324Error, SharedHandshakeState};
+use super::data_read::DataReadParser;
 
 #[derive(Debug)]
 pub enum HandshakeReadState {
@@ -155,6 +156,24 @@ impl HandshakeReadParser {
                 None
             }
         }
+    }
+
+    pub fn into_data_reader(mut self) -> (DataReadParser, Vec<u8>) {
+        assert!(
+            self.is_handshake_done(),
+            "Handshake must be done before transitioning to data phase"
+        );
+
+        let (inbound_cipher, outbound_cipher) = self
+            .take_ciphers()
+            .expect("Ciphers must be available after handshake");
+
+        let aad = self.take_aad().unwrap_or_default();
+
+        // Store the outbound cipher in shared state so the paired writer can use it.
+        self.shared.borrow_mut().outbound_cipher = Some(outbound_cipher);
+
+        (DataReadParser::new(aad.clone(), inbound_cipher), aad)
     }
 }
 

@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::cipher::CipherSession;
+use crate::cipher::{CipherSession, OutboundCipher};
 use crate::protocol::{EcdhPoint, GarbageTerminatorType, MagicType, NUM_ELLIGATOR_SWIFT_BYTES, Role};
 
 pub mod data_read;
@@ -48,6 +48,9 @@ pub struct HandshakeState {
     pub(super) cipher_session: Option<CipherSession>,
     pub(super) outbound_garbage_terminator: Option<GarbageTerminatorType>,
     pub(super) writer_started_sending: bool,
+    /// Outbound cipher extracted from the cipher session by into_data_reader()
+    /// The paired write parser reads this in into_data_writer()
+    pub(super) outbound_cipher: Option<OutboundCipher>,
 }
 
 /// A reference-counted, interior-mutable handle to `HandshakeState`.
@@ -65,6 +68,7 @@ impl HandshakeState {
             cipher_session: None,
             outbound_garbage_terminator: None,
             writer_started_sending: false,
+            outbound_cipher: None,
         }
     }
 
@@ -454,5 +458,144 @@ mod tests {
         writer.produce(&mut buf.as_mut_slice()).unwrap();
 
         assert_eq!(buf, expected_bytes, "Writer must produce the key from shared state");
+    }
+
+    // Helper, run a full BIP-324 handshake for both sides using new_handshake_pair.
+    // Returns (alice_reader, alice_writer, bob_reader, bob_writer), all in HandshakeDone state.
+    fn do_full_handshake() -> (
+        HandshakeReadParser,
+        HandshakeWriteParser,
+        HandshakeReadParser,
+        HandshakeWriteParser,
+    ) {
+        use crate::state_machine::StreamWriteParser;
+
+        let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
+        let bob_key = key_from_secret_bytes(BOB_SECRET).unwrap();
+
+        let bob_wire_key = bob_key.elligator_swift.to_array().to_vec();
+        let alice_wire_key = alice_key.elligator_swift.to_array().to_vec();
+
+        let (mut alice_reader, mut alice_writer) =
+            super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
+        let (mut bob_reader, mut bob_writer) =
+            super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
+
+        // Exchange public keys (also derives ECDH, making outbound_garbage_terminator available)
+        alice_reader.consume(&mut bob_wire_key.as_slice()).unwrap();
+        bob_reader.consume(&mut alice_wire_key.as_slice()).unwrap();
+
+        // Exchange garbage terminators (no garbage content)
+        let alice_term = alice_reader.outbound_garbage_terminator().unwrap().to_vec();
+        let bob_term = bob_reader.outbound_garbage_terminator().unwrap().to_vec();
+
+        alice_reader.consume(&mut bob_term.as_slice()).unwrap();
+        bob_reader.consume(&mut alice_term.as_slice()).unwrap();
+
+        assert!(alice_reader.is_handshake_done());
+        assert!(bob_reader.is_handshake_done());
+
+        // Drive write parsers to Done: send key bytes + no garbage + garbage terminator.
+        // ECDH is complete, so outbound_garbage_terminator is in shared state.
+        alice_writer.set_garbage_eof();
+        bob_writer.set_garbage_eof();
+
+        let mut discard = vec![0u8; 256];
+        alice_writer.produce(&mut discard.as_mut_slice()).unwrap();
+        assert!(alice_writer.is_done(), "alice writer must reach Done after produce()");
+
+        let mut discard = vec![0u8; 256];
+        bob_writer.produce(&mut discard.as_mut_slice()).unwrap();
+        assert!(bob_writer.is_done(), "bob writer must reach Done after produce()");
+
+        (alice_reader, alice_writer, bob_reader, bob_writer)
+    }
+
+    // 9. Complete a handshake, call into_data_reader(), feed encrypted data to the resulting
+    //    DataReadParser, and verify decryption works.
+    #[test]
+    fn test_handshake_reader_into_data_reader() {
+        let (alice_reader, alice_writer, bob_reader, _bob_writer) = do_full_handshake();
+
+        // Alice transitions to data phase; outbound cipher is deposited into shared state.
+        let (_alice_data_reader, _) = alice_reader.into_data_reader();
+        let mut alice_data_writer = alice_writer.into_data_writer();
+
+        // Bob's read transition yields the DataReadParser
+        let (mut bob_data_reader, _) = bob_reader.into_data_reader();
+
+        // Alice encrypts, bob decrypts
+        let plaintext = b"into_data_reader test";
+        let ciphertext = encrypt_packet(&mut alice_data_writer, plaintext);
+
+        bob_data_reader.consume(&mut ciphertext.as_slice()).unwrap();
+        let decrypted = bob_data_reader.drain_data_bytes();
+
+        assert_eq!(decrypted[0], 0x00, "Expected genuine header byte");
+        assert_eq!(&decrypted[1..], plaintext);
+    }
+
+    // 10. Complete a handshake, call into_data_writer(), encrypt data, and verify decryption.
+    #[test]
+    fn test_handshake_writer_into_data_writer() {
+        let (alice_reader, alice_writer, bob_reader, _bob_writer) = do_full_handshake();
+
+        // Alice transitions to data phase (reader stores outbound in shared state)
+        let (_alice_data_reader, _) = alice_reader.into_data_reader();
+        let mut alice_data_writer = alice_writer.into_data_writer();
+
+        // Bob needs inbound cipher: use take_ciphers on a fresh handshake as a cross-check,
+        // but since we're testing the writer we get bob's inbound from his reader transition.
+        let (mut bob_data_reader, _) = bob_reader.into_data_reader();
+
+        let plaintext = b"into_data_writer test";
+        let ciphertext = encrypt_packet(&mut alice_data_writer, plaintext);
+
+        bob_data_reader.consume(&mut ciphertext.as_slice()).unwrap();
+        let decrypted = bob_data_reader.drain_data_bytes();
+
+        assert_eq!(decrypted[0], 0x00, "Expected genuine header byte");
+        assert_eq!(&decrypted[1..], plaintext);
+    }
+
+    // 11. Both sides do handshake → data transition. Side A encrypts, side B decrypts.
+    //     This replaces/extends test_full_protocol_flow by using the new transition methods
+    //     instead of take_ciphers().
+    #[test]
+    fn test_full_transition_roundtrip() {
+        let (alice_reader, alice_writer, bob_reader, bob_writer) = do_full_handshake();
+
+        // Both sides transition to data phase using the new methods
+        let (_alice_data_reader, _) = alice_reader.into_data_reader();
+        let mut alice_data_writer = alice_writer.into_data_writer();
+
+        let (mut bob_data_reader, _) = bob_reader.into_data_reader();
+        let _bob_data_writer = bob_writer.into_data_writer();
+
+        // Alice encrypts → Bob decrypts
+        let plaintext = b"full transition roundtrip";
+        let ciphertext = encrypt_packet(&mut alice_data_writer, plaintext);
+
+        bob_data_reader.consume(&mut ciphertext.as_slice()).unwrap();
+        let decrypted = bob_data_reader.drain_data_bytes();
+
+        assert_eq!(decrypted[0], 0x00, "Expected genuine header byte");
+        assert_eq!(
+            &decrypted[1..],
+            plaintext,
+            "Decrypted payload must match original plaintext"
+        );
+    }
+
+    // 12. Call into_data_reader() before the handshake completes → should panic.
+    #[test]
+    #[should_panic(expected = "Handshake must be done before transitioning to data phase")]
+    fn test_into_data_reader_panics_if_not_done() {
+        let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
+        let (alice_reader, _alice_writer) =
+            super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
+
+        // Handshake not done yet -- should panic
+        let _ = alice_reader.into_data_reader();
     }
 }

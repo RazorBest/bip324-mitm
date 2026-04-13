@@ -50,6 +50,18 @@ pub enum BIP324MitmError {
 
 use BIP324MitmError::*;
 
+impl From<crate::bip324::Bip324Error> for BIP324MitmError {
+    fn from(e: crate::bip324::Bip324Error) -> Self {
+        use crate::bip324::Bip324Error as E;
+        match e {
+            E::ReadError(err) => BIP324MitmError::ReadError(err),
+            E::KeyGenerationError => BIP324MitmError::KeyGenerationError,
+            E::GarbageLimitExceededError => BIP324MitmError::GarbageLimitExceededError,
+            E::IllegalState(msg) => BIP324MitmError::IllegalState(msg),
+        }
+    }
+}
+
 // A BufWriter wrapper that limits how many bytes can be written per step().
 // Used to implement relay-channel pacing in handshake writers.
 struct LimitedWriter<'a> {
@@ -334,7 +346,7 @@ impl MitmHandshakeImpersonatorLegReader {
 
         self.parser
             .set_ecdh_point(secret_key)
-            .map_err(|(_, err)| (secret, err))?;
+            .map_err(|(_, err)| (secret, err.into()))?;
 
         Ok(())
     }

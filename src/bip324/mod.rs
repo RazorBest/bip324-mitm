@@ -8,6 +8,27 @@ pub use data_write::{DataWriteParser, DataWriteState};
 pub use handshake_read::{HandshakeReadParser, HandshakeReadState};
 pub use handshake_write::{HandshakeWriteParser, HandshakeWriteState};
 
+#[derive(Debug)]
+pub enum Bip324Error {
+    ReadError(std::io::Error),
+    KeyGenerationError,
+    GarbageLimitExceededError,
+    IllegalState(String),
+}
+
+impl std::fmt::Display for Bip324Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadError(e) => write!(f, "IO Read error: {e}"),
+            Self::KeyGenerationError => write!(f, "Key generation error"),
+            Self::GarbageLimitExceededError => write!(f, "Garbage limit exceeded"),
+            Self::IllegalState(msg) => write!(f, "Illegal state: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for Bip324Error {}
+
 #[cfg(test)]
 mod tests {
     use hex_literal::hex;

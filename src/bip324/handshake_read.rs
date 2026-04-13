@@ -6,8 +6,7 @@ use crate::protocol::{
     NUM_GARBAGE_CONTENT_LIMIT, NUM_GARBAGE_TERMINATOR_BYTES, Role, find_garbage,
 };
 use crate::state_machine::{BufReader, HasFinal, ProtocolReadParser, ProtocolStatus};
-use crate::BIP324MitmError;
-use BIP324MitmError::*;
+use super::Bip324Error;
 
 #[derive(Debug)]
 pub enum HandshakeReadState {
@@ -70,15 +69,15 @@ impl HandshakeReadParser {
     fn on_share_received(
         &mut self,
         point: EcdhPoint,
-    ) -> Result<GarbageTerminatorType, (EcdhPoint, BIP324MitmError)> {
+    ) -> Result<GarbageTerminatorType, (EcdhPoint, Bip324Error)> {
         let Some(other_key) = &self.other_key else {
             return Err((
                 point,
-                IllegalState("on_share_received called with empty other_key".to_string()),
+                Bip324Error::IllegalState("on_share_received called with empty other_key".to_string()),
             ));
         };
         let cipher = CipherSession::new_from_shares(self.magic, self.role, point, other_key)
-            .map_err(|(point, _)| (point, KeyGenerationError))?;
+            .map_err(|(point, _)| (point, Bip324Error::KeyGenerationError))?;
         let inbound_garbage_terminator = cipher.inbound_garbage_terminator;
         let outbound_garbage_terminator = cipher.outbound_garbage_terminator;
 
@@ -91,13 +90,13 @@ impl HandshakeReadParser {
     pub fn set_ecdh_point(
         &mut self,
         point: EcdhPoint,
-    ) -> Result<(), (EcdhPoint, BIP324MitmError)> {
+    ) -> Result<(), (EcdhPoint, Bip324Error)> {
         use HandshakeReadState::*;
 
         if self.state.as_ref().is_some_and(|s| s.is_final()) {
             return Err((
                 point,
-                IllegalState("Can't change key. Handshake is already done".to_string()),
+                Bip324Error::IllegalState("Can't change key. Handshake is already done".to_string()),
             ));
         }
 
@@ -118,7 +117,7 @@ impl HandshakeReadParser {
                 self.state = state;
                 Err((
                     point,
-                    IllegalState("Can't change key in this state".to_string()),
+                    Bip324Error::IllegalState("Can't change key in this state".to_string()),
                 ))
             }
         }
@@ -192,7 +191,7 @@ impl HandshakeReadParser {
 
 impl ProtocolReadParser for HandshakeReadParser {
     type State = HandshakeReadState;
-    type Error = BIP324MitmError;
+    type Error = Bip324Error;
 
     fn transition(
         &mut self,
@@ -209,7 +208,7 @@ impl ProtocolReadParser for HandshakeReadParser {
                     Err(err) => {
                         return (
                             ReceivingKey(point, remaining),
-                            Err(BIP324MitmError::ReadError(err)),
+                            Err(Bip324Error::ReadError(err)),
                         );
                     }
                 };
@@ -298,7 +297,7 @@ impl ProtocolReadParser for HandshakeReadParser {
 
                 if self.read_buffer.len() > NUM_GARBAGE_CONTENT_LIMIT + NUM_GARBAGE_TERMINATOR_BYTES
                 {
-                    return (state, Err(GarbageLimitExceededError));
+                    return (state, Err(Bip324Error::GarbageLimitExceededError));
                 }
 
                 if found {
@@ -610,7 +609,7 @@ mod tests {
         let result = parser.consume(&mut gref);
 
         assert!(
-            matches!(result, Err(BIP324MitmError::GarbageLimitExceededError)),
+            matches!(result, Err(Bip324Error::GarbageLimitExceededError)),
             "Expected GarbageLimitExceededError"
         );
     }

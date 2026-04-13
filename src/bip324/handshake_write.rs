@@ -1,4 +1,5 @@
 use std::cmp;
+use std::collections::VecDeque;
 
 use crate::cipher::OutboundCipher;
 use crate::state_machine::{BufWriter, HasFinal, ProtocolStatus, ProtocolWriteParser};
@@ -18,10 +19,10 @@ impl HasFinal for HandshakeWriteState {
 
 pub struct HandshakeWriteParser {
     state: Option<HandshakeWriteState>,
-    key_bytes: Vec<u8>,
-    garbage_bytes: Vec<u8>,
+    key_bytes: VecDeque<u8>,
+    garbage_bytes: VecDeque<u8>,
     garbage_eof: bool,
-    terminator_bytes: Vec<u8>,
+    terminator_bytes: VecDeque<u8>,
     outbound_cipher: Option<OutboundCipher>,
 }
 
@@ -29,20 +30,20 @@ impl HandshakeWriteParser {
     pub fn new(key_bytes: Vec<u8>) -> Self {
         Self {
             state: Some(HandshakeWriteState::SendingKey),
-            key_bytes,
-            garbage_bytes: vec![],
+            key_bytes: VecDeque::from(key_bytes),
+            garbage_bytes: VecDeque::new(),
             garbage_eof: false,
-            terminator_bytes: vec![],
+            terminator_bytes: VecDeque::new(),
             outbound_cipher: None,
         }
     }
 
     pub fn set_key_bytes(&mut self, key: Vec<u8>) {
-        self.key_bytes = key;
+        self.key_bytes = VecDeque::from(key);
     }
 
     pub fn push_garbage_bytes(&mut self, bytes: &[u8]) {
-        self.garbage_bytes.extend_from_slice(bytes);
+        self.garbage_bytes.extend(bytes.iter().copied());
     }
 
     pub fn set_garbage_eof(&mut self) {
@@ -50,7 +51,7 @@ impl HandshakeWriteParser {
     }
 
     pub fn set_terminator(&mut self, terminator: &[u8]) {
-        self.terminator_bytes = terminator.to_vec();
+        self.terminator_bytes = VecDeque::from(terminator.to_vec());
     }
 
     pub fn set_outbound_cipher(&mut self, cipher: OutboundCipher) {
@@ -96,8 +97,8 @@ impl ProtocolWriteParser for HandshakeWriteParser {
         match state {
             state @ SendingKey => {
                 let size = cmp::min(data.remaining(), self.key_bytes.len());
-                data.write_all(&self.key_bytes[..size]).unwrap();
-                self.key_bytes.splice(..size, []);
+                let key_chunk: Vec<u8> = self.key_bytes.drain(..size).collect();
+                data.write_all(&key_chunk).unwrap();
 
                 if self.key_bytes.is_empty() {
                     (SendingGarbage, Ok(ProtocolStatus::Continue))
@@ -107,8 +108,8 @@ impl ProtocolWriteParser for HandshakeWriteParser {
             }
             state @ SendingGarbage => {
                 let size = cmp::min(data.remaining(), self.garbage_bytes.len());
-                data.write_all(&self.garbage_bytes[..size]).unwrap();
-                self.garbage_bytes.splice(..size, []);
+                let garbage_chunk: Vec<u8> = self.garbage_bytes.drain(..size).collect();
+                data.write_all(&garbage_chunk).unwrap();
 
                 if self.garbage_bytes.is_empty() && self.garbage_eof {
                     (SendingGarbageTerminator, Ok(ProtocolStatus::Continue))
@@ -118,8 +119,8 @@ impl ProtocolWriteParser for HandshakeWriteParser {
             }
             state @ SendingGarbageTerminator => {
                 let size = cmp::min(data.remaining(), self.terminator_bytes.len());
-                data.write_all(&self.terminator_bytes[..size]).unwrap();
-                self.terminator_bytes.splice(..size, []);
+                let term_chunk: Vec<u8> = self.terminator_bytes.drain(..size).collect();
+                data.write_all(&term_chunk).unwrap();
 
                 if self.terminator_bytes.is_empty() {
                     (Done, Ok(ProtocolStatus::End))

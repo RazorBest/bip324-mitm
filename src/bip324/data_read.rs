@@ -1,4 +1,5 @@
 use std::cmp;
+use std::collections::VecDeque;
 
 use crate::cipher::{InboundCipher, LengthDecryptor};
 use crate::external::chacha20_poly1305::ChaCha20Poly1305Stream;
@@ -30,9 +31,9 @@ pub struct DataReadParser {
     inbound_cipher: InboundCipher,
 
     // Output buffers
-    output_length_bytes: Vec<u8>,
-    output_data_bytes: Vec<u8>,
-    output_tag_bytes: Vec<u8>,
+    output_length_bytes: VecDeque<u8>,
+    output_data_bytes: VecDeque<u8>,
+    output_tag_bytes: VecDeque<u8>,
     output_aad: Option<Vec<u8>>,
 }
 
@@ -46,23 +47,23 @@ impl DataReadParser {
             remaining: NUM_LENGTH_BYTES,
             aad,
             inbound_cipher,
-            output_length_bytes: vec![],
-            output_data_bytes: vec![],
-            output_tag_bytes: vec![],
+            output_length_bytes: VecDeque::new(),
+            output_data_bytes: VecDeque::new(),
+            output_tag_bytes: VecDeque::new(),
             output_aad: None,
         }
     }
 
     pub fn drain_length_bytes(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.output_length_bytes)
+        self.output_length_bytes.drain(..).collect()
     }
 
     pub fn drain_data_bytes(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.output_data_bytes)
+        self.output_data_bytes.drain(..).collect()
     }
 
     pub fn drain_tag_bytes(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.output_tag_bytes)
+        self.output_tag_bytes.drain(..).collect()
     }
 
     pub fn take_aad(&mut self) -> Option<Vec<u8>> {
@@ -101,7 +102,7 @@ impl ProtocolReadParser for DataReadParser {
                     .decrypt_len_part_inplace(&mut data_to_process)
                     .unwrap();
 
-                self.output_length_bytes.extend_from_slice(&data_to_process);
+                self.output_length_bytes.extend(data_to_process.iter().copied());
 
                 match length_decryptor.try_end() {
                     Ok((length_cipher, packet_len)) => {
@@ -137,7 +138,7 @@ impl ProtocolReadParser for DataReadParser {
             }
             ReceivingPacketContent(mut stream_cipher) => {
                 stream_cipher.decrypt_and_store_chunk(&mut data_to_process);
-                self.output_data_bytes.extend_from_slice(&data_to_process);
+                self.output_data_bytes.extend(data_to_process.iter().copied());
 
                 if self.remaining == 0 {
                     let aad = self.consume_aad();
@@ -167,7 +168,7 @@ impl ProtocolReadParser for DataReadParser {
                 }
                 expected_tag.drain(..data_to_process.len());
 
-                self.output_tag_bytes.extend_from_slice(&data_to_process);
+                self.output_tag_bytes.extend(data_to_process.iter().copied());
 
                 if self.remaining == 0 {
                     let length_decryptor = self

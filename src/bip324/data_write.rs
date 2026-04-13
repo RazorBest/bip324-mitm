@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::cipher::OutboundCipher;
 use crate::external::chacha20_poly1305::ChaCha20Poly1305Stream;
 use crate::protocol::NUM_LENGTH_BYTES;
@@ -21,9 +23,9 @@ pub struct DataWriteParser {
     outbound_cipher: OutboundCipher,
 
     // Input buffers (pushed by caller)
-    input_length_bytes: Vec<u8>,
-    input_data_bytes: Vec<u8>,
-    input_tag_bytes: Vec<u8>,
+    input_length_bytes: VecDeque<u8>,
+    input_data_bytes: VecDeque<u8>,
+    input_tag_bytes: VecDeque<u8>,
     input_aad: Option<Vec<u8>>,
 }
 
@@ -32,23 +34,23 @@ impl DataWriteParser {
         Self {
             state: Some(DataWriteState::SendingLength(NUM_LENGTH_BYTES, vec![])),
             outbound_cipher,
-            input_length_bytes: vec![],
-            input_data_bytes: vec![],
-            input_tag_bytes: vec![],
+            input_length_bytes: VecDeque::new(),
+            input_data_bytes: VecDeque::new(),
+            input_tag_bytes: VecDeque::new(),
             input_aad: None,
         }
     }
 
     pub fn push_length_bytes(&mut self, bytes: &[u8]) {
-        self.input_length_bytes.extend_from_slice(bytes);
+        self.input_length_bytes.extend(bytes.iter().copied());
     }
 
     pub fn push_data_bytes(&mut self, bytes: &[u8]) {
-        self.input_data_bytes.extend_from_slice(bytes);
+        self.input_data_bytes.extend(bytes.iter().copied());
     }
 
     pub fn push_tag_bytes(&mut self, bytes: &[u8]) {
-        self.input_tag_bytes.extend_from_slice(bytes);
+        self.input_tag_bytes.extend(bytes.iter().copied());
     }
 
     pub fn set_aad(&mut self, aad: &[u8]) {
@@ -95,8 +97,9 @@ impl ProtocolWriteParser for DataWriteParser {
                 }
 
                 // Capture plaintext before encrypting
-                let new_written = [&written[..], &self.input_length_bytes[..size]].concat();
-                buf.copy_from_slice(&self.input_length_bytes[..size]);
+                let contiguous = self.input_length_bytes.make_contiguous();
+                let new_written = [&written[..], &contiguous[..size]].concat();
+                buf.copy_from_slice(&contiguous[..size]);
                 self.input_length_bytes.drain(..size);
 
                 self.outbound_cipher
@@ -140,7 +143,7 @@ impl ProtocolWriteParser for DataWriteParser {
                     panic!("Received too many data bytes from the input buffer");
                 }
 
-                buf.copy_from_slice(&self.input_data_bytes[..size]);
+                buf.copy_from_slice(&self.input_data_bytes.make_contiguous()[..size]);
                 self.input_data_bytes.drain(..size);
 
                 stream_cipher.encrypt_and_store_chunk(&mut buf[..size]);

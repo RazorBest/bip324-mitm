@@ -1,4 +1,5 @@
 use std::cmp;
+use std::collections::VecDeque;
 
 use crate::cipher::{CipherSession, InboundCipher, OutboundCipher};
 use crate::protocol::{
@@ -32,9 +33,9 @@ pub struct HandshakeReadParser {
     own_ellswift_bytes: [u8; NUM_ELLIGATOR_SWIFT_BYTES],
 
     // Output buffers -- drained by caller after each step()
-    output_key_bytes: Vec<u8>,
-    output_garbage_bytes: Vec<u8>,
-    output_terminator_bytes: Vec<u8>,
+    output_key_bytes: VecDeque<u8>,
+    output_garbage_bytes: VecDeque<u8>,
+    output_terminator_bytes: VecDeque<u8>,
     key_eof: bool,
     garbage_eof: bool,
 
@@ -56,9 +57,9 @@ impl HandshakeReadParser {
             read_buffer: vec![],
             other_key: None,
             own_ellswift_bytes,
-            output_key_bytes: vec![],
-            output_garbage_bytes: vec![],
-            output_terminator_bytes: vec![],
+            output_key_bytes: VecDeque::new(),
+            output_garbage_bytes: VecDeque::new(),
+            output_terminator_bytes: VecDeque::new(),
             key_eof: false,
             garbage_eof: false,
             cipher_session: None,
@@ -124,15 +125,15 @@ impl HandshakeReadParser {
     }
 
     pub fn drain_key_bytes(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.output_key_bytes)
+        self.output_key_bytes.drain(..).collect()
     }
 
     pub fn drain_garbage_bytes(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.output_garbage_bytes)
+        self.output_garbage_bytes.drain(..).collect()
     }
 
     pub fn drain_terminator_bytes(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.output_terminator_bytes)
+        self.output_terminator_bytes.drain(..).collect()
     }
 
     pub fn is_key_eof(&self) -> bool {
@@ -215,7 +216,7 @@ impl ProtocolReadParser for HandshakeReadParser {
                 remaining -= size;
 
                 self.read_buffer.extend_from_slice(&key_buf[..size]);
-                self.output_key_bytes.extend_from_slice(&key_buf[..size]);
+                self.output_key_bytes.extend(key_buf[..size].iter().copied());
 
                 if remaining == 0 {
                     self.key_eof = true;
@@ -311,11 +312,11 @@ impl ProtocolReadParser for HandshakeReadParser {
 
                     // Copy slices to avoid multiple borrows of self
                     let garbage_chunk = self.read_buffer[new_range].to_vec();
-                    self.output_garbage_bytes.extend_from_slice(&garbage_chunk);
+                    self.output_garbage_bytes.extend(garbage_chunk.iter().copied());
                     self.garbage_eof = true;
 
                     let term_chunk = self.read_buffer[garbage_len..].to_vec();
-                    self.output_terminator_bytes.extend_from_slice(&term_chunk);
+                    self.output_terminator_bytes.extend(term_chunk.iter().copied());
 
                     let aad: Vec<_> = self.read_buffer.splice(..garbage_len, []).collect();
                     self.read_buffer.clear();
@@ -329,7 +330,7 @@ impl ProtocolReadParser for HandshakeReadParser {
                     let new_range = lhs..rhs;
 
                     let garbage_chunk = self.read_buffer[new_range].to_vec();
-                    self.output_garbage_bytes.extend_from_slice(&garbage_chunk);
+                    self.output_garbage_bytes.extend(garbage_chunk.iter().copied());
 
                     (state, Ok(ProtocolStatus::End))
                 }

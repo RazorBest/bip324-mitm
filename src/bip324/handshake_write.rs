@@ -2,7 +2,9 @@ use std::cmp;
 use std::collections::VecDeque;
 
 use crate::cipher::OutboundCipher;
+use crate::protocol::{NUM_ELLIGATOR_SWIFT_BYTES, NUM_GARBAGE_TERMINATOR_BYTES};
 use crate::state_machine::{BufWriter, HasFinal, ProtocolStatus, ProtocolWriteParser};
+use super::SharedHandshakeState;
 
 pub enum HandshakeWriteState {
     SendingKey,
@@ -19,27 +21,25 @@ impl HasFinal for HandshakeWriteState {
 
 pub struct HandshakeWriteParser {
     state: Option<HandshakeWriteState>,
-    key_bytes: VecDeque<u8>,
+    key_bytes_sent: usize,
     garbage_bytes: VecDeque<u8>,
     garbage_eof: bool,
-    terminator_bytes: VecDeque<u8>,
+    terminator_bytes_sent: usize,
     outbound_cipher: Option<OutboundCipher>,
+    shared: SharedHandshakeState,
 }
 
 impl HandshakeWriteParser {
-    pub fn new(key_bytes: Vec<u8>) -> Self {
+    pub(super) fn new_with_state(shared: SharedHandshakeState) -> Self {
         Self {
             state: Some(HandshakeWriteState::SendingKey),
-            key_bytes: VecDeque::from(key_bytes),
+            key_bytes_sent: 0,
             garbage_bytes: VecDeque::new(),
             garbage_eof: false,
-            terminator_bytes: VecDeque::new(),
+            terminator_bytes_sent: 0,
             outbound_cipher: None,
+            shared,
         }
-    }
-
-    pub fn set_key_bytes(&mut self, key: Vec<u8>) {
-        self.key_bytes = VecDeque::from(key);
     }
 
     pub fn push_garbage_bytes(&mut self, bytes: &[u8]) {
@@ -48,10 +48,6 @@ impl HandshakeWriteParser {
 
     pub fn set_garbage_eof(&mut self) {
         self.garbage_eof = true;
-    }
-
-    pub fn set_terminator(&mut self, terminator: &[u8]) {
-        self.terminator_bytes = VecDeque::from(terminator.to_vec());
     }
 
     pub fn set_outbound_cipher(&mut self, cipher: OutboundCipher) {
@@ -81,6 +77,17 @@ impl HandshakeWriteParser {
     pub fn is_sending_terminator(&self) -> bool {
         matches!(self.state, Some(HandshakeWriteState::SendingGarbageTerminator))
     }
+
+    /// Inject an outbound garbage terminator directly into shared state.
+    /// This is only intended for use in tests. In production the terminator is derived
+    /// automatically when the read-parser completes the ECDH exchange.
+    #[cfg(test)]
+    pub(crate) fn inject_outbound_garbage_terminator_for_test(
+        &mut self,
+        term: crate::protocol::GarbageTerminatorType,
+    ) {
+        self.shared.borrow_mut().outbound_garbage_terminator = Some(term);
+    }
 }
 
 impl ProtocolWriteParser for HandshakeWriteParser {
@@ -96,11 +103,19 @@ impl ProtocolWriteParser for HandshakeWriteParser {
 
         match state {
             state @ SendingKey => {
-                let size = cmp::min(data.remaining(), self.key_bytes.len());
-                let key_chunk: Vec<u8> = self.key_bytes.drain(..size).collect();
-                data.write_all(&key_chunk).unwrap();
+                // Mark writer as started so that set_ecdh_point is rejected from here on.
+                if !self.shared.borrow().writer_started_sending {
+                    self.shared.borrow_mut().writer_started_sending = true;
+                }
 
-                if self.key_bytes.is_empty() {
+                let ellswift_bytes = self.shared.borrow().our_ellswift_bytes;
+                let remaining = NUM_ELLIGATOR_SWIFT_BYTES - self.key_bytes_sent;
+                let size = cmp::min(data.remaining(), remaining);
+                data.write_all(&ellswift_bytes[self.key_bytes_sent..self.key_bytes_sent + size])
+                    .unwrap();
+                self.key_bytes_sent += size;
+
+                if self.key_bytes_sent == NUM_ELLIGATOR_SWIFT_BYTES {
                     (SendingGarbage, Ok(ProtocolStatus::Continue))
                 } else {
                     (state, Ok(ProtocolStatus::End))
@@ -118,11 +133,21 @@ impl ProtocolWriteParser for HandshakeWriteParser {
                 }
             }
             state @ SendingGarbageTerminator => {
-                let size = cmp::min(data.remaining(), self.terminator_bytes.len());
-                let term_chunk: Vec<u8> = self.terminator_bytes.drain(..size).collect();
-                data.write_all(&term_chunk).unwrap();
+                // The outbound terminator is derived via ECDH by the read-parser. If it is
+                // not ready yet (peer's key hasn't been fully received), wait.
+                let outbound_term = self.shared.borrow().outbound_garbage_terminator;
+                let term = match outbound_term {
+                    Some(t) => t,
+                    None => return (state, Ok(ProtocolStatus::End)),
+                };
 
-                if self.terminator_bytes.is_empty() {
+                let remaining = NUM_GARBAGE_TERMINATOR_BYTES - self.terminator_bytes_sent;
+                let size = cmp::min(data.remaining(), remaining);
+                data.write_all(&term[self.terminator_bytes_sent..self.terminator_bytes_sent + size])
+                    .unwrap();
+                self.terminator_bytes_sent += size;
+
+                if self.terminator_bytes_sent == NUM_GARBAGE_TERMINATOR_BYTES {
                     (Done, Ok(ProtocolStatus::End))
                 } else {
                     (state, Ok(ProtocolStatus::End))
@@ -144,17 +169,29 @@ impl ProtocolWriteParser for HandshakeWriteParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::NUM_ELLIGATOR_SWIFT_BYTES;
+    use crate::key_from_secret_bytes;
+    use crate::protocol::{MAINNET_MAGIC, Role};
     use crate::state_machine::{ProtocolStatus, StreamWriteParser};
 
     const KEY_LEN: usize = NUM_ELLIGATOR_SWIFT_BYTES;
-    const TERMINATOR_LEN: usize = 16;
+    const TERMINATOR_LEN: usize = NUM_GARBAGE_TERMINATOR_BYTES;
 
-    // 1. Create parser with 64 key bytes. produce() with 64-byte buffer. Verify all key bytes written.
+    // Deterministic secret bytes for tests.
+    const SECRET_A: [u8; 32] = [0x01u8; 32];
+    const SECRET_B: [u8; 32] = [0x02u8; 32];
+
+    fn make_writer() -> (HandshakeWriteParser, [u8; KEY_LEN]) {
+        let point = key_from_secret_bytes(SECRET_A).unwrap();
+        let expected_key = point.elligator_swift.to_array();
+        let (_, writer) = super::super::new_handshake_pair(Role::Initiator, MAINNET_MAGIC, point);
+        (writer, expected_key)
+    }
+
+    // 1. Create parser with key from shared state. produce() with 64-byte buffer.
+    //    Verify all key bytes written match the ellswift bytes.
     #[test]
     fn test_write_key_complete() {
-        let expected_key = vec![0xABu8; KEY_LEN];
-        let mut parser = HandshakeWriteParser::new(expected_key.clone());
+        let (mut parser, expected_key) = make_writer();
 
         let mut buf = vec![0u8; KEY_LEN];
         let mut write_slice = buf.as_mut_slice();
@@ -163,11 +200,10 @@ mod tests {
         assert_eq!(buf, expected_key);
     }
 
-    // 2. Create parser with 64 key bytes. step() with 10-byte buffer repeatedly. Verify correct chunking.
+    // 2. Create parser and step() with 10-byte buffer repeatedly. Verify correct chunking.
     #[test]
     fn test_write_key_chunked() {
-        let expected_key: Vec<u8> = (0u8..KEY_LEN as u8).collect();
-        let mut parser = HandshakeWriteParser::new(expected_key.clone());
+        let (mut parser, expected_key) = make_writer();
 
         let mut all_output = Vec::new();
         let chunk_size = 10;
@@ -187,16 +223,20 @@ mod tests {
     }
 
     // 3. Full handshake: key || garbage || terminator in one produce() call.
+    //    The outbound terminator is injected via the test helper.
     #[test]
     fn test_write_full_handshake() {
-        let key = vec![0x01u8; KEY_LEN];
-        let garbage = vec![0xFFu8; 20];
-        let terminator = vec![0xAAu8; TERMINATOR_LEN];
+        let point = key_from_secret_bytes(SECRET_A).unwrap();
+        let expected_key = point.elligator_swift.to_array();
+        let (_, mut parser) =
+            super::super::new_handshake_pair(Role::Initiator, MAINNET_MAGIC, point);
 
-        let mut parser = HandshakeWriteParser::new(key.clone());
+        let garbage = vec![0xFFu8; 20];
+        let terminator = [0xAAu8; TERMINATOR_LEN];
+
         parser.push_garbage_bytes(&garbage);
         parser.set_garbage_eof();
-        parser.set_terminator(&terminator);
+        parser.inject_outbound_garbage_terminator_for_test(terminator);
 
         let mut buf = vec![0u8; KEY_LEN + 20 + TERMINATOR_LEN];
         {
@@ -205,7 +245,7 @@ mod tests {
         }
 
         let mut expected = Vec::new();
-        expected.extend_from_slice(&key);
+        expected.extend_from_slice(&expected_key);
         expected.extend_from_slice(&garbage);
         expected.extend_from_slice(&terminator);
 
@@ -216,12 +256,14 @@ mod tests {
     // 4. No garbage: output is key || terminator.
     #[test]
     fn test_write_no_garbage() {
-        let key = vec![0x02u8; KEY_LEN];
-        let terminator = vec![0xBBu8; TERMINATOR_LEN];
+        let point = key_from_secret_bytes(SECRET_B).unwrap();
+        let expected_key = point.elligator_swift.to_array();
+        let (_, mut parser) =
+            super::super::new_handshake_pair(Role::Initiator, MAINNET_MAGIC, point);
 
-        let mut parser = HandshakeWriteParser::new(key.clone());
+        let terminator = [0xBBu8; TERMINATOR_LEN];
         parser.set_garbage_eof();
-        parser.set_terminator(&terminator);
+        parser.inject_outbound_garbage_terminator_for_test(terminator);
 
         let mut buf = vec![0u8; KEY_LEN + TERMINATOR_LEN];
         {
@@ -230,36 +272,33 @@ mod tests {
         }
 
         let mut expected = Vec::new();
-        expected.extend_from_slice(&key);
+        expected.extend_from_slice(&expected_key);
         expected.extend_from_slice(&terminator);
 
         assert_eq!(buf, expected);
         assert!(parser.is_done());
     }
 
-    // 5. Change key bytes before any writing. Verify new key is written.
+    // 5. writer_started_sending is false before any write, true after.
     #[test]
-    fn test_set_key_bytes() {
-        let original_key = vec![0x01u8; KEY_LEN];
-        let new_key = vec![0x02u8; KEY_LEN];
+    fn test_writer_started_sending_flag() {
+        let (mut parser, _) = make_writer();
 
-        let mut parser = HandshakeWriteParser::new(original_key);
-        parser.set_key_bytes(new_key.clone());
+        assert!(!parser.shared.borrow().writer_started_sending);
 
-        let mut buf = vec![0u8; KEY_LEN];
-        {
-            let mut s = buf.as_mut_slice();
-            parser.step(&mut s).unwrap();
-        }
+        let mut buf = vec![0u8; 1];
+        parser.step(&mut buf.as_mut_slice()).unwrap();
 
-        assert_eq!(buf, new_key);
+        assert!(parser.shared.borrow().writer_started_sending);
     }
 
     // 6. Push garbage in small chunks, calling step() after each. Verify output accumulates correctly.
     #[test]
     fn test_pacing_garbage() {
-        let key = vec![0x03u8; KEY_LEN];
-        let mut parser = HandshakeWriteParser::new(key.clone());
+        let point = key_from_secret_bytes(SECRET_A).unwrap();
+        let expected_key = point.elligator_swift.to_array();
+        let (_, mut parser) =
+            super::super::new_handshake_pair(Role::Initiator, MAINNET_MAGIC, point);
 
         // Consume the key phase first
         let mut key_out = vec![0u8; KEY_LEN];
@@ -268,7 +307,7 @@ mod tests {
             let result = parser.step(&mut s).unwrap();
             assert!(matches!(result, ProtocolStatus::Continue));
         }
-        assert_eq!(key_out, key);
+        assert_eq!(key_out, expected_key);
         assert!(matches!(
             parser.state,
             Some(HandshakeWriteState::SendingGarbage)
@@ -298,8 +337,7 @@ mod tests {
     // 7. Push garbage without setting EOF. Verify parser stays in SendingGarbage and returns End.
     #[test]
     fn test_no_output_when_no_garbage_eof() {
-        let key = vec![0x04u8; KEY_LEN];
-        let mut parser = HandshakeWriteParser::new(key);
+        let (mut parser, _) = make_writer();
 
         // Consume key phase
         let mut key_buf = vec![0u8; KEY_LEN];
@@ -325,5 +363,27 @@ mod tests {
             parser.state,
             Some(HandshakeWriteState::SendingGarbage)
         ));
+    }
+
+    // 8. SendingGarbageTerminator waits when outbound_garbage_terminator is not yet ready.
+    #[test]
+    fn test_terminator_waits_for_ecdh() {
+        let (mut parser, _) = make_writer();
+
+        // Consume the key phase
+        let mut key_buf = vec![0u8; KEY_LEN];
+        parser.step(&mut key_buf.as_mut_slice()).unwrap();
+
+        // Skip garbage (set EOF immediately -- no garbage bytes)
+        parser.set_garbage_eof();
+
+        // produce() drives through to SendingGarbageTerminator and stops because
+        // outbound_garbage_terminator is None (no ECDH has been completed).
+        let mut buf = vec![0u8; 200];
+        parser.produce(&mut buf.as_mut_slice()).unwrap();
+
+        // Parser is stuck at SendingGarbageTerminator, not Done
+        assert!(!parser.is_done());
+        assert!(parser.is_sending_terminator());
     }
 }

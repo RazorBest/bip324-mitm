@@ -135,23 +135,10 @@ impl MitmImpersonatorLeg {
         relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
         secret_key: EcdhPoint,
     ) -> Self {
-        let key_bytes = secret_key.elligator_swift.to_array().to_vec();
-        let key_to_send = Rc::new(RefCell::new(key_bytes.clone()));
-        let garbage_terminator_to_send = Rc::new(RefCell::new(vec![]));
-
-        let reader_leg = MitmHandshakeImpersonatorLegReader::new(
-            role,
-            magic,
-            relay_out,
-            secret_key,
-            Rc::clone(&key_to_send),
-            Rc::clone(&garbage_terminator_to_send),
-        );
-        let writer_leg = MitmHandshakeImpersonatorLegWriter::new(
-            relay_in,
-            key_bytes,
-            garbage_terminator_to_send,
-        );
+        let (bip324_reader, bip324_writer) =
+            bip324::new_handshake_pair(role, magic, secret_key);
+        let reader_leg = MitmHandshakeImpersonatorLegReader::new(relay_out, bip324_reader);
+        let writer_leg = MitmHandshakeImpersonatorLegWriter::new(relay_in, bip324_writer);
 
         Self {
             reader_leg_state: Some(ReaderLegState::Handshake(reader_leg)),
@@ -184,11 +171,9 @@ impl MitmImpersonatorLeg {
         match (&mut self.reader_leg_state, &mut self.writer_leg_state) {
             (
                 Some(ReaderLegState::Handshake(reader_leg)),
-                Some(WriterLegState::Handshake(writer_leg)),
+                Some(WriterLegState::Handshake(_)),
             ) => {
                 reader_leg.set_secret(secret)?;
-                let new_key = reader_leg.key_to_send.borrow().clone();
-                writer_leg.parser.set_key_bytes(new_key);
                 Ok(())
             }
             _ => Err((
@@ -297,39 +282,25 @@ impl ProtocolWriteParser for MitmImpersonatorLeg {
 pub struct MitmHandshakeImpersonatorLegReader {
     pub parser: HandshakeReadParser,
     relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
-    pub key_to_send: Rc<RefCell<Vec<u8>>>,
-    garbage_terminator_to_send: Rc<RefCell<Vec<u8>>>,
 }
 
 impl MitmHandshakeImpersonatorLegReader {
     pub fn new(
-        role: Role,
-        magic: MagicType,
         relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
-        secret_key: EcdhPoint,
-        key_to_send: Rc<RefCell<Vec<u8>>>,
-        garbage_terminator_to_send: Rc<RefCell<Vec<u8>>>,
+        parser: HandshakeReadParser,
     ) -> Self {
-        let parser = HandshakeReadParser::new(role, magic, secret_key);
-        Self {
-            parser,
-            relay_out,
-            key_to_send,
-            garbage_terminator_to_send,
-        }
+        Self { parser, relay_out }
     }
 
     pub fn set_secret(
         &mut self,
         secret: [u8; NUM_SECRET_BYTES],
     ) -> Result<(), ([u8; NUM_SECRET_BYTES], BIP324MitmError)> {
-        if self.key_to_send.borrow().len() < NUM_ELLIGATOR_SWIFT_BYTES
-            || self.parser.is_handshake_done()
-        {
+        if self.parser.is_handshake_done() {
             return Err((
                 secret,
                 IllegalState(
-                    "Can't change secret. Public key has already started to be sent".to_string(),
+                    "Can't change secret. Handshake is already done".to_string(),
                 ),
             ));
         }
@@ -340,9 +311,6 @@ impl MitmHandshakeImpersonatorLegReader {
                 IllegalState("Can't generate EC scalar from secret key bytes".to_string()),
             )
         })?;
-
-        let new_key = secret_key.elligator_swift.to_array().to_vec();
-        self.key_to_send.replace(new_key);
 
         self.parser
             .set_ecdh_point(secret_key)
@@ -418,12 +386,6 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
             self.relay_out.borrow_mut().set_eof_terminator();
         }
 
-        // Update shared garbage_terminator_to_send when the ECDH-derived terminator is ready
-        if let Some(term) = self.parser.outbound_garbage_terminator() {
-            let term_clone = term.to_vec();
-            *self.garbage_terminator_to_send.borrow_mut() = term_clone;
-        }
-
         Ok(status)
     }
 }
@@ -433,21 +395,14 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
 pub struct MitmHandshakeImpersonatorLegWriter {
     pub parser: HandshakeWriteParser,
     relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
-    garbage_terminator_to_send: Rc<RefCell<Vec<u8>>>,
 }
 
 impl MitmHandshakeImpersonatorLegWriter {
     pub fn new(
         relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
-        key_bytes: Vec<u8>,
-        garbage_terminator_to_send: Rc<RefCell<Vec<u8>>>,
+        parser: HandshakeWriteParser,
     ) -> Self {
-        let parser = HandshakeWriteParser::new(key_bytes);
-        Self {
-            parser,
-            relay_in,
-            garbage_terminator_to_send,
-        }
+        Self { parser, relay_in }
     }
 
     pub fn is_final(&self) -> bool {
@@ -494,11 +449,8 @@ impl StreamWriteParser for MitmHandshakeImpersonatorLegWriter {
         }
 
         if self.parser.is_sending_terminator() {
-            // Ensure parser has the outbound garbage terminator before writing
-            let term = self.garbage_terminator_to_send.borrow().clone();
-            if !term.is_empty() {
-                self.parser.set_terminator(&term);
-            }
+            // The outbound terminator is read automatically from shared HandshakeState;
+            // no explicit injection needed here.
             // Pacing: only write as many terminator bytes as the real peer has sent
             let available = self.relay_in.borrow().peek_len_terminator();
             if available == 0 {
@@ -1262,7 +1214,7 @@ mod mitmfakepeerbip324_tests {
         };
 
         assert_eq!(
-            *reader_leg.key_to_send.borrow(),
+            reader_leg.parser.elligator_swift_bytes(),
             server_key,
             "The generated secret key is different from the expected one"
         );

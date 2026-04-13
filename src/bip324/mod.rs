@@ -1,3 +1,9 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::cipher::CipherSession;
+use crate::protocol::{EcdhPoint, GarbageTerminatorType, MagicType, NUM_ELLIGATOR_SWIFT_BYTES, Role};
+
 pub mod data_read;
 pub mod data_write;
 pub mod handshake_read;
@@ -29,12 +35,116 @@ impl std::fmt::Display for Bip324Error {
 
 impl std::error::Error for Bip324Error {}
 
+/// Shared handshake state owned by both the read and write parsers.
+/// Holds all data that must be visible to both sides during the BIP-324 handshake:
+/// our secret key, the peer's key once received, the derived cipher session, and a
+/// flag that the writer sets when it starts transmitting our key bytes.
+pub struct HandshakeState {
+    role: Role,
+    magic: MagicType,
+    pub(super) our_key: EcdhPoint,
+    pub(super) our_ellswift_bytes: [u8; NUM_ELLIGATOR_SWIFT_BYTES],
+    peer_key: Option<[u8; NUM_ELLIGATOR_SWIFT_BYTES]>,
+    pub(super) cipher_session: Option<CipherSession>,
+    pub(super) outbound_garbage_terminator: Option<GarbageTerminatorType>,
+    pub(super) writer_started_sending: bool,
+}
+
+/// A reference-counted, interior-mutable handle to `HandshakeState`.
+pub type SharedHandshakeState = Rc<RefCell<HandshakeState>>;
+
+impl HandshakeState {
+    pub fn new(role: Role, magic: MagicType, our_key: EcdhPoint) -> Self {
+        let our_ellswift_bytes = our_key.elligator_swift.to_array();
+        Self {
+            role,
+            magic,
+            our_key,
+            our_ellswift_bytes,
+            peer_key: None,
+            cipher_session: None,
+            outbound_garbage_terminator: None,
+            writer_started_sending: false,
+        }
+    }
+
+    /// Update the ECDH key used for this handshake.
+    ///
+    /// Fails if the writer has already started transmitting key bytes, because
+    /// changing the key at that point would be inconsistent with what the peer receives.
+    /// If the peer's key has already arrived, the cipher session is re-derived immediately.
+    pub fn set_ecdh_point(&mut self, point: EcdhPoint) -> Result<(), (EcdhPoint, Bip324Error)> {
+        if self.writer_started_sending {
+            return Err((
+                point,
+                Bip324Error::IllegalState(
+                    "Can't change key: writer has already started sending".to_string(),
+                ),
+            ));
+        }
+        self.our_ellswift_bytes = point.elligator_swift.to_array();
+        self.our_key = point;
+        if self.peer_key.is_some() {
+            self.derive_cipher_session()
+                .map_err(|e| (self.our_key.clone(), e))?;
+        }
+        Ok(())
+    }
+
+    /// Record the peer's key and immediately derive the shared cipher session.
+    ///
+    /// Returns the inbound garbage terminator so the caller can transition
+    /// the read-parser state to `ReceivingGarbage`.
+    pub(super) fn on_peer_key_received(
+        &mut self,
+        peer_key: [u8; NUM_ELLIGATOR_SWIFT_BYTES],
+    ) -> Result<GarbageTerminatorType, Bip324Error> {
+        self.peer_key = Some(peer_key);
+        self.derive_cipher_session()
+    }
+
+    /// Return the inbound garbage terminator from the derived cipher session, if available.
+    pub(super) fn inbound_garbage_terminator(&self) -> Option<GarbageTerminatorType> {
+        self.cipher_session
+            .as_ref()
+            .map(|c| c.inbound_garbage_terminator)
+    }
+
+    fn derive_cipher_session(&mut self) -> Result<GarbageTerminatorType, Bip324Error> {
+        let peer_key = self.peer_key.as_ref().ok_or_else(|| {
+            Bip324Error::IllegalState(
+                "derive_cipher_session called without peer_key".to_string(),
+            )
+        })?;
+        let cipher =
+            CipherSession::new_from_shares(self.magic, self.role, self.our_key.clone(), peer_key)
+                .map_err(|(_, _)| Bip324Error::KeyGenerationError)?;
+        let inbound_garbage_terminator = cipher.inbound_garbage_terminator;
+        let outbound_garbage_terminator = cipher.outbound_garbage_terminator;
+        self.cipher_session = Some(cipher);
+        self.outbound_garbage_terminator = Some(outbound_garbage_terminator);
+        Ok(inbound_garbage_terminator)
+    }
+}
+
+
+pub fn new_handshake_pair(
+    role: Role,
+    magic: MagicType,
+    our_key: EcdhPoint,
+) -> (HandshakeReadParser, HandshakeWriteParser) {
+    let state = Rc::new(RefCell::new(HandshakeState::new(role, magic, our_key)));
+    let reader = HandshakeReadParser::new_with_state(Rc::clone(&state));
+    let writer = HandshakeWriteParser::new_with_state(state);
+    (reader, writer)
+}
+
 #[cfg(test)]
 mod tests {
     use hex_literal::hex;
     use secp256k1::ellswift::ElligatorSwiftParty;
 
-    use super::{DataReadParser, DataWriteParser, HandshakeReadParser};
+    use super::{DataReadParser, DataWriteParser, HandshakeReadParser, HandshakeWriteParser};
     use crate::cipher::{InboundCipher, OutboundCipher, SessionKeyMaterial};
     use crate::key_from_secret_bytes;
     use crate::protocol::{MAINNET_MAGIC, NUM_LENGTH_BYTES, NUM_TAG_BYTES, Role};
@@ -48,8 +158,7 @@ mod tests {
     const BOB_SECRET: [u8; 32] =
         hex!("6f312890ec83bbb26798abaadd574684a53e74ccef7953b790fcc29409080246");
 
-    // Complete a BIP-324 handshake using only HandshakeReadParser objects -- no relay or external types.
-    // Returns (alice_inbound, alice_outbound, bob_inbound, bob_outbound).
+    // Complete a BIP-324 handshake using new_handshake_pair. Returns ciphers for both sides.
     fn complete_handshake() -> (InboundCipher, OutboundCipher, InboundCipher, OutboundCipher) {
         let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
         let bob_key = key_from_secret_bytes(BOB_SECRET).unwrap();
@@ -57,25 +166,31 @@ mod tests {
         let bob_wire_key = bob_key.elligator_swift.to_array().to_vec();
         let alice_wire_key = alice_key.elligator_swift.to_array().to_vec();
 
-        let mut alice_parser = HandshakeReadParser::new(Role::Initiator, MAGIC, alice_key);
-        let mut bob_parser = HandshakeReadParser::new(Role::Responder, MAGIC, bob_key);
+        let (mut alice_reader, _alice_writer) =
+            super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
+        let (mut bob_reader, _bob_writer) =
+            super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
 
         // Exchange public keys
-        alice_parser.consume(&mut bob_wire_key.as_slice()).unwrap();
-        bob_parser.consume(&mut alice_wire_key.as_slice()).unwrap();
+        alice_reader.consume(&mut bob_wire_key.as_slice()).unwrap();
+        bob_reader.consume(&mut alice_wire_key.as_slice()).unwrap();
 
         // Exchange garbage terminators (no garbage content -- empty garbage is valid)
-        let alice_outbound_term = alice_parser.outbound_garbage_terminator().unwrap().to_vec();
-        let bob_outbound_term = bob_parser.outbound_garbage_terminator().unwrap().to_vec();
+        let alice_outbound_term = alice_reader.outbound_garbage_terminator().unwrap().to_vec();
+        let bob_outbound_term = bob_reader.outbound_garbage_terminator().unwrap().to_vec();
 
-        alice_parser.consume(&mut bob_outbound_term.as_slice()).unwrap();
-        bob_parser.consume(&mut alice_outbound_term.as_slice()).unwrap();
+        alice_reader
+            .consume(&mut bob_outbound_term.as_slice())
+            .unwrap();
+        bob_reader
+            .consume(&mut alice_outbound_term.as_slice())
+            .unwrap();
 
-        assert!(alice_parser.is_handshake_done());
-        assert!(bob_parser.is_handshake_done());
+        assert!(alice_reader.is_handshake_done());
+        assert!(bob_reader.is_handshake_done());
 
-        let (alice_inbound, alice_outbound) = alice_parser.take_ciphers().unwrap();
-        let (bob_inbound, bob_outbound) = bob_parser.take_ciphers().unwrap();
+        let (alice_inbound, alice_outbound) = alice_reader.take_ciphers().unwrap();
+        let (bob_inbound, bob_outbound) = bob_reader.take_ciphers().unwrap();
 
         (alice_inbound, alice_outbound, bob_inbound, bob_outbound)
     }
@@ -134,9 +249,10 @@ mod tests {
         let bob_wire_key = bob_key_for_parser.elligator_swift.to_array().to_vec();
         let alice_wire_key = alice_key_for_parser.elligator_swift.to_array().to_vec();
 
-        let mut alice_parser =
-            HandshakeReadParser::new(Role::Initiator, MAGIC, alice_key_for_parser);
-        let mut bob_parser = HandshakeReadParser::new(Role::Responder, MAGIC, bob_key_for_parser);
+        let (mut alice_parser, _) =
+            super::new_handshake_pair(Role::Initiator, MAGIC, alice_key_for_parser);
+        let (mut bob_parser, _) =
+            super::new_handshake_pair(Role::Responder, MAGIC, bob_key_for_parser);
 
         alice_parser.consume(&mut bob_wire_key.as_slice()).unwrap();
         bob_parser.consume(&mut alice_wire_key.as_slice()).unwrap();
@@ -144,8 +260,12 @@ mod tests {
         let alice_outbound_term = alice_parser.outbound_garbage_terminator().unwrap().to_vec();
         let bob_outbound_term = bob_parser.outbound_garbage_terminator().unwrap().to_vec();
 
-        alice_parser.consume(&mut bob_outbound_term.as_slice()).unwrap();
-        bob_parser.consume(&mut alice_outbound_term.as_slice()).unwrap();
+        alice_parser
+            .consume(&mut bob_outbound_term.as_slice())
+            .unwrap();
+        bob_parser
+            .consume(&mut alice_outbound_term.as_slice())
+            .unwrap();
 
         assert!(alice_parser.is_handshake_done(), "Alice handshake must complete");
         assert!(bob_parser.is_handshake_done(), "Bob handshake must complete");
@@ -171,19 +291,19 @@ mod tests {
     }
 
     // 3. Demonstrate that the protocol parsers work entirely standalone:
-    //    no FakePeerRelay, no Rc<RefCell<>>, and no external wrapper types are involved.
-    //    This is the primary proof that the bip324 module separation was successful.
+    //    no FakePeerRelay, no external wrapper types are involved.
+    //    The reader and writer are created as a coupled pair via new_handshake_pair.
     #[test]
     fn test_protocol_parsers_standalone() {
-        // Standalone test using only pure bip324 parser types.
         let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
         let bob_key = key_from_secret_bytes(BOB_SECRET).unwrap();
 
         let bob_wire_key = bob_key.elligator_swift.to_array().to_vec();
         let alice_wire_key = alice_key.elligator_swift.to_array().to_vec();
 
-        let mut alice_hs = HandshakeReadParser::new(Role::Initiator, MAGIC, alice_key);
-        let mut bob_hs = HandshakeReadParser::new(Role::Responder, MAGIC, bob_key);
+        let (mut alice_hs, _alice_w) =
+            super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
+        let (mut bob_hs, _bob_w) = super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
 
         // Key exchange
         alice_hs.consume(&mut bob_wire_key.as_slice()).unwrap();
@@ -230,5 +350,109 @@ mod tests {
             let decrypted = read_parser.drain_data_bytes();
             assert_eq!(&decrypted[1..], *expected, "Packet {i} roundtrip failed");
         }
+    }
+
+    // 5. set_ecdh_point fails once the writer has started sending key bytes.
+    #[test]
+    fn test_set_ecdh_point_after_writer_started() {
+        use crate::state_machine::StreamWriteParser;
+
+        let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
+        let new_key = key_from_secret_bytes(BOB_SECRET).unwrap();
+
+        let (mut reader, mut writer) =
+            super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
+
+        // Start sending key bytes -- this sets writer_started_sending = true
+        let mut buf = vec![0u8; 1];
+        writer.step(&mut buf.as_mut_slice()).unwrap();
+
+        // Now set_ecdh_point must return an error
+        let result = reader.set_ecdh_point(new_key);
+        assert!(
+            result.is_err(),
+            "set_ecdh_point should fail after writer started sending"
+        );
+    }
+
+    // 6. set_ecdh_point succeeds before the writer has started sending key bytes.
+    #[test]
+    fn test_set_ecdh_point_before_writer_started() {
+        let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
+        let new_key = key_from_secret_bytes(BOB_SECRET).unwrap();
+
+        let (mut reader, _writer) = super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
+
+        let result = reader.set_ecdh_point(new_key);
+        assert!(result.is_ok(), "set_ecdh_point should succeed before writer starts sending");
+    }
+
+    // 7. Both sides use new_handshake_pair and derive matching cipher sessions.
+    #[test]
+    fn test_coupled_handshake() {
+        let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
+        let bob_key = key_from_secret_bytes(BOB_SECRET).unwrap();
+
+        let alice_wire = alice_key.elligator_swift.to_array().to_vec();
+        let bob_wire = bob_key.elligator_swift.to_array().to_vec();
+
+        let (mut alice_reader, _alice_writer) =
+            super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
+        let (mut bob_reader, _bob_writer) =
+            super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
+
+        // Exchange keys
+        alice_reader.consume(&mut bob_wire.as_slice()).unwrap();
+        bob_reader.consume(&mut alice_wire.as_slice()).unwrap();
+
+        // Exchange terminators
+        let alice_term = alice_reader.outbound_garbage_terminator().unwrap().to_vec();
+        let bob_term = bob_reader.outbound_garbage_terminator().unwrap().to_vec();
+        alice_reader.consume(&mut bob_term.as_slice()).unwrap();
+        bob_reader.consume(&mut alice_term.as_slice()).unwrap();
+
+        let (alice_inbound, alice_outbound) = alice_reader.take_ciphers().unwrap();
+        let (bob_inbound, bob_outbound) = bob_reader.take_ciphers().unwrap();
+
+        // Alice's outbound keys must match Bob's inbound keys
+        assert_eq!(
+            alice_outbound.length_cipher.key_bytes,
+            bob_inbound.length_cipher.unwrap().key_bytes,
+            "alice outbound length key must equal bob inbound length key"
+        );
+        assert_eq!(
+            alice_outbound.packet_cipher.key_bytes,
+            bob_inbound.packet_cipher.key_bytes,
+            "alice outbound packet key must equal bob inbound packet key"
+        );
+        // Bob's outbound keys must match Alice's inbound keys
+        assert_eq!(
+            bob_outbound.length_cipher.key_bytes,
+            alice_inbound.length_cipher.unwrap().key_bytes,
+            "bob outbound length key must equal alice inbound length key"
+        );
+        assert_eq!(
+            bob_outbound.packet_cipher.key_bytes,
+            alice_inbound.packet_cipher.key_bytes,
+            "bob outbound packet key must equal alice inbound packet key"
+        );
+    }
+
+    // 8. The writer produces the correct ellswift bytes without any explicit key injection.
+    #[test]
+    fn test_writer_reads_key_from_shared_state() {
+        use crate::protocol::NUM_ELLIGATOR_SWIFT_BYTES;
+        use crate::state_machine::StreamWriteParser;
+
+        let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
+        let expected_bytes = alice_key.elligator_swift.to_array();
+
+        let (_reader, mut writer) =
+            super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
+
+        let mut buf = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+        writer.produce(&mut buf.as_mut_slice()).unwrap();
+
+        assert_eq!(buf, expected_bytes, "Writer must produce the key from shared state");
     }
 }

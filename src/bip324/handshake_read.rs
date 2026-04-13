@@ -1,19 +1,19 @@
 use std::cmp;
 use std::collections::VecDeque;
 
-use crate::cipher::{CipherSession, InboundCipher, OutboundCipher};
+use crate::cipher::{InboundCipher, OutboundCipher};
 use crate::protocol::{
-    AADType, EcdhPoint, GarbageTerminatorType, MagicType, NUM_ELLIGATOR_SWIFT_BYTES,
-    NUM_GARBAGE_CONTENT_LIMIT, NUM_GARBAGE_TERMINATOR_BYTES, Role, find_garbage,
+    AADType, EcdhPoint, GarbageTerminatorType, NUM_ELLIGATOR_SWIFT_BYTES,
+    NUM_GARBAGE_CONTENT_LIMIT, NUM_GARBAGE_TERMINATOR_BYTES, find_garbage,
 };
 use crate::state_machine::{BufReader, HasFinal, ProtocolReadParser, ProtocolStatus};
-use super::Bip324Error;
+use super::{Bip324Error, SharedHandshakeState};
 
 #[derive(Debug)]
 pub enum HandshakeReadState {
-    ReceivingKey(EcdhPoint, usize),          // secret_key, remaining_bytes
+    ReceivingKey(usize),                    // remaining_bytes
     ReceivingGarbage(GarbageTerminatorType), // inbound_garbage_terminator
-    HandshakeDone(AADType),                  // garbage content (AAD)
+    HandshakeDone(AADType),                 // garbage content (AAD)
 }
 
 impl HasFinal for HandshakeReadState {
@@ -23,14 +23,8 @@ impl HasFinal for HandshakeReadState {
 }
 
 pub struct HandshakeReadParser {
-    role: Role,
-    magic: MagicType,
     state: Option<HandshakeReadState>,
     read_buffer: Vec<u8>,
-    other_key: Option<[u8; NUM_ELLIGATOR_SWIFT_BYTES]>,
-
-    // Tracks our own ellswift bytes so the user can read them at any time
-    own_ellswift_bytes: [u8; NUM_ELLIGATOR_SWIFT_BYTES],
 
     // Output buffers -- drained by caller after each step()
     output_key_bytes: VecDeque<u8>,
@@ -38,54 +32,29 @@ pub struct HandshakeReadParser {
     output_terminator_bytes: VecDeque<u8>,
     key_eof: bool,
     garbage_eof: bool,
-
-    // Derived protocol data
-    cipher_session: Option<CipherSession>,
-    outbound_garbage_terminator: Option<GarbageTerminatorType>,
+    shared: SharedHandshakeState,
 }
 
 impl HandshakeReadParser {
-    pub fn new(role: Role, magic: MagicType, secret_key: EcdhPoint) -> Self {
-        let own_ellswift_bytes = secret_key.elligator_swift.to_array();
+    pub(super) fn new_with_state(shared: SharedHandshakeState) -> Self {
+        let remaining = NUM_ELLIGATOR_SWIFT_BYTES;
         Self {
-            role,
-            magic,
-            state: Some(HandshakeReadState::ReceivingKey(
-                secret_key,
-                NUM_ELLIGATOR_SWIFT_BYTES,
-            )),
+            state: Some(HandshakeReadState::ReceivingKey(remaining)),
             read_buffer: vec![],
-            other_key: None,
-            own_ellswift_bytes,
             output_key_bytes: VecDeque::new(),
             output_garbage_bytes: VecDeque::new(),
             output_terminator_bytes: VecDeque::new(),
             key_eof: false,
             garbage_eof: false,
-            cipher_session: None,
-            outbound_garbage_terminator: None,
+            shared,
         }
     }
 
     fn on_share_received(
         &mut self,
-        point: EcdhPoint,
-    ) -> Result<GarbageTerminatorType, (EcdhPoint, Bip324Error)> {
-        let Some(other_key) = &self.other_key else {
-            return Err((
-                point,
-                Bip324Error::IllegalState("on_share_received called with empty other_key".to_string()),
-            ));
-        };
-        let cipher = CipherSession::new_from_shares(self.magic, self.role, point, other_key)
-            .map_err(|(point, _)| (point, Bip324Error::KeyGenerationError))?;
-        let inbound_garbage_terminator = cipher.inbound_garbage_terminator;
-        let outbound_garbage_terminator = cipher.outbound_garbage_terminator;
-
-        self.cipher_session = Some(cipher);
-        self.outbound_garbage_terminator = Some(outbound_garbage_terminator);
-
-        Ok(inbound_garbage_terminator)
+        other_key: [u8; NUM_ELLIGATOR_SWIFT_BYTES],
+    ) -> Result<GarbageTerminatorType, Bip324Error> {
+        self.shared.borrow_mut().on_peer_key_received(other_key)
     }
 
     pub fn set_ecdh_point(
@@ -97,31 +66,26 @@ impl HandshakeReadParser {
         if self.state.as_ref().is_some_and(|s| s.is_final()) {
             return Err((
                 point,
-                Bip324Error::IllegalState("Can't change key. Handshake is already done".to_string()),
+                Bip324Error::IllegalState(
+                    "Can't change key. Handshake is already done".to_string(),
+                ),
             ));
         }
 
-        self.own_ellswift_bytes = point.elligator_swift.to_array();
+        let is_receiving_garbage = matches!(self.state, Some(ReceivingGarbage(_)));
 
-        match self.state.take() {
-            Some(ReceivingKey(_old_point, remaining)) => {
-                self.state = Some(ReceivingKey(point, remaining));
-                Ok(())
-            }
-            Some(ReceivingGarbage(_old_garbage_terminator)) => {
-                let inbound_garbage_terminator = self
-                    .on_share_received(point)?;
-                self.state = Some(ReceivingGarbage(inbound_garbage_terminator));
-                Ok(())
-            }
-            state => {
-                self.state = state;
-                Err((
-                    point,
-                    Bip324Error::IllegalState("Can't change key in this state".to_string()),
-                ))
+        // Delegates to shared state, which enforces the writer_started_sending guard
+        // and re-derives the cipher session if the peer's key is already known.
+        self.shared.borrow_mut().set_ecdh_point(point)?;
+
+        if is_receiving_garbage {
+            // Update the inbound_garbage_terminator in our state to reflect the new ECDH outcome.
+            if let Some(inbound_term) = self.shared.borrow().inbound_garbage_terminator() {
+                self.state = Some(ReceivingGarbage(inbound_term));
             }
         }
+
+        Ok(())
     }
 
     pub fn drain_key_bytes(&mut self) -> Vec<u8> {
@@ -145,15 +109,19 @@ impl HandshakeReadParser {
     }
 
     pub fn take_ciphers(&mut self) -> Option<(InboundCipher, OutboundCipher)> {
-        self.cipher_session.take().map(|c| c.into_split())
+        self.shared
+            .borrow_mut()
+            .cipher_session
+            .take()
+            .map(|c| c.into_split())
     }
 
-    pub fn outbound_garbage_terminator(&self) -> Option<&GarbageTerminatorType> {
-        self.outbound_garbage_terminator.as_ref()
+    pub fn outbound_garbage_terminator(&self) -> Option<GarbageTerminatorType> {
+        self.shared.borrow().outbound_garbage_terminator
     }
 
     pub fn elligator_swift_bytes(&self) -> [u8; NUM_ELLIGATOR_SWIFT_BYTES] {
-        self.own_ellswift_bytes
+        self.shared.borrow().our_ellswift_bytes
     }
 
     pub fn is_handshake_done(&self) -> bool {
@@ -202,13 +170,13 @@ impl ProtocolReadParser for HandshakeReadParser {
         use HandshakeReadState::*;
 
         match state {
-            ReceivingKey(point, mut remaining) => {
+            ReceivingKey(mut remaining) => {
                 let mut key_buf = vec![0u8; remaining];
                 let size = match data.read(&mut key_buf) {
                     Ok(size) => size,
                     Err(err) => {
                         return (
-                            ReceivingKey(point, remaining),
+                            ReceivingKey(remaining),
                             Err(Bip324Error::ReadError(err)),
                         );
                     }
@@ -223,12 +191,11 @@ impl ProtocolReadParser for HandshakeReadParser {
 
                     let mut other_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
                     other_key.copy_from_slice(&std::mem::take(&mut self.read_buffer));
-                    self.other_key = Some(other_key);
 
-                    let inbound_garbage_terminator = match self.on_share_received(point) {
+                    let inbound_garbage_terminator = match self.on_share_received(other_key) {
                         Ok(ret) => ret,
-                        Err((point, err)) => {
-                            return (ReceivingKey(point, remaining), Err(err));
+                        Err(err) => {
+                            return (ReceivingKey(remaining), Err(err));
                         }
                     };
 
@@ -237,7 +204,7 @@ impl ProtocolReadParser for HandshakeReadParser {
                         Ok(ProtocolStatus::Continue),
                     )
                 } else {
-                    (ReceivingKey(point, remaining), Ok(ProtocolStatus::End))
+                    (ReceivingKey(remaining), Ok(ProtocolStatus::End))
                 }
             }
 
@@ -356,10 +323,10 @@ mod tests {
     use secp256k1::rand::{CryptoRng, RngCore};
     use secp256k1::rand::rngs::mock::StepRng;
 
-    use crate::protocol::NUM_GARBAGE_TERMINATOR_BYTES;
+    use crate::protocol::{MAINNET_MAGIC, NUM_GARBAGE_TERMINATOR_BYTES, Role};
     use crate::state_machine::StreamReadParser;
 
-    const DEFAULT_MAGIC: MagicType = [0xF9, 0xBE, 0xB4, 0xD9];
+    const DEFAULT_MAGIC: [u8; 4] = MAINNET_MAGIC;
 
     // Mirrors HANDSHAKE_PARAMS1 from lib.rs
     #[allow(dead_code)]
@@ -428,25 +395,25 @@ mod tests {
         buf
     }
 
-    fn parser_from_rng<Rng: RngCore + CryptoRng>(
+    fn reader_from_rng<Rng: RngCore + CryptoRng>(
         role: Role,
         rng: &mut Rng,
     ) -> HandshakeReadParser {
         let bytes = secret_key_bytes_from_rng(rng);
         let point = crate::key_from_secret_bytes(bytes).unwrap();
-        HandshakeReadParser::new(role, DEFAULT_MAGIC, point)
+        super::super::new_handshake_pair(role, DEFAULT_MAGIC, point).0
     }
 
-    fn parser_from_seed(role: Role, seed: u64) -> HandshakeReadParser {
+    fn reader_from_seed(role: Role, seed: u64) -> HandshakeReadParser {
         let mut rng = insecurerng(seed);
-        parser_from_rng(role, &mut rng)
+        reader_from_rng(role, &mut rng)
     }
 
     // 1. Feed 64 key bytes at once. Verify drain_key_bytes() returns all 64.
     //    Verify state transitions to ReceivingGarbage.
     #[test]
     fn test_parse_key_complete() {
-        let mut parser = parser_from_seed(Role::Responder, 1111);
+        let mut parser = reader_from_seed(Role::Responder, 1111);
 
         let key_bytes = [0x42u8; NUM_ELLIGATOR_SWIFT_BYTES];
         let mut data = &key_bytes[..];
@@ -466,7 +433,7 @@ mod tests {
     //    drain_key_bytes() returns 1 byte. After 64, verify state is ReceivingGarbage.
     #[test]
     fn test_parse_key_byte_by_byte() {
-        let mut parser = parser_from_seed(Role::Responder, 2222);
+        let mut parser = reader_from_seed(Role::Responder, 2222);
 
         let key_bytes = [0x7Eu8; NUM_ELLIGATOR_SWIFT_BYTES];
         for i in 0..NUM_ELLIGATOR_SWIFT_BYTES {
@@ -488,7 +455,7 @@ mod tests {
     //    extra 10 bytes consumed as potential garbage.
     #[test]
     fn test_parse_key_overflow() {
-        let mut parser = parser_from_seed(Role::Responder, 3333);
+        let mut parser = reader_from_seed(Role::Responder, 3333);
 
         let all_bytes = [0x5Au8; NUM_ELLIGATOR_SWIFT_BYTES + 10];
         let mut data = &all_bytes[..];
@@ -521,7 +488,7 @@ mod tests {
             ..
         } = HANDSHAKE_PARAMS1;
 
-        let mut parser = parser_from_seed(Role::Responder, server_seed);
+        let mut parser = reader_from_seed(Role::Responder, server_seed);
 
         let mut data = &client_key[..];
         parser.consume(&mut data).unwrap();
@@ -565,7 +532,7 @@ mod tests {
             ..
         } = HANDSHAKE_PARAMS1;
 
-        let mut parser = parser_from_seed(Role::Responder, server_seed);
+        let mut parser = reader_from_seed(Role::Responder, server_seed);
 
         let garbage = [0xAAu8; 20];
         let mut input = Vec::new();
@@ -599,7 +566,7 @@ mod tests {
             ..
         } = HANDSHAKE_PARAMS1;
 
-        let mut parser = parser_from_seed(Role::Responder, server_seed);
+        let mut parser = reader_from_seed(Role::Responder, server_seed);
 
         let mut data = &client_key[..];
         parser.consume(&mut data).unwrap();
@@ -630,7 +597,7 @@ mod tests {
         } = HANDSHAKE_PARAMS1;
 
         // Start with an arbitrary initial key
-        let mut parser = parser_from_seed(Role::Responder, 7777);
+        let mut parser = reader_from_seed(Role::Responder, 7777);
 
         // Feed a partial key (30 bytes)
         let mut partial = &client_key[..30];
@@ -652,7 +619,7 @@ mod tests {
         let mut rest = &client_key[30..];
         parser.consume(&mut rest).unwrap();
 
-        // Now take ciphers — they should be derived from the real server key + client_key
+        // Now take ciphers, they should be derived from the real server key + client_key
         let (inbound, outbound) = parser.take_ciphers().expect("Expected ciphers");
         assert_eq!(inbound.length_cipher.unwrap().key_bytes, initiator_l);
         assert_eq!(inbound.packet_cipher.key_bytes, initiator_p);
@@ -675,9 +642,9 @@ mod tests {
         } = HANDSHAKE_PARAMS1;
 
         // Start with an arbitrary initial key
-        let mut parser = parser_from_seed(Role::Responder, 8888);
+        let mut parser = reader_from_seed(Role::Responder, 8888);
 
-        // Feed full client key — parser moves to ReceivingGarbage with wrong ciphers
+        // Feed full client key, parser moves to ReceivingGarbage with wrong ciphers
         let mut data = &client_key[..];
         parser.consume(&mut data).unwrap();
         assert!(matches!(

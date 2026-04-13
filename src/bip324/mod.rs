@@ -48,7 +48,7 @@ mod tests {
     const BOB_SECRET: [u8; 32] =
         hex!("6f312890ec83bbb26798abaadd574684a53e74ccef7953b790fcc29409080246");
 
-    // Complete a BIP-324 handshake using only HandshakeReadParser objects -- no relay or MITM types.
+    // Complete a BIP-324 handshake using only HandshakeReadParser objects -- no relay or external types.
     // Returns (alice_inbound, alice_outbound, bob_inbound, bob_outbound).
     fn complete_handshake() -> (InboundCipher, OutboundCipher, InboundCipher, OutboundCipher) {
         let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
@@ -171,11 +171,11 @@ mod tests {
     }
 
     // 3. Demonstrate that the protocol parsers work entirely standalone:
-    //    no FakePeerRelay, no Rc<RefCell<>>, and no MitmImpersonatorLeg are involved.
+    //    no FakePeerRelay, no Rc<RefCell<>>, and no external wrapper types are involved.
     //    This is the primary proof that the bip324 module separation was successful.
     #[test]
     fn test_protocol_parsers_standalone() {
-        // No relay, Rc, or MITM types anywhere in this test.
+        // Standalone test using only pure bip324 parser types.
         let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
         let bob_key = key_from_secret_bytes(BOB_SECRET).unwrap();
 
@@ -199,7 +199,7 @@ mod tests {
         let (bob_inbound, _) = bob_hs.take_ciphers().unwrap();
 
         // Alice → Bob data transfer using only pure parser objects
-        let msg = b"standalone parsers work without any MITM infrastructure";
+        let msg = b"standalone parsers work without any external infrastructure";
         let mut write = DataWriteParser::new(alice_outbound);
         let ct = encrypt_packet(&mut write, msg);
 

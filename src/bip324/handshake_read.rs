@@ -28,7 +28,7 @@ pub struct HandshakeReadParser {
     read_buffer: Vec<u8>,
     other_key: Option<[u8; NUM_ELLIGATOR_SWIFT_BYTES]>,
 
-    // Tracks our own ellswift bytes so the MITM layer can read them at any time
+    // Tracks our own ellswift bytes so the user can read them at any time
     own_ellswift_bytes: [u8; NUM_ELLIGATOR_SWIFT_BYTES],
 
     // Output buffers -- drained by caller after each step()

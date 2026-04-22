@@ -444,8 +444,6 @@ impl StreamWriteParser for MitmHandshakeImpersonatorLegWriter {
         }
 
         if self.parser.is_sending_terminator() {
-            // The outbound terminator is read automatically from shared HandshakeState;
-            // no explicit injection needed here.
             // Pacing: only write as many terminator bytes as the real peer has sent
             let available = self.relay_in.borrow().peek_len_terminator();
             if available == 0 {

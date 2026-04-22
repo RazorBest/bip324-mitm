@@ -155,7 +155,7 @@ pub struct HandshakeReadParser {
 }
 
 impl HandshakeReadParser {
-    pub(super) fn new_with_state(shared: SharedHandshakeState) -> Self {
+    pub(super) fn new(shared: SharedHandshakeState) -> Self {
         let remaining = NUM_ELLIGATOR_SWIFT_BYTES;
         Self {
             state: Some(HandshakeReadState::ReceivingKey(remaining)),
@@ -1029,7 +1029,7 @@ pub fn new_handshake_pair(
     our_key: EcdhPoint,
 ) -> (HandshakeReadParser, HandshakeWriteParser) {
     let state = Rc::new(RefCell::new(HandshakeState::new(role, magic, our_key)));
-    let reader = HandshakeReadParser::new_with_state(Rc::clone(&state));
+    let reader = HandshakeReadParser::new(Rc::clone(&state));
     let writer = HandshakeWriteParser::new_with_state(state);
     (reader, writer)
 }

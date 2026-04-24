@@ -526,6 +526,10 @@ impl HandshakeWriteParser {
         matches!(self.state, Some(HandshakeWriteState::SendingGarbageTerminator))
     }
 
+    pub fn writer_started_sending(&self) -> bool {
+        self.shared.borrow().writer_started_sending
+    }
+
     pub fn into_data_writer(mut self) -> DataWriteParser {
         assert!(
             self.is_done(),

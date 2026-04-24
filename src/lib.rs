@@ -171,8 +171,16 @@ impl MitmImpersonatorLeg {
         match (&mut self.reader_leg_state, &mut self.writer_leg_state) {
             (
                 Some(ReaderLegState::Handshake(reader_leg)),
-                Some(WriterLegState::Handshake(_)),
+                Some(WriterLegState::Handshake(writer_leg)),
             ) => {
+                if writer_leg.writer_started_sending() {
+                    return Err((
+                        secret,
+                        IllegalState(
+                            "Can't change secret: writer has already started sending".to_string(),
+                        ),
+                    ));
+                }
                 reader_leg.set_secret(secret)?;
                 Ok(())
             }
@@ -399,6 +407,10 @@ impl MitmHandshakeImpersonatorLegWriter {
 
     pub fn is_final(&self) -> bool {
         self.parser.is_done()
+    }
+
+    pub fn writer_started_sending(&self) -> bool {
+        self.parser.writer_started_sending()
     }
 
     pub fn next_phase(self) -> Option<MitmImpersonatorLegWriter> {

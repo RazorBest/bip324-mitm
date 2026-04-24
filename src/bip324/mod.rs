@@ -37,8 +37,6 @@ impl std::error::Error for Bip324Error {}
 
 /// Shared handshake state owned by both the read and write parsers.
 pub struct HandshakeState {
-    role: Role,
-    magic: MagicType,
     pub(super) our_key: EcdhPoint,
     pub(super) our_ellswift_bytes: [u8; NUM_ELLIGATOR_SWIFT_BYTES],
     peer_key: Option<[u8; NUM_ELLIGATOR_SWIFT_BYTES]>,
@@ -53,11 +51,9 @@ pub struct HandshakeState {
 pub type SharedHandshakeState = Rc<RefCell<HandshakeState>>;
 
 impl HandshakeState {
-    pub fn new(role: Role, magic: MagicType, our_key: EcdhPoint) -> Self {
+    pub fn new(our_key: EcdhPoint) -> Self {
         let our_ellswift_bytes = our_key.elligator_swift.to_array();
         Self {
-            role,
-            magic,
             our_key,
             our_ellswift_bytes,
             peer_key: None,
@@ -74,7 +70,12 @@ impl HandshakeState {
     /// Fails if the writer has already started transmitting key bytes, because
     /// changing the key at that point would be inconsistent with what the peer receives.
     /// If the peer's key has already arrived, the cipher session is re-derived immediately.
-    pub fn set_ecdh_point(&mut self, point: EcdhPoint) -> Result<(), (EcdhPoint, Bip324Error)> {
+    pub fn set_ecdh_point(
+        &mut self,
+        point: EcdhPoint,
+        role: Role,
+        magic: MagicType,
+    ) -> Result<(), (EcdhPoint, Bip324Error)> {
         if self.writer_started_sending {
             return Err((
                 point,
@@ -86,7 +87,7 @@ impl HandshakeState {
         self.our_ellswift_bytes = point.elligator_swift.to_array();
         self.our_key = point;
         if self.peer_key.is_some() {
-            self.derive_cipher_session()
+            self.derive_cipher_session(role, magic)
                 .map_err(|e| (self.our_key.clone(), e))?;
         }
         Ok(())
@@ -99,9 +100,11 @@ impl HandshakeState {
     pub(super) fn on_peer_key_received(
         &mut self,
         peer_key: [u8; NUM_ELLIGATOR_SWIFT_BYTES],
+        role: Role,
+        magic: MagicType,
     ) -> Result<GarbageTerminatorType, Bip324Error> {
         self.peer_key = Some(peer_key);
-        self.derive_cipher_session()
+        self.derive_cipher_session(role, magic)
     }
 
     /// Return the inbound garbage terminator from the derived cipher session, if available.
@@ -109,14 +112,18 @@ impl HandshakeState {
         self.inbound_garbage_terminator
     }
 
-    fn derive_cipher_session(&mut self) -> Result<GarbageTerminatorType, Bip324Error> {
+    fn derive_cipher_session(
+        &mut self,
+        role: Role,
+        magic: MagicType,
+    ) -> Result<GarbageTerminatorType, Bip324Error> {
         let peer_key = self.peer_key.as_ref().ok_or_else(|| {
             Bip324Error::IllegalState(
                 "derive_cipher_session called without peer_key".to_string(),
             )
         })?;
         let cipher =
-            CipherSession::new_from_shares(self.magic, self.role, self.our_key.clone(), peer_key)
+            CipherSession::new_from_shares(magic, role, self.our_key.clone(), peer_key)
                 .map_err(|(_, _)| Bip324Error::KeyGenerationError)?;
         let inbound_garbage_terminator = cipher.inbound_garbage_terminator;
         let outbound_garbage_terminator = cipher.outbound_garbage_terminator;
@@ -143,6 +150,8 @@ impl HasFinal for HandshakeReadState {
 }
 
 pub struct HandshakeReadParser {
+    role: Role,
+    magic: MagicType,
     state: Option<HandshakeReadState>,
     read_buffer: Vec<u8>,
 
@@ -156,9 +165,11 @@ pub struct HandshakeReadParser {
 }
 
 impl HandshakeReadParser {
-    pub(super) fn new(shared: SharedHandshakeState) -> Self {
+    pub(super) fn new(role: Role, magic: MagicType, shared: SharedHandshakeState) -> Self {
         let remaining = NUM_ELLIGATOR_SWIFT_BYTES;
         Self {
+            role,
+            magic,
             state: Some(HandshakeReadState::ReceivingKey(remaining)),
             read_buffer: vec![],
             output_key_bytes: VecDeque::new(),
@@ -174,7 +185,7 @@ impl HandshakeReadParser {
         &mut self,
         other_key: [u8; NUM_ELLIGATOR_SWIFT_BYTES],
     ) -> Result<GarbageTerminatorType, Bip324Error> {
-        self.shared.borrow_mut().on_peer_key_received(other_key)
+        self.shared.borrow_mut().on_peer_key_received(other_key, self.role, self.magic)
     }
 
     pub fn set_ecdh_point(
@@ -196,7 +207,7 @@ impl HandshakeReadParser {
 
         // Delegates to shared state, which enforces the writer_started_sending guard
         // and re-derives the cipher session if the peer's key is already known.
-        self.shared.borrow_mut().set_ecdh_point(point)?;
+        self.shared.borrow_mut().set_ecdh_point(point, self.role, self.magic)?;
 
         if is_receiving_garbage {
             // Update the inbound_garbage_terminator in our state to reflect the new ECDH outcome.
@@ -1033,8 +1044,8 @@ pub fn new_handshake_pair(
     magic: MagicType,
     our_key: EcdhPoint,
 ) -> (HandshakeReadParser, HandshakeWriteParser) {
-    let state = Rc::new(RefCell::new(HandshakeState::new(role, magic, our_key)));
-    let reader = HandshakeReadParser::new(Rc::clone(&state));
+    let state = Rc::new(RefCell::new(HandshakeState::new(our_key)));
+    let reader = HandshakeReadParser::new(role, magic, Rc::clone(&state));
     let writer = HandshakeWriteParser::new_with_state(state);
     (reader, writer)
 }

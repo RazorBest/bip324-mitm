@@ -42,12 +42,11 @@ pub struct HandshakeState {
     pub(super) our_key: EcdhPoint,
     pub(super) our_ellswift_bytes: [u8; NUM_ELLIGATOR_SWIFT_BYTES],
     peer_key: Option<[u8; NUM_ELLIGATOR_SWIFT_BYTES]>,
-    pub(super) cipher_session: Option<CipherSession>,
+    pub(super) inbound_cipher: Option<InboundCipher>,
+    pub(super) outbound_cipher: Option<OutboundCipher>,
+    pub(super) inbound_garbage_terminator: Option<GarbageTerminatorType>,
     pub(super) outbound_garbage_terminator: Option<GarbageTerminatorType>,
     pub(super) writer_started_sending: bool,
-    /// Outbound cipher extracted from the cipher session by into_data_reader()
-    /// The paired write parser reads this in into_data_writer()
-    pub(super) outbound_cipher: Option<OutboundCipher>,
 }
 
 /// A reference-counted, interior-mutable handle to `HandshakeState`.
@@ -62,10 +61,11 @@ impl HandshakeState {
             our_key,
             our_ellswift_bytes,
             peer_key: None,
-            cipher_session: None,
+            inbound_cipher: None,
+            outbound_cipher: None,
+            inbound_garbage_terminator: None,
             outbound_garbage_terminator: None,
             writer_started_sending: false,
-            outbound_cipher: None,
         }
     }
 
@@ -106,9 +106,7 @@ impl HandshakeState {
 
     /// Return the inbound garbage terminator from the derived cipher session, if available.
     pub(super) fn inbound_garbage_terminator(&self) -> Option<GarbageTerminatorType> {
-        self.cipher_session
-            .as_ref()
-            .map(|c| c.inbound_garbage_terminator)
+        self.inbound_garbage_terminator
     }
 
     fn derive_cipher_session(&mut self) -> Result<GarbageTerminatorType, Bip324Error> {
@@ -122,7 +120,10 @@ impl HandshakeState {
                 .map_err(|(_, _)| Bip324Error::KeyGenerationError)?;
         let inbound_garbage_terminator = cipher.inbound_garbage_terminator;
         let outbound_garbage_terminator = cipher.outbound_garbage_terminator;
-        self.cipher_session = Some(cipher);
+        let (inbound_cipher, outbound_cipher) = cipher.into_split();
+        self.inbound_cipher = Some(inbound_cipher);
+        self.outbound_cipher = Some(outbound_cipher);
+        self.inbound_garbage_terminator = Some(inbound_garbage_terminator);
         self.outbound_garbage_terminator = Some(outbound_garbage_terminator);
         Ok(inbound_garbage_terminator)
     }
@@ -227,12 +228,12 @@ impl HandshakeReadParser {
         self.garbage_eof
     }
 
-    pub fn take_ciphers(&mut self) -> Option<(InboundCipher, OutboundCipher)> {
-        self.shared
-            .borrow_mut()
-            .cipher_session
-            .take()
-            .map(|c| c.into_split())
+    pub fn take_inbound_cipher(&mut self) -> Option<InboundCipher> {
+        self.shared.borrow_mut().inbound_cipher.take()
+    }
+
+    pub fn take_outbound_cipher(&mut self) -> Option<OutboundCipher> {
+        self.shared.borrow_mut().outbound_cipher.take()
     }
 
     pub fn outbound_garbage_terminator(&self) -> Option<GarbageTerminatorType> {
@@ -282,14 +283,14 @@ impl HandshakeReadParser {
             "Handshake must be done before transitioning to data phase"
         );
 
-        let (inbound_cipher, outbound_cipher) = self
-            .take_ciphers()
-            .expect("Ciphers must be available after handshake");
+        let inbound_cipher = self
+            .shared
+            .borrow_mut()
+            .inbound_cipher
+            .take()
+            .expect("Inbound cipher must be available after handshake");
 
         let aad = self.take_aad().unwrap_or_default();
-
-        // Store the outbound cipher in shared state so the paired writer can use it.
-        self.shared.borrow_mut().outbound_cipher = Some(outbound_cipher);
 
         (DataReadParser::new(aad.clone(), inbound_cipher), aad)
     }

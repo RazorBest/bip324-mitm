@@ -203,7 +203,8 @@ fn test_cipher_session_derivation() {
     let mut data = &client_key[..];
     parser.consume(&mut data).unwrap();
 
-    let (inbound, outbound) = parser.take_ciphers().expect("Expected ciphers after key phase");
+    let inbound = parser.take_inbound_cipher().expect("Expected inbound cipher after key phase");
+    let outbound = parser.take_outbound_cipher().expect("Expected outbound cipher after key phase");
 
     assert_eq!(
         inbound.length_cipher.unwrap().key_bytes,
@@ -329,7 +330,8 @@ fn test_set_ecdh_point_during_key() {
     parser.consume(&mut rest).unwrap();
 
     // Now take ciphers, they should be derived from the real server key + client_key
-    let (inbound, outbound) = parser.take_ciphers().expect("Expected ciphers");
+    let inbound = parser.take_inbound_cipher().expect("Expected ciphers");
+    let outbound = parser.take_outbound_cipher().expect("Expected ciphers");
     assert_eq!(inbound.length_cipher.unwrap().key_bytes, initiator_l);
     assert_eq!(inbound.packet_cipher.key_bytes, initiator_p);
     assert_eq!(outbound.length_cipher.key_bytes, responder_l);
@@ -370,7 +372,8 @@ fn test_set_ecdh_point_after_key() {
     parser.set_ecdh_point(server_point).unwrap();
 
     // take_ciphers() should now give ciphers from the real server key + client_key
-    let (inbound, outbound) = parser.take_ciphers().expect("Expected ciphers");
+    let inbound = parser.take_inbound_cipher().expect("Expected ciphers");
+    let outbound = parser.take_outbound_cipher().expect("Expected ciphers");
     assert_eq!(inbound.length_cipher.unwrap().key_bytes, initiator_l);
     assert_eq!(inbound.packet_cipher.key_bytes, initiator_p);
     assert_eq!(outbound.length_cipher.key_bytes, responder_l);
@@ -1034,9 +1037,10 @@ fn complete_handshake() -> (InboundCipher, OutboundCipher, InboundCipher, Outbou
     assert!(alice_reader.is_handshake_done());
     assert!(bob_reader.is_handshake_done());
 
-    let (alice_inbound, alice_outbound) = alice_reader.take_ciphers().unwrap();
-    let (bob_inbound, bob_outbound) = bob_reader.take_ciphers().unwrap();
-
+    let alice_inbound = alice_reader.take_inbound_cipher().unwrap();
+    let alice_outbound = alice_reader.take_outbound_cipher().unwrap();
+    let bob_inbound = bob_reader.take_inbound_cipher().unwrap();
+    let bob_outbound = bob_reader.take_outbound_cipher().unwrap();
     (alice_inbound, alice_outbound, bob_inbound, bob_outbound)
 }
 
@@ -1160,8 +1164,8 @@ fn test_protocol_parsers_standalone() {
     alice_hs.consume(&mut bob_term.as_slice()).unwrap();
     bob_hs.consume(&mut alice_term.as_slice()).unwrap();
 
-    let (_, alice_outbound) = alice_hs.take_ciphers().unwrap();
-    let (bob_inbound, _) = bob_hs.take_ciphers().unwrap();
+    let alice_outbound = alice_hs.take_outbound_cipher().unwrap();
+    let bob_inbound = bob_hs.take_inbound_cipher().unwrap();
 
     // Alice → Bob data transfer using only pure parser objects
     let msg = b"standalone parsers work without any external infrastructure";
@@ -1254,9 +1258,10 @@ fn test_coupled_handshake() {
     alice_reader.consume(&mut bob_term.as_slice()).unwrap();
     bob_reader.consume(&mut alice_term.as_slice()).unwrap();
 
-    let (alice_inbound, alice_outbound) = alice_reader.take_ciphers().unwrap();
-    let (bob_inbound, bob_outbound) = bob_reader.take_ciphers().unwrap();
-
+    let alice_inbound = alice_reader.take_inbound_cipher().unwrap();
+    let alice_outbound = alice_reader.take_outbound_cipher().unwrap();
+    let bob_inbound = bob_reader.take_inbound_cipher().unwrap();
+    let bob_outbound = bob_reader.take_outbound_cipher().unwrap();
     // Alice's outbound keys must match Bob's inbound keys
     assert_eq!(
         alice_outbound.length_cipher.key_bytes,

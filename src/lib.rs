@@ -1249,7 +1249,8 @@ mod mitmfakepeerbip324_tests {
             panic!("Wrong leg state");
         };
 
-        let (inbound_cipher, outbound_cipher) = reader_leg.parser.take_ciphers().unwrap();
+        let inbound_cipher = reader_leg.parser.take_inbound_cipher().unwrap();
+        let outbound_cipher = reader_leg.parser.take_outbound_cipher().unwrap();
 
         assert_eq!(inbound_cipher.length_cipher.unwrap().key_bytes, initiator_l);
         assert_eq!(inbound_cipher.packet_cipher.key_bytes, initiator_p);

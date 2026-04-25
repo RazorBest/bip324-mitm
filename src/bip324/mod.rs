@@ -572,14 +572,14 @@ impl ProtocolWriteParser for HandshakeWriteParser {
 
         match state {
             state @ SendingKey => {
-                // Mark writer as started so that set_ecdh_point is rejected from here on.
-                if !self.shared.borrow().writer_started_sending {
-                    self.shared.borrow_mut().writer_started_sending = true;
-                }
-
                 let ellswift_bytes = self.shared.borrow().our_ellswift_bytes;
                 let remaining = NUM_ELLIGATOR_SWIFT_BYTES - self.key_bytes_sent;
                 let size = cmp::min(data.remaining(), remaining);
+
+                if size > 0 && !self.shared.borrow().writer_started_sending {
+                    self.shared.borrow_mut().writer_started_sending = true;
+                }
+
                 data.write_all(&ellswift_bytes[self.key_bytes_sent..self.key_bytes_sent + size])
                     .unwrap();
                 self.key_bytes_sent += size;

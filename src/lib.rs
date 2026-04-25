@@ -135,8 +135,7 @@ impl MitmImpersonatorLeg {
         relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
         secret_key: EcdhPoint,
     ) -> Self {
-        let (bip324_reader, bip324_writer) =
-            bip324::new_handshake_pair(role, magic, secret_key);
+        let (bip324_reader, bip324_writer) = bip324::new_handshake_pair(role, magic, secret_key);
         let reader_leg = MitmHandshakeImpersonatorLegReader::new(relay_out, bip324_reader);
         let writer_leg = MitmHandshakeImpersonatorLegWriter::new(relay_in, bip324_writer);
 
@@ -301,9 +300,7 @@ impl MitmHandshakeImpersonatorLegReader {
         if self.parser.is_handshake_done() {
             return Err((
                 secret,
-                IllegalState(
-                    "Can't change secret. Handshake is already done".to_string(),
-                ),
+                IllegalState("Can't change secret. Handshake is already done".to_string()),
             ));
         }
 
@@ -342,7 +339,11 @@ impl MitmHandshakeImpersonatorLegReader {
             return None;
         }
         let (data_parser, aad) = self.parser.into_data_reader();
-        Some(MitmImpersonatorLegReader::new_from_parser(self.relay_out, data_parser, &aad))
+        Some(MitmImpersonatorLegReader::new_from_parser(
+            self.relay_out,
+            data_parser,
+            &aad,
+        ))
     }
 }
 
@@ -390,8 +391,6 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
     }
 }
 
-
-
 pub struct MitmHandshakeImpersonatorLegWriter {
     pub parser: HandshakeWriteParser,
     relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
@@ -418,7 +417,10 @@ impl MitmHandshakeImpersonatorLegWriter {
             return None;
         }
         let data_writer = self.parser.into_data_writer();
-        Some(MitmImpersonatorLegWriter::new_from_parser(self.relay_in, data_writer))
+        Some(MitmImpersonatorLegWriter::new_from_parser(
+            self.relay_in,
+            data_writer,
+        ))
     }
 }
 
@@ -434,11 +436,18 @@ impl StreamWriteParser for MitmHandshakeImpersonatorLegWriter {
             }
             let limit = cmp::min(available, data.remaining());
             let mut pacing_buf = vec![0u8; limit];
-            let size = self.relay_in.borrow_mut().read_key(&mut pacing_buf).unwrap();
+            let size = self
+                .relay_in
+                .borrow_mut()
+                .read_key(&mut pacing_buf)
+                .unwrap();
             if size == 0 {
                 return Ok(ProtocolStatus::End);
             }
-            let mut limited = LimitedWriter { inner: data, limit: size };
+            let mut limited = LimitedWriter {
+                inner: data,
+                limit: size,
+            };
             return self.parser.step(&mut limited);
         }
 
@@ -471,7 +480,10 @@ impl StreamWriteParser for MitmHandshakeImpersonatorLegWriter {
             if size == 0 {
                 return Ok(ProtocolStatus::End);
             }
-            let mut limited = LimitedWriter { inner: data, limit: size };
+            let mut limited = LimitedWriter {
+                inner: data,
+                limit: size,
+            };
             return self.parser.step(&mut limited);
         }
 
@@ -517,7 +529,9 @@ impl StreamReadParser for MitmImpersonatorLegReader {
 
         let length_bytes = self.parser.drain_length_bytes();
         if !length_bytes.is_empty() {
-            self.relay_out.borrow_mut().write_length_bytes(&length_bytes);
+            self.relay_out
+                .borrow_mut()
+                .write_length_bytes(&length_bytes);
         }
 
         let data_bytes = self.parser.drain_data_bytes();
@@ -597,8 +611,6 @@ impl StreamWriteParser for MitmImpersonatorLegWriter {
         self.parser.step(data)
     }
 }
-
-
 
 pub fn key_from_rng<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Result<EcdhPoint, Box<dyn Error>> {
     let mut secret_key_buffer = [0u8; 32];

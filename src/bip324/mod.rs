@@ -7,8 +7,8 @@ use crate::cipher::{CipherSession, InboundCipher, LengthDecryptor, OutboundCiphe
 use crate::external::chacha20_poly1305::ChaCha20Poly1305Stream;
 use crate::protocol::{
     AADType, EcdhPoint, GarbageTerminatorType, MagicType, NUM_ELLIGATOR_SWIFT_BYTES,
-    NUM_GARBAGE_CONTENT_LIMIT, NUM_GARBAGE_TERMINATOR_BYTES, NUM_LENGTH_BYTES, NUM_TAG_BYTES,
-    Role, TagType, find_garbage,
+    NUM_GARBAGE_CONTENT_LIMIT, NUM_GARBAGE_TERMINATOR_BYTES, NUM_LENGTH_BYTES, NUM_TAG_BYTES, Role,
+    TagType, find_garbage,
 };
 use crate::state_machine::{
     BufReader, BufWriter, HasFinal, ProtocolReadParser, ProtocolStatus, ProtocolWriteParser,
@@ -118,13 +118,10 @@ impl HandshakeState {
         magic: MagicType,
     ) -> Result<GarbageTerminatorType, Bip324Error> {
         let peer_key = self.peer_key.as_ref().ok_or_else(|| {
-            Bip324Error::IllegalState(
-                "derive_cipher_session called without peer_key".to_string(),
-            )
+            Bip324Error::IllegalState("derive_cipher_session called without peer_key".to_string())
         })?;
-        let cipher =
-            CipherSession::new_from_shares(magic, role, self.our_key.clone(), peer_key)
-                .map_err(|(_, _)| Bip324Error::KeyGenerationError)?;
+        let cipher = CipherSession::new_from_shares(magic, role, self.our_key.clone(), peer_key)
+            .map_err(|(_, _)| Bip324Error::KeyGenerationError)?;
         let inbound_garbage_terminator = cipher.inbound_garbage_terminator;
         let outbound_garbage_terminator = cipher.outbound_garbage_terminator;
         let (inbound_cipher, outbound_cipher) = cipher.into_split();
@@ -138,9 +135,9 @@ impl HandshakeState {
 
 #[derive(Debug)]
 pub enum HandshakeReadState {
-    ReceivingKey(usize),                    // remaining_bytes
+    ReceivingKey(usize),                     // remaining_bytes
     ReceivingGarbage(GarbageTerminatorType), // inbound_garbage_terminator
-    HandshakeDone(AADType),                 // garbage content (AAD)
+    HandshakeDone(AADType),                  // garbage content (AAD)
 }
 
 impl HasFinal for HandshakeReadState {
@@ -185,13 +182,12 @@ impl HandshakeReadParser {
         &mut self,
         other_key: [u8; NUM_ELLIGATOR_SWIFT_BYTES],
     ) -> Result<GarbageTerminatorType, Bip324Error> {
-        self.shared.borrow_mut().on_peer_key_received(other_key, self.role, self.magic)
+        self.shared
+            .borrow_mut()
+            .on_peer_key_received(other_key, self.role, self.magic)
     }
 
-    pub fn set_ecdh_point(
-        &mut self,
-        point: EcdhPoint,
-    ) -> Result<(), (EcdhPoint, Bip324Error)> {
+    pub fn set_ecdh_point(&mut self, point: EcdhPoint) -> Result<(), (EcdhPoint, Bip324Error)> {
         use HandshakeReadState::*;
 
         if self.state.as_ref().is_some_and(|s| s.is_final()) {
@@ -207,7 +203,9 @@ impl HandshakeReadParser {
 
         // Delegates to shared state, which enforces the writer_started_sending guard
         // and re-derives the cipher session if the peer's key is already known.
-        self.shared.borrow_mut().set_ecdh_point(point, self.role, self.magic)?;
+        self.shared
+            .borrow_mut()
+            .set_ecdh_point(point, self.role, self.magic)?;
 
         if is_receiving_garbage {
             // Update the inbound_garbage_terminator in our state to reflect the new ECDH outcome.
@@ -324,16 +322,14 @@ impl ProtocolReadParser for HandshakeReadParser {
                 let size = match data.read(&mut key_buf) {
                     Ok(size) => size,
                     Err(err) => {
-                        return (
-                            ReceivingKey(remaining),
-                            Err(Bip324Error::ReadError(err)),
-                        );
+                        return (ReceivingKey(remaining), Err(Bip324Error::ReadError(err)));
                     }
                 };
                 remaining -= size;
 
                 self.read_buffer.extend_from_slice(&key_buf[..size]);
-                self.output_key_bytes.extend(key_buf[..size].iter().copied());
+                self.output_key_bytes
+                    .extend(key_buf[..size].iter().copied());
 
                 if remaining == 0 {
                     self.key_eof = true;
@@ -428,11 +424,13 @@ impl ProtocolReadParser for HandshakeReadParser {
 
                     // Copy slices to avoid multiple borrows of self
                     let garbage_chunk = self.read_buffer[new_range].to_vec();
-                    self.output_garbage_bytes.extend(garbage_chunk.iter().copied());
+                    self.output_garbage_bytes
+                        .extend(garbage_chunk.iter().copied());
                     self.garbage_eof = true;
 
                     let term_chunk = self.read_buffer[garbage_len..].to_vec();
-                    self.output_terminator_bytes.extend(term_chunk.iter().copied());
+                    self.output_terminator_bytes
+                        .extend(term_chunk.iter().copied());
 
                     let aad: Vec<_> = self.read_buffer.splice(..garbage_len, []).collect();
                     self.read_buffer.clear();
@@ -446,7 +444,8 @@ impl ProtocolReadParser for HandshakeReadParser {
                     let new_range = lhs..rhs;
 
                     let garbage_chunk = self.read_buffer[new_range].to_vec();
-                    self.output_garbage_bytes.extend(garbage_chunk.iter().copied());
+                    self.output_garbage_bytes
+                        .extend(garbage_chunk.iter().copied());
 
                     (state, Ok(ProtocolStatus::End))
                 }
@@ -524,7 +523,10 @@ impl HandshakeWriteParser {
     }
 
     pub fn is_sending_terminator(&self) -> bool {
-        matches!(self.state, Some(HandshakeWriteState::SendingGarbageTerminator))
+        matches!(
+            self.state,
+            Some(HandshakeWriteState::SendingGarbageTerminator)
+        )
     }
 
     pub fn writer_started_sending(&self) -> bool {
@@ -612,8 +614,10 @@ impl ProtocolWriteParser for HandshakeWriteParser {
 
                 let remaining = NUM_GARBAGE_TERMINATOR_BYTES - self.terminator_bytes_sent;
                 let size = cmp::min(data.remaining(), remaining);
-                data.write_all(&term[self.terminator_bytes_sent..self.terminator_bytes_sent + size])
-                    .unwrap();
+                data.write_all(
+                    &term[self.terminator_bytes_sent..self.terminator_bytes_sent + size],
+                )
+                .unwrap();
                 self.terminator_bytes_sent += size;
 
                 if self.terminator_bytes_sent == NUM_GARBAGE_TERMINATOR_BYTES {
@@ -731,7 +735,8 @@ impl ProtocolReadParser for DataReadParser {
                     .decrypt_len_part_inplace(&mut data_to_process)
                     .unwrap();
 
-                self.output_length_bytes.extend(data_to_process.iter().copied());
+                self.output_length_bytes
+                    .extend(data_to_process.iter().copied());
 
                 match length_decryptor.try_end() {
                     Ok((length_cipher, packet_len)) => {
@@ -767,7 +772,8 @@ impl ProtocolReadParser for DataReadParser {
             }
             ReceivingPacketContent(mut stream_cipher) => {
                 stream_cipher.decrypt_and_store_chunk(&mut data_to_process);
-                self.output_data_bytes.extend(data_to_process.iter().copied());
+                self.output_data_bytes
+                    .extend(data_to_process.iter().copied());
 
                 if self.remaining == 0 {
                     let aad = self.consume_aad();
@@ -797,7 +803,8 @@ impl ProtocolReadParser for DataReadParser {
                 }
                 expected_tag.drain(..data_to_process.len());
 
-                self.output_tag_bytes.extend(data_to_process.iter().copied());
+                self.output_tag_bytes
+                    .extend(data_to_process.iter().copied());
 
                 if self.remaining == 0 {
                     let length_decryptor = self

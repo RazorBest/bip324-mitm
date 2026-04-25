@@ -5,8 +5,8 @@ use hex::prelude::*;
 use hex_literal::hex;
 use secp256k1::SecretKey;
 use secp256k1::ellswift::{ElligatorSwift, ElligatorSwiftParty};
-use secp256k1::rand::{CryptoRng, RngCore};
 use secp256k1::rand::rngs::mock::StepRng;
+use secp256k1::rand::{CryptoRng, RngCore};
 
 use crate::cipher::{CipherSession, InboundCipher, OutboundCipher, SessionKeyMaterial};
 use crate::key_from_secret_bytes;
@@ -20,10 +20,9 @@ const MAGIC: [u8; 4] = MAINNET_MAGIC;
 
 // Returns (alice_outbound [sender], bob_inbound [receiver]) using fixed known keys.
 fn make_cipher_pair() -> (OutboundCipher, InboundCipher) {
-    let alice = SecretKey::from_str(
-        "61062ea5071d800bbfd59e2e8b53d47d194b095ae5a4df04936b49772ef0d4d7",
-    )
-    .unwrap();
+    let alice =
+        SecretKey::from_str("61062ea5071d800bbfd59e2e8b53d47d194b095ae5a4df04936b49772ef0d4d7")
+            .unwrap();
     let elliswift_alice = ElligatorSwift::from_str("ec0adff257bbfe500c188c80b4fdd640f6b45a482bbc15fc7cef5931deff0aa186f6eb9bba7b85dc4dcc28b28722de1e3d9108b985e2967045668f66098e475b").unwrap();
     let elliswift_bob = ElligatorSwift::from_str("a4a94dfce69b4a2a0a099313d10f9f7e7d649d60501c9e1d274c300e0d89aafaffffffffffffffffffffffffffffffffffffffffffffffffffffffff8faf88d5").unwrap();
     let session_keys = SessionKeyMaterial::from_ecdh(
@@ -203,8 +202,12 @@ fn test_cipher_session_derivation() {
     let mut data = &client_key[..];
     parser.consume(&mut data).unwrap();
 
-    let inbound = parser.take_inbound_cipher().expect("Expected inbound cipher after key phase");
-    let outbound = parser.take_outbound_cipher().expect("Expected outbound cipher after key phase");
+    let inbound = parser
+        .take_inbound_cipher()
+        .expect("Expected inbound cipher after key phase");
+    let outbound = parser
+        .take_outbound_cipher()
+        .expect("Expected outbound cipher after key phase");
 
     assert_eq!(
         inbound.length_cipher.unwrap().key_bytes,
@@ -262,7 +265,10 @@ fn test_garbage_with_terminator() {
         NUM_GARBAGE_TERMINATOR_BYTES,
         "Terminator length mismatch"
     );
-    assert_eq!(drained_term, client_garbage_terminator, "Terminator mismatch");
+    assert_eq!(
+        drained_term, client_garbage_terminator,
+        "Terminator mismatch"
+    );
     assert!(parser.is_garbage_eof());
     assert!(parser.is_handshake_done());
 }
@@ -591,7 +597,7 @@ fn test_terminator_waits_for_ecdh() {
     assert!(parser.is_sending_terminator());
 }
 
-// Data read tests 
+// Data read tests
 
 // Encrypt plaintext with OutboundCipher (bypassing DataWriteParser, for read-side tests).
 fn cipher_encrypt_packet(outbound: &mut OutboundCipher, plaintext: &[u8]) -> Vec<u8> {
@@ -933,8 +939,7 @@ fn test_encrypt_with_aad() {
     let mut parser = DataWriteParser::new(alice_out);
     let ciphertext = encrypt_with_parser(&mut parser, plaintext, Some(&garbage_aad));
 
-    let packet_len =
-        bob_in.decrypt_packet_len(ciphertext[..NUM_LENGTH_BYTES].try_into().unwrap());
+    let packet_len = bob_in.decrypt_packet_len(ciphertext[..NUM_LENGTH_BYTES].try_into().unwrap());
     let mut ct_body = ciphertext[NUM_LENGTH_BYTES..NUM_LENGTH_BYTES + packet_len].to_vec();
     let (_pkt, msg) = bob_in
         .decrypt_in_place(&mut ct_body, Some(&garbage_aad))
@@ -998,7 +1003,7 @@ fn test_roundtrip_with_data_read_parser() {
     assert_eq!(&data_bytes[1..], plaintext);
 }
 
-// Integration tests 
+// Integration tests
 
 // Fixed deterministic keys used across all integration tests.
 const ALICE_SECRET: [u8; 32] =
@@ -1016,8 +1021,7 @@ fn complete_handshake() -> (InboundCipher, OutboundCipher, InboundCipher, Outbou
 
     let (mut alice_reader, _alice_writer) =
         super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
-    let (mut bob_reader, _bob_writer) =
-        super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
+    let (mut bob_reader, _bob_writer) = super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
 
     // Exchange public keys
     alice_reader.consume(&mut bob_wire_key.as_slice()).unwrap();
@@ -1100,8 +1104,7 @@ fn test_handshake_roundtrip() {
 
     let (mut alice_parser, _) =
         super::new_handshake_pair(Role::Initiator, MAGIC, alice_key_for_parser);
-    let (mut bob_parser, _) =
-        super::new_handshake_pair(Role::Responder, MAGIC, bob_key_for_parser);
+    let (mut bob_parser, _) = super::new_handshake_pair(Role::Responder, MAGIC, bob_key_for_parser);
 
     alice_parser.consume(&mut bob_wire_key.as_slice()).unwrap();
     bob_parser.consume(&mut alice_wire_key.as_slice()).unwrap();
@@ -1116,8 +1119,14 @@ fn test_handshake_roundtrip() {
         .consume(&mut alice_outbound_term.as_slice())
         .unwrap();
 
-    assert!(alice_parser.is_handshake_done(), "Alice handshake must complete");
-    assert!(bob_parser.is_handshake_done(), "Bob handshake must complete");
+    assert!(
+        alice_parser.is_handshake_done(),
+        "Alice handshake must complete"
+    );
+    assert!(
+        bob_parser.is_handshake_done(),
+        "Bob handshake must complete"
+    );
 }
 
 // 2. Complete handshake bidirectionally, then verify a data roundtrip:
@@ -1136,7 +1145,11 @@ fn test_full_protocol_flow() {
 
     let decrypted = decrypt_parser.drain_data_bytes();
     assert_eq!(decrypted[0], 0x00, "Expected genuine header byte");
-    assert_eq!(&decrypted[1..], plaintext, "Decrypted payload must match original plaintext");
+    assert_eq!(
+        &decrypted[1..],
+        plaintext,
+        "Decrypted payload must match original plaintext"
+    );
 }
 
 // 3. Demonstrate that the protocol parsers work entirely standalone:
@@ -1150,8 +1163,7 @@ fn test_protocol_parsers_standalone() {
     let bob_wire_key = bob_key.elligator_swift.to_array().to_vec();
     let alice_wire_key = alice_key.elligator_swift.to_array().to_vec();
 
-    let (mut alice_hs, _alice_w) =
-        super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
+    let (mut alice_hs, _alice_w) = super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
     let (mut bob_hs, _bob_w) = super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
 
     // Key exchange
@@ -1207,8 +1219,7 @@ fn test_set_ecdh_point_after_writer_started() {
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
     let new_key = key_from_secret_bytes(BOB_SECRET).unwrap();
 
-    let (mut reader, mut writer) =
-        super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
+    let (mut reader, mut writer) = super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
 
     // Start sending key bytes -- this sets writer_started_sending = true
     let mut buf = vec![0u8; 1];
@@ -1231,7 +1242,10 @@ fn test_set_ecdh_point_before_writer_started() {
     let (mut reader, _writer) = super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
 
     let result = reader.set_ecdh_point(new_key);
-    assert!(result.is_ok(), "set_ecdh_point should succeed before writer starts sending");
+    assert!(
+        result.is_ok(),
+        "set_ecdh_point should succeed before writer starts sending"
+    );
 }
 
 // 7. Both sides use new_handshake_pair and derive matching cipher sessions.
@@ -1245,8 +1259,7 @@ fn test_coupled_handshake() {
 
     let (mut alice_reader, _alice_writer) =
         super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
-    let (mut bob_reader, _bob_writer) =
-        super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
+    let (mut bob_reader, _bob_writer) = super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
 
     // Exchange keys
     alice_reader.consume(&mut bob_wire.as_slice()).unwrap();
@@ -1269,8 +1282,7 @@ fn test_coupled_handshake() {
         "alice outbound length key must equal bob inbound length key"
     );
     assert_eq!(
-        alice_outbound.packet_cipher.key_bytes,
-        bob_inbound.packet_cipher.key_bytes,
+        alice_outbound.packet_cipher.key_bytes, bob_inbound.packet_cipher.key_bytes,
         "alice outbound packet key must equal bob inbound packet key"
     );
     // Bob's outbound keys must match Alice's inbound keys
@@ -1280,8 +1292,7 @@ fn test_coupled_handshake() {
         "bob outbound length key must equal alice inbound length key"
     );
     assert_eq!(
-        bob_outbound.packet_cipher.key_bytes,
-        alice_inbound.packet_cipher.key_bytes,
+        bob_outbound.packet_cipher.key_bytes, alice_inbound.packet_cipher.key_bytes,
         "bob outbound packet key must equal alice inbound packet key"
     );
 }
@@ -1292,13 +1303,15 @@ fn test_writer_reads_key_from_shared_state() {
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
     let expected_bytes = alice_key.elligator_swift.to_array();
 
-    let (_reader, mut writer) =
-        super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
+    let (_reader, mut writer) = super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
 
     let mut buf = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
     writer.produce(&mut buf.as_mut_slice()).unwrap();
 
-    assert_eq!(buf, expected_bytes, "Writer must produce the key from shared state");
+    assert_eq!(
+        buf, expected_bytes,
+        "Writer must produce the key from shared state"
+    );
 }
 
 // Helper: run a full BIP-324 handshake for both sides using new_handshake_pair.
@@ -1341,11 +1354,17 @@ fn do_full_handshake() -> (
 
     let mut discard = vec![0u8; 256];
     alice_writer.produce(&mut discard.as_mut_slice()).unwrap();
-    assert!(alice_writer.is_done(), "alice writer must reach Done after produce()");
+    assert!(
+        alice_writer.is_done(),
+        "alice writer must reach Done after produce()"
+    );
 
     let mut discard = vec![0u8; 256];
     bob_writer.produce(&mut discard.as_mut_slice()).unwrap();
-    assert!(bob_writer.is_done(), "bob writer must reach Done after produce()");
+    assert!(
+        bob_writer.is_done(),
+        "bob writer must reach Done after produce()"
+    );
 
     (alice_reader, alice_writer, bob_reader, bob_writer)
 }

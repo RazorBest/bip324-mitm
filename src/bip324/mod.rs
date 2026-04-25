@@ -484,7 +484,6 @@ pub struct HandshakeWriteParser {
     garbage_bytes: VecDeque<u8>,
     garbage_eof: bool,
     terminator_bytes_sent: usize,
-    outbound_cipher: Option<OutboundCipher>,
     shared: SharedHandshakeState,
 }
 
@@ -496,7 +495,6 @@ impl HandshakeWriteParser {
             garbage_bytes: VecDeque::new(),
             garbage_eof: false,
             terminator_bytes_sent: 0,
-            outbound_cipher: None,
             shared,
         }
     }
@@ -509,16 +507,8 @@ impl HandshakeWriteParser {
         self.garbage_eof = true;
     }
 
-    pub fn set_outbound_cipher(&mut self, cipher: OutboundCipher) {
-        self.outbound_cipher = Some(cipher);
-    }
-
-    pub fn take_outbound_cipher(&mut self) -> Option<OutboundCipher> {
-        self.outbound_cipher.take()
-    }
-
     pub fn has_outbound_cipher(&self) -> bool {
-        self.outbound_cipher.is_some() || self.shared.borrow().outbound_cipher.is_some()
+        self.shared.borrow().outbound_cipher.is_some()
     }
 
     pub fn is_done(&self) -> bool {
@@ -541,16 +531,17 @@ impl HandshakeWriteParser {
         self.shared.borrow().writer_started_sending
     }
 
-    pub fn into_data_writer(mut self) -> DataWriteParser {
+    pub fn into_data_writer(self) -> DataWriteParser {
         assert!(
             self.is_done(),
             "Handshake must be done before transitioning to data phase"
         );
 
         let outbound_cipher = self
+            .shared
+            .borrow_mut()
             .outbound_cipher
             .take()
-            .or_else(|| self.shared.borrow_mut().outbound_cipher.take())
             .expect("Outbound cipher must be available for data phase");
 
         DataWriteParser::new(outbound_cipher)

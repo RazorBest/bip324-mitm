@@ -481,6 +481,7 @@ pub struct HandshakeWriteParser {
     state: Option<HandshakeWriteState>,
     key_bytes_sent: usize,
     garbage_bytes: VecDeque<u8>,
+    garbage_sent: Vec<u8>,
     garbage_eof: bool,
     terminator_bytes_sent: usize,
     shared: SharedHandshakeState,
@@ -492,6 +493,7 @@ impl HandshakeWriteParser {
             state: Some(HandshakeWriteState::SendingKey),
             key_bytes_sent: 0,
             garbage_bytes: VecDeque::new(),
+            garbage_sent: Vec::new(),
             garbage_eof: false,
             terminator_bytes_sent: 0,
             shared,
@@ -546,7 +548,9 @@ impl HandshakeWriteParser {
             .take()
             .expect("Outbound cipher must be available for data phase");
 
-        DataWriteParser::new(outbound_cipher)
+        let mut writer = DataWriteParser::new(outbound_cipher);
+        writer.set_aad(&self.garbage_sent);
+        writer
     }
 
     /// Inject an outbound garbage terminator directly into shared state.
@@ -596,6 +600,7 @@ impl ProtocolWriteParser for HandshakeWriteParser {
                 let size = cmp::min(data.remaining(), self.garbage_bytes.len());
                 let garbage_chunk: Vec<u8> = self.garbage_bytes.drain(..size).collect();
                 data.write_all(&garbage_chunk).unwrap();
+                self.garbage_sent.extend_from_slice(&garbage_chunk);
 
                 if self.garbage_bytes.is_empty() && self.garbage_eof {
                     (SendingGarbageTerminator, Ok(ProtocolStatus::Continue))

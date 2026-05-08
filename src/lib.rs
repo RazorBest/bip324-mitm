@@ -1,3 +1,4 @@
+pub mod bip324;
 pub mod cipher;
 pub mod external;
 mod fmt_utils;
@@ -8,6 +9,8 @@ pub mod state_machine;
 use std::cell::RefCell;
 use std::cmp;
 use std::error::Error;
+use std::io;
+use std::io::Write;
 use std::rc::Rc;
 
 use secp256k1::ellswift::ElligatorSwift;
@@ -15,23 +18,17 @@ use secp256k1::rand::{CryptoRng, RngCore};
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use thiserror::Error;
 
-use crate::cipher::{CipherSession, InboundCipher, LengthDecryptor, OutboundCipher};
-use crate::external::chacha20_poly1305::ChaCha20Poly1305Stream;
+use crate::bip324::{DataReadParser, DataWriteParser, HandshakeReadParser, HandshakeWriteParser};
+use crate::cipher::{InboundCipher, OutboundCipher};
 use crate::protocol::{
     AADType, EcdhPoint, GarbageTerminatorType, MAINNET_MAGIC, MagicType, NUM_ELLIGATOR_SWIFT_BYTES,
-    NUM_GARBAGE_CONTENT_LIMIT, NUM_GARBAGE_TERMINATOR_BYTES, NUM_LENGTH_BYTES, NUM_SECRET_BYTES,
-    NUM_TAG_BYTES, REGTEST_MAGIC, Role, TESTNET_MAGIC, TagType, find_garbage,
+    NUM_SECRET_BYTES, REGTEST_MAGIC, Role, TESTNET_MAGIC,
 };
 use crate::relay::{FakePeerRelay, FakePeerRelayReader, FakePeerRelayWriter};
 use crate::state_machine::{
     BufReader, BufWriter, HasFinal, ProtocolReadParser, ProtocolStatus, ProtocolWriteParser,
     StreamReadParser, StreamWriteParser,
 };
-
-// Maximum packet size for automatic allocation.
-// Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH is 4,000,000 bytes (~4 MiB).
-// 14 extra bytes are for the BIP-324 header byte and 13 serialization header bytes (message type).
-const MAX_PACKET_SIZE_FOR_ALLOCATION: usize = 4000014;
 
 #[derive(Error, Debug)]
 pub enum BIP324MitmError {
@@ -53,68 +50,50 @@ pub enum BIP324MitmError {
 
 use BIP324MitmError::*;
 
-pub enum LegWriterState {
-    SendingLength(usize, Vec<u8>),
-    SendingPayload(usize, ChaCha20Poly1305Stream),
-    SendingTag(Vec<u8>),
-}
-
-impl LegWriterState {
-    fn new() -> Self {
-        Self::SendingLength(NUM_LENGTH_BYTES, vec![])
+impl From<crate::bip324::Bip324Error> for BIP324MitmError {
+    fn from(e: crate::bip324::Bip324Error) -> Self {
+        use crate::bip324::Bip324Error as E;
+        match e {
+            E::ReadError(err) => BIP324MitmError::ReadError(err),
+            E::KeyGenerationError => BIP324MitmError::KeyGenerationError,
+            E::GarbageLimitExceededError => BIP324MitmError::GarbageLimitExceededError,
+            E::IllegalState(msg) => BIP324MitmError::IllegalState(msg),
+        }
     }
 }
 
-impl HasFinal for LegWriterState {
-    /// Always returns false
-    fn is_final(&self) -> bool {
-        false
+// A BufWriter wrapper that limits how many bytes can be written per step().
+// Used to implement relay-channel pacing in handshake writers.
+struct LimitedWriter<'a> {
+    inner: &'a mut dyn BufWriter,
+    limit: usize,
+}
+
+impl Write for LimitedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let to_write = cmp::min(buf.len(), self.limit);
+        if to_write == 0 {
+            return Ok(0);
+        }
+        let written = self.inner.write(&buf[..to_write])?;
+        self.limit -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
-#[derive(PartialEq)]
-pub enum HandshakeRelayPeerState {
-    SendingKey,
-    SendingGarbage,
-    SendingGarbageTerminator,
-    HandshakeDone,
-}
-
-impl HandshakeRelayPeerState {
-    fn new() -> Self {
-        Self::SendingKey
+impl BufWriter for LimitedWriter<'_> {
+    fn remaining(&self) -> usize {
+        cmp::min(self.limit, self.inner.remaining())
     }
-}
 
-impl HasFinal for HandshakeRelayPeerState {
-    fn is_final(&self) -> bool {
-        matches!(self, Self::HandshakeDone)
-    }
-}
-
-#[derive(Debug)]
-pub enum HandshakeBIP324State {
-    ReceivingKey(EcdhPoint, usize),
-    ReceivingGarbage(GarbageTerminatorType),
-    HandshakeDone(AADType),
-}
-
-impl HasFinal for HandshakeBIP324State {
-    fn is_final(&self) -> bool {
-        matches!(self, Self::HandshakeDone(_))
-    }
-}
-
-pub enum DataBIP324State {
-    ReceivingPacketLen(LengthDecryptor),
-    ReceivingPacketContent(ChaCha20Poly1305Stream),
-    ReceivingPacketTag(TagType),
-}
-
-impl HasFinal for DataBIP324State {
-    /// Always returns false
-    fn is_final(&self) -> bool {
-        false
+    fn prewrite(&mut self, amount: usize) -> io::Result<&mut [u8]> {
+        let size = cmp::min(amount, self.remaining());
+        self.limit -= size;
+        self.inner.prewrite(size)
     }
 }
 
@@ -156,29 +135,9 @@ impl MitmImpersonatorLeg {
         relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
         secret_key: EcdhPoint,
     ) -> Self {
-        // We know the fake server's public key, so we can already prepare it for sending
-        let mut key_to_send_vec = vec![];
-        key_to_send_vec.extend_from_slice(&secret_key.elligator_swift.to_array());
-
-        let key_to_send = Rc::new(RefCell::new(key_to_send_vec));
-        let cipher = Rc::new(RefCell::new(None));
-        let garbage_terminator_to_send = Rc::new(RefCell::new(vec![]));
-
-        let reader_leg = MitmHandshakeImpersonatorLegReader::new(
-            role,
-            magic,
-            relay_out,
-            secret_key,
-            Rc::clone(&key_to_send),
-            Rc::clone(&cipher),
-            Rc::clone(&garbage_terminator_to_send),
-        );
-        let writer_leg = MitmHandshakeImpersonatorLegWriter::new(
-            relay_in,
-            key_to_send,
-            cipher,
-            garbage_terminator_to_send,
-        );
+        let (bip324_reader, bip324_writer) = bip324::new_handshake_pair(role, magic, secret_key);
+        let reader_leg = MitmHandshakeImpersonatorLegReader::new(relay_out, bip324_reader);
+        let writer_leg = MitmHandshakeImpersonatorLegWriter::new(relay_in, bip324_writer);
 
         Self {
             reader_leg_state: Some(ReaderLegState::Handshake(reader_leg)),
@@ -208,8 +167,22 @@ impl MitmImpersonatorLeg {
         &mut self,
         secret: [u8; NUM_SECRET_BYTES],
     ) -> Result<(), ([u8; NUM_SECRET_BYTES], BIP324MitmError)> {
-        match &mut self.reader_leg_state {
-            Some(ReaderLegState::Handshake(reader_leg)) => reader_leg.set_secret(secret),
+        match (&mut self.reader_leg_state, &mut self.writer_leg_state) {
+            (
+                Some(ReaderLegState::Handshake(reader_leg)),
+                Some(WriterLegState::Handshake(writer_leg)),
+            ) => {
+                if writer_leg.writer_started_sending() {
+                    return Err((
+                        secret,
+                        IllegalState(
+                            "Can't change secret: writer has already started sending".to_string(),
+                        ),
+                    ));
+                }
+                reader_leg.set_secret(secret)?;
+                Ok(())
+            }
             _ => Err((
                 secret,
                 IllegalState("Invalid state for set_secret".to_string()),
@@ -278,8 +251,13 @@ impl ProtocolWriteParser for MitmImpersonatorLeg {
                 writer_leg.produce(data).unwrap();
 
                 if writer_leg.is_final() {
-                    let new_writer_leg = writer_leg.next_phase().unwrap();
-                    (Data(new_writer_leg), Ok(ProtocolStatus::End))
+                    if writer_leg.parser.has_outbound_cipher() {
+                        let new_writer_leg = writer_leg.next_phase().unwrap();
+                        (Data(new_writer_leg), Ok(ProtocolStatus::End))
+                    } else {
+                        // Cipher not yet forwarded from reader; stay in handshake
+                        (Handshake(writer_leg), Ok(ProtocolStatus::End))
+                    }
                 } else {
                     (Handshake(writer_leg), Ok(ProtocolStatus::End))
                 }
@@ -303,83 +281,26 @@ impl ProtocolWriteParser for MitmImpersonatorLeg {
 }
 
 pub struct MitmHandshakeImpersonatorLegReader {
-    role: Role,
-    magic: MagicType,
-    state: Option<HandshakeBIP324State>,
-
+    pub parser: HandshakeReadParser,
     relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
-
-    other_key: Option<[u8; NUM_ELLIGATOR_SWIFT_BYTES]>,
-
-    read_buffer: Vec<u8>,
-
-    key_to_send: Rc<RefCell<Vec<u8>>>,
-    cipher: Rc<RefCell<Option<CipherSession>>>,
-    garbage_terminator_to_send: Rc<RefCell<Vec<u8>>>,
 }
 
 impl MitmHandshakeImpersonatorLegReader {
     pub fn new(
-        role: Role,
-        magic: MagicType,
         relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
-        secret_key: EcdhPoint,
-        key_to_send: Rc<RefCell<Vec<u8>>>,
-        cipher: Rc<RefCell<Option<CipherSession>>>,
-        garbage_terminator_to_send: Rc<RefCell<Vec<u8>>>,
+        parser: HandshakeReadParser,
     ) -> Self {
-        Self {
-            role,
-            magic,
-            state: Some(HandshakeBIP324State::ReceivingKey(
-                secret_key,
-                NUM_ELLIGATOR_SWIFT_BYTES,
-            )),
-            key_to_send,
-            garbage_terminator_to_send,
-            relay_out,
-            other_key: None,
-            read_buffer: vec![],
-            cipher,
-        }
-    }
-
-    fn on_share_received(
-        &mut self,
-        point: EcdhPoint,
-    ) -> Result<GarbageTerminatorType, (EcdhPoint, BIP324MitmError)> {
-        let Some(other_key) = &self.other_key else {
-            return Err((
-                point,
-                IllegalState("on_share_received called with empty other_key".to_string()),
-            ));
-        };
-        let cipher = CipherSession::new_from_shares(self.magic, self.role, point, other_key)
-            .map_err(|(point, _)| (point, KeyGenerationError))?;
-        let inbound_garbage_terminator = cipher.inbound_garbage_terminator;
-        let outbound_garbage_terminator = cipher.outbound_garbage_terminator;
-
-        self.cipher.replace(Some(cipher));
-        self.garbage_terminator_to_send
-            .replace(outbound_garbage_terminator.to_vec());
-
-        Ok(inbound_garbage_terminator)
+        Self { parser, relay_out }
     }
 
     pub fn set_secret(
         &mut self,
         secret: [u8; NUM_SECRET_BYTES],
     ) -> Result<(), ([u8; NUM_SECRET_BYTES], BIP324MitmError)> {
-        use HandshakeBIP324State::*;
-
-        if self.key_to_send.borrow().len() < NUM_ELLIGATOR_SWIFT_BYTES
-            || self.state.as_ref().unwrap().is_final()
-        {
+        if self.parser.is_handshake_done() {
             return Err((
                 secret,
-                IllegalState(
-                    "Can't change secret. Public key has already started to be sent".to_string(),
-                ),
+                IllegalState("Can't change secret. Handshake is already done".to_string()),
             ));
         }
 
@@ -389,370 +310,189 @@ impl MitmHandshakeImpersonatorLegReader {
                 IllegalState("Can't generate EC scalar from secret key bytes".to_string()),
             )
         })?;
-        let mut key_to_send = vec![];
-        key_to_send.extend_from_slice(&secret_key.elligator_swift.to_array());
 
-        self.key_to_send.replace(key_to_send);
-        match self.state.take() {
-            Some(ReceivingKey(_old_point, remaining)) => {
-                self.state = Some(ReceivingKey(secret_key, remaining));
-            }
-            Some(ReceivingGarbage(_old_other_garbage_terminator)) => {
-                let inbound_garbage_terminator = self
-                    .on_share_received(secret_key)
-                    .map_err(|(_, err)| (secret, err))?;
-
-                self.state = Some(ReceivingGarbage(inbound_garbage_terminator));
-            }
-            state => {
-                panic!("Can't change secret for state: {state:?}")
-            }
-        }
+        self.parser
+            .set_ecdh_point(secret_key)
+            .map_err(|(_, err)| (secret, err.into()))?;
 
         Ok(())
     }
 
     pub fn is_final(&self) -> bool {
-        if let Some(state) = &self.state {
-            state.is_final()
-        } else {
-            false
-        }
+        self.parser.is_handshake_done()
+    }
+
+    pub fn is_receiving_key(&self) -> bool {
+        self.parser.is_receiving_key()
+    }
+
+    pub fn is_receiving_garbage(&self) -> bool {
+        self.parser.is_receiving_garbage()
+    }
+
+    pub fn inbound_garbage_terminator(&self) -> Option<&GarbageTerminatorType> {
+        self.parser.inbound_garbage_terminator()
     }
 
     pub fn next_phase(self) -> Option<MitmImpersonatorLegReader> {
-        let Some(HandshakeBIP324State::HandshakeDone(aad)) = self.state else {
+        if !self.parser.is_handshake_done() {
             return None;
-        };
-
-        // TODO: replace unwrap
-        let inbound_cipher = self
-            .cipher
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .consume_inbound()
-            .unwrap();
-
-        Some(MitmImpersonatorLegReader::new(
-            aad,
+        }
+        let (data_parser, aad) = self.parser.into_data_reader();
+        Some(MitmImpersonatorLegReader::new_from_parser(
             self.relay_out,
-            inbound_cipher,
+            data_parser,
+            &aad,
         ))
     }
 }
 
-impl ProtocolReadParser for MitmHandshakeImpersonatorLegReader {
-    type State = HandshakeBIP324State;
+impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
     type Error = BIP324MitmError;
 
-    fn transition(
-        &mut self,
-        state: Self::State,
-        data: &mut dyn BufReader,
-    ) -> (Self::State, Result<ProtocolStatus, Self::Error>) {
-        use HandshakeBIP324State::*;
+    fn step(&mut self, data: &mut dyn BufReader) -> Result<ProtocolStatus, Self::Error> {
+        let status = self.parser.step(data)?;
 
-        match state {
-            ReceivingKey(point, mut remaining) => {
-                let mut key_buf = vec![0u8; remaining];
-                let size = match data.read(&mut key_buf) {
-                    Ok(size) => size,
-                    Err(err) => {
-                        return (
-                            ReceivingKey(point, remaining),
-                            Err(BIP324MitmError::ReadError(err)),
-                        );
-                    }
-                };
-                remaining -= size;
-
-                self.read_buffer.extend_from_slice(&key_buf[..size]);
-                // TODO: replace unwrap
-                self.relay_out
-                    .borrow_mut()
-                    .write_key(&key_buf[..size])
-                    .map_err(|_| "Error writing key to relay")
-                    .unwrap();
-
-                if remaining == 0 {
-                    self.relay_out.borrow_mut().set_eof_key();
-
-                    let mut other_key = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-                    other_key.copy_from_slice(&std::mem::take(&mut self.read_buffer));
-                    self.other_key = Some(other_key);
-
-                    let inbound_garbage_terminator = match self.on_share_received(point) {
-                        Ok(ret) => ret,
-                        Err((point, err)) => {
-                            return (ReceivingKey(point, remaining), Err(err));
-                        }
-                    };
-
-                    (
-                        ReceivingGarbage(inbound_garbage_terminator),
-                        Ok(ProtocolStatus::Continue),
-                    )
-                } else {
-                    (ReceivingKey(point, remaining), Ok(ProtocolStatus::End))
-                }
-            }
-            // This uses a peek-then-read strategy
-            state @ ReceivingGarbage(other_garbage_terminator) => {
-                // The length under which we don't know if an array of data is a garbage terminator
-                let insurance_len = other_garbage_terminator.len() - 1;
-                let prevlen = self.read_buffer.len();
-                let mut relay_out = self.relay_out.borrow_mut();
-
-                // When the read buffer has data that can still be part of the garbage terminator
-                let mut found = {
-                    let data_buf = data.buf_ref();
-                    let mut to_consume = cmp::min(data_buf.len(), insurance_len);
-
-                    self.read_buffer.extend_from_slice(&data_buf[..to_consume]);
-
-                    // If terminator found, actually consume the buffer
-                    if let Some((_garbage, rest)) =
-                        find_garbage(&self.read_buffer, other_garbage_terminator)
-                    {
-                        to_consume -= rest.len();
-                        // TODO: replace unwrap
-                        let _ = data.read(&mut vec![0u8; to_consume]).unwrap();
-
-                        // Remove the final bytes that are not part of the garbage
-                        self.read_buffer
-                            .resize(self.read_buffer.len() - rest.len(), 0u8);
-
-                        true
-                    // If terminator not found, restore the read buffer
-                    } else {
-                        self.read_buffer
-                            .resize(self.read_buffer.len() - to_consume, 0u8);
-
-                        false
-                    }
-                };
-
-                // If still not found, look for the garbage terminator in the new data
-                found = if !found {
-                    let data_buf = data.buf_ref();
-                    let res = find_garbage(data_buf, other_garbage_terminator);
-
-                    let (to_consume, found) = if let Some((garbage, _rest)) = res {
-                        (garbage.len(), true)
-                    } else {
-                        (data_buf.len(), false)
-                    };
-
-                    let mut buf = vec![0u8; to_consume];
-                    data.read_exact(&mut buf).unwrap();
-                    self.read_buffer.extend(buf);
-
-                    found
-                } else {
-                    found
-                };
-
-                if self.read_buffer.len() > NUM_GARBAGE_CONTENT_LIMIT + NUM_GARBAGE_TERMINATOR_BYTES
-                {
-                    return (state, Err(GarbageLimitExceededError));
-                }
-
-                if found {
-                    // Here, we expect self.read_buffer to contain the garbage, including the
-                    // terminator
-
-                    let currlen = self.read_buffer.len();
-                    let garbage_len = currlen - other_garbage_terminator.len();
-                    let lhs = cmp::max(prevlen, insurance_len) - insurance_len;
-                    let new_range = lhs..garbage_len;
-                    relay_out
-                        .write_garbage(&self.read_buffer[new_range])
-                        // TODO: replace unwrap
-                        .map_err(|_| "Error writing garbage terminator to relay")
-                        .unwrap();
-                    relay_out.set_eof_garbage();
-
-                    relay_out
-                        .write_terminator(&self.read_buffer[garbage_len..])
-                        // TODO: replace unwrap
-                        .map_err(|_| "Error writing garbage terminator to relay")
-                        .unwrap();
-                    relay_out.set_eof_terminator();
-
-                    let aad: Vec<_> = self.read_buffer.splice(..garbage_len, []).collect();
-                    self.read_buffer.clear();
-
-                    (HandshakeDone(aad), Ok(ProtocolStatus::End))
-                } else {
-                    let currlen = self.read_buffer.len();
-                    let lhs = cmp::max(prevlen, insurance_len) - insurance_len;
-                    let rhs = cmp::max(currlen, insurance_len) - insurance_len;
-                    // The range of data that wasn't relayed and we're sure it's garbage, and is not part of the terminator
-                    let new_range = lhs..rhs;
-                    relay_out
-                        .write_garbage(&self.read_buffer[new_range])
-                        // TODO: replace unwrap
-                        .map_err(|_| "Error writing garbage terminator to relay")
-                        .unwrap();
-
-                    (state, Ok(ProtocolStatus::End))
-                }
-            }
-            state @ HandshakeDone(_) => (state, Ok(ProtocolStatus::End)),
+        // Forward key bytes to relay
+        let key_bytes = self.parser.drain_key_bytes();
+        if !key_bytes.is_empty() {
+            self.relay_out
+                .borrow_mut()
+                .write_key(&key_bytes)
+                .map_err(ReadError)?;
         }
-    }
+        if self.parser.is_key_eof() {
+            self.relay_out.borrow_mut().set_eof_key();
+        }
 
-    fn take_state(&mut self) -> Self::State {
-        self.state.take().unwrap()
-    }
+        // Forward garbage bytes to relay
+        let garbage_bytes = self.parser.drain_garbage_bytes();
+        if !garbage_bytes.is_empty() {
+            self.relay_out
+                .borrow_mut()
+                .write_garbage(&garbage_bytes)
+                .map_err(ReadError)?;
+        }
+        if self.parser.is_garbage_eof() {
+            self.relay_out.borrow_mut().set_eof_garbage();
+        }
 
-    fn set_state(&mut self, state: Self::State) {
-        self.state = Some(state);
+        // Forward terminator bytes to relay
+        let terminator_bytes = self.parser.drain_terminator_bytes();
+        if !terminator_bytes.is_empty() {
+            self.relay_out
+                .borrow_mut()
+                .write_terminator(&terminator_bytes)
+                .map_err(ReadError)?;
+            self.relay_out.borrow_mut().set_eof_terminator();
+        }
+
+        Ok(status)
     }
 }
 
 pub struct MitmHandshakeImpersonatorLegWriter {
-    state: Option<HandshakeRelayPeerState>,
-
+    pub parser: HandshakeWriteParser,
     relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
-
-    key_to_send: Rc<RefCell<Vec<u8>>>,
-    cipher: Rc<RefCell<Option<CipherSession>>>,
-    garbage_terminator_to_send: Rc<RefCell<Vec<u8>>>,
 }
 
 impl MitmHandshakeImpersonatorLegWriter {
     pub fn new(
         relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
-        key_to_send: Rc<RefCell<Vec<u8>>>,
-        cipher: Rc<RefCell<Option<CipherSession>>>,
-        garbage_terminator_to_send: Rc<RefCell<Vec<u8>>>,
+        parser: HandshakeWriteParser,
     ) -> Self {
-        Self {
-            state: Some(HandshakeRelayPeerState::new()),
-            relay_in,
-            key_to_send,
-            cipher,
-            garbage_terminator_to_send,
-        }
+        Self { parser, relay_in }
     }
 
     pub fn is_final(&self) -> bool {
-        if let Some(state) = &self.state {
-            state.is_final()
-        } else {
-            false
-        }
+        self.parser.is_done()
+    }
+
+    pub fn writer_started_sending(&self) -> bool {
+        self.parser.writer_started_sending()
     }
 
     pub fn next_phase(self) -> Option<MitmImpersonatorLegWriter> {
-        if !self.is_final() {
+        if !self.parser.has_outbound_cipher() {
             return None;
-        };
-
-        // TODO: replace unwrap
-        let outbound_cipher = self
-            .cipher
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .consume_outbound()
-            .unwrap();
-
-        Some(MitmImpersonatorLegWriter::new(
+        }
+        let data_writer = self.parser.into_data_writer();
+        Some(MitmImpersonatorLegWriter::new_from_parser(
             self.relay_in,
-            outbound_cipher,
+            data_writer,
         ))
     }
 }
 
-impl ProtocolWriteParser for MitmHandshakeImpersonatorLegWriter {
-    type State = HandshakeRelayPeerState;
+impl StreamWriteParser for MitmHandshakeImpersonatorLegWriter {
     type Error = ();
 
-    fn transition(
-        &mut self,
-        state: Self::State,
-        data: &mut dyn BufWriter,
-    ) -> (Self::State, Result<ProtocolStatus, Self::Error>) {
-        use HandshakeRelayPeerState::*;
-
-        match state {
-            state @ SendingKey => {
-                let mut key_to_send = self.key_to_send.borrow_mut();
-
-                let limit = cmp::min(data.remaining(), key_to_send.len());
-                let mut _key_buf = vec![0u8; limit];
-                // TODO: replace unwrap
-                let size = self.relay_in.borrow_mut().read_key(&mut _key_buf).unwrap();
-
-                data.write_all(&key_to_send[..size]).unwrap();
-                key_to_send.splice(..size, []);
-
-                if key_to_send.is_empty() {
-                    (SendingGarbage, Ok(ProtocolStatus::Continue))
-                } else {
-                    (state, Ok(ProtocolStatus::End))
-                }
+    fn step(&mut self, data: &mut dyn BufWriter) -> Result<ProtocolStatus, Self::Error> {
+        if self.parser.is_sending_key() {
+            // Pacing: only write as many key bytes as the real peer has signalled
+            let available = self.relay_in.borrow().peek_len_key();
+            if available == 0 {
+                return Ok(ProtocolStatus::End);
             }
-            state @ SendingGarbage => {
-                let limit = data.remaining();
-                let mut buf = vec![0u8; limit];
-                // TODO: replace unwrap
-                let size = self.relay_in.borrow_mut().read_garbage(&mut buf).unwrap();
-
-                data.write_all(&buf[..size]).unwrap();
-
-                if self.relay_in.borrow().peek_len_garbage() == 0
-                    && self.relay_in.borrow().is_eof_garbage()
-                {
-                    (SendingGarbageTerminator, Ok(ProtocolStatus::Continue))
-                } else {
-                    (state, Ok(ProtocolStatus::End))
-                }
+            let limit = cmp::min(available, data.remaining());
+            let mut pacing_buf = vec![0u8; limit];
+            let size = self
+                .relay_in
+                .borrow_mut()
+                .read_key(&mut pacing_buf)
+                .unwrap();
+            if size == 0 {
+                return Ok(ProtocolStatus::End);
             }
-            state @ SendingGarbageTerminator => {
-                let mut garbage_terminator_to_send = self.garbage_terminator_to_send.borrow_mut();
-                let limit = cmp::min(data.remaining(), garbage_terminator_to_send.len());
-                let mut _terminator_buf = vec![0u8; limit];
-                let size = self
-                    .relay_in
-                    .borrow_mut()
-                    // TODO: replace unwrap
-                    .read_terminator(&mut _terminator_buf)
-                    .unwrap();
-
-                // The terminator is replaced by ours. We're not using the original one
-                data.write_all(&garbage_terminator_to_send[..size]).unwrap();
-                garbage_terminator_to_send.splice(..size, []);
-
-                if garbage_terminator_to_send.is_empty() {
-                    (HandshakeDone, Ok(ProtocolStatus::End))
-                } else {
-                    (state, Ok(ProtocolStatus::End))
-                }
-            }
-            state @ HandshakeDone => (state, Ok(ProtocolStatus::End)),
+            let mut limited = LimitedWriter {
+                inner: data,
+                limit: size,
+            };
+            return self.parser.step(&mut limited);
         }
-    }
 
-    fn take_state(&mut self) -> Self::State {
-        self.state.take().unwrap()
-    }
+        if self.parser.is_sending_garbage() {
+            // Push available relay garbage into parser, then step
+            let available = self.relay_in.borrow().peek_len_garbage();
+            if available > 0 {
+                let mut buf = vec![0u8; available];
+                let size = self.relay_in.borrow_mut().read_garbage(&mut buf).unwrap();
+                self.parser.push_garbage_bytes(&buf[..size]);
+            }
+            if self.relay_in.borrow().is_eof_garbage() {
+                self.parser.set_garbage_eof();
+            }
+        }
 
-    fn set_state(&mut self, state: Self::State) {
-        self.state = Some(state);
+        if self.parser.is_sending_terminator() {
+            // Pacing: only write as many terminator bytes as the real peer has sent
+            let available = self.relay_in.borrow().peek_len_terminator();
+            if available == 0 {
+                return Ok(ProtocolStatus::End);
+            }
+            let limit = cmp::min(available, data.remaining());
+            let mut pacing_buf = vec![0u8; limit];
+            let size = self
+                .relay_in
+                .borrow_mut()
+                .read_terminator(&mut pacing_buf)
+                .unwrap();
+            if size == 0 {
+                return Ok(ProtocolStatus::End);
+            }
+            let mut limited = LimitedWriter {
+                inner: data,
+                limit: size,
+            };
+            return self.parser.step(&mut limited);
+        }
+
+        self.parser.step(data)
     }
 }
 
 pub struct MitmImpersonatorLegReader {
-    state: Option<DataBIP324State>,
-    remaining: usize,
-    aad: Vec<u8>,
-
-    inbound_cipher: InboundCipher,
-
+    parser: DataReadParser,
     relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
 }
 
@@ -760,163 +500,60 @@ impl MitmImpersonatorLegReader {
     pub fn new(
         aad: AADType,
         relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
-        mut inbound_cipher: InboundCipher,
+        inbound_cipher: InboundCipher,
     ) -> Self {
-        let length_decryptor = inbound_cipher
-            .get_new_length_decryptor()
-            .expect("The inbound cipher can't create a length decryptor");
+        let parser = DataReadParser::new(aad.clone(), inbound_cipher);
         relay_out.borrow_mut().set_aad(&aad);
-        Self {
-            state: Some(DataBIP324State::ReceivingPacketLen(length_decryptor)),
-            remaining: NUM_LENGTH_BYTES,
-            aad,
-            inbound_cipher,
-            relay_out,
-        }
+        Self { parser, relay_out }
     }
 
-    fn consume_aad(&mut self) -> Vec<u8> {
-        self.aad.drain(..).collect()
-    }
-
-    pub fn set_aad(&mut self, aad: Vec<u8>) {
-        self.aad = aad;
+    /// Create a data-phase reader from an already-built `DataReadParser`.
+    ///
+    /// `aad` must be the same garbage content that was fed to `DataReadParser::new()` so that
+    /// the relay is informed of the connection's AAD before the first packet arrives.
+    pub(crate) fn new_from_parser(
+        relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
+        parser: DataReadParser,
+        aad: &[u8],
+    ) -> Self {
+        relay_out.borrow_mut().set_aad(aad);
+        Self { parser, relay_out }
     }
 }
 
-impl ProtocolReadParser for MitmImpersonatorLegReader {
-    type State = DataBIP324State;
+impl StreamReadParser for MitmImpersonatorLegReader {
     type Error = ();
 
-    fn transition(
-        &mut self,
-        state: Self::State,
-        data: &mut dyn BufReader,
-    ) -> (Self::State, Result<ProtocolStatus, Self::Error>) {
-        use DataBIP324State::*;
+    fn step(&mut self, data: &mut dyn BufReader) -> Result<ProtocolStatus, Self::Error> {
+        let status = self.parser.step(data)?;
 
-        let data_buf = data.buf_ref();
-        let to_consume = cmp::min(self.remaining, data_buf.len());
-        let mut data_to_process = data_buf[..to_consume].to_vec();
-        self.remaining -= to_consume;
-
-        let (next_state, res) = match state {
-            ReceivingPacketLen(mut length_decryptor) => {
-                // TODO: replace unwrap
-                length_decryptor
-                    .decrypt_len_part_inplace(&mut data_to_process)
-                    .unwrap();
-
-                self.relay_out
-                    .borrow_mut()
-                    .write_length_bytes(&data_to_process);
-
-                match length_decryptor.try_end() {
-                    Ok((length_cipher, packet_len)) => {
-                        // TODO: replace unwrap
-                        self.inbound_cipher
-                            .reown_length_cipher(length_cipher)
-                            .unwrap();
-
-                        if packet_len > MAX_PACKET_SIZE_FOR_ALLOCATION {
-                            // TODO: replace panic
-                            panic!("Packet too big");
-                        }
-
-                        let stream_cipher = self
-                            .inbound_cipher
-                            .packet_cipher
-                            .start_one_payload_stream_encryption();
-
-                        // Add 1 for the header byte, which is not included in the length
-                        self.remaining = packet_len + 1;
-                        (
-                            ReceivingPacketContent(stream_cipher),
-                            Ok(ProtocolStatus::Continue),
-                        )
-                    }
-                    // This is just the initial length_decryptor
-                    // We have this weird pattern because we want the length decryptor to be
-                    // consumed conditionally (only when when length_decryptor received all the
-                    // necessary bytes)
-                    Err(new_length_decryptor) => (
-                        ReceivingPacketLen(new_length_decryptor),
-                        Ok(ProtocolStatus::End),
-                    ),
-                }
-            }
-            ReceivingPacketContent(mut stream_cipher) => {
-                stream_cipher.decrypt_and_store_chunk(&mut data_to_process);
-                self.relay_out
-                    .borrow_mut()
-                    .write_data_bytes(&data_to_process);
-
-                if self.remaining == 0 {
-                    let aad = self.consume_aad();
-                    let tag = stream_cipher.get_tag(Some(&aad[..]));
-
-                    self.remaining = NUM_TAG_BYTES;
-                    (
-                        ReceivingPacketTag(tag.to_vec()),
-                        Ok(ProtocolStatus::Continue),
-                    )
-                } else {
-                    (
-                        ReceivingPacketContent(stream_cipher),
-                        Ok(ProtocolStatus::End),
-                    )
-                }
-            }
-            ReceivingPacketTag(mut expected_tag) => {
-                if data_to_process != expected_tag[..data_to_process.len()] {
-                    // TODO: replace panic
-                    panic!("AEAD tag check fail");
-                }
-                expected_tag.drain(..data_to_process.len());
-
-                self.relay_out
-                    .borrow_mut()
-                    .write_tag_bytes(&data_to_process);
-                if self.remaining == 0 {
-                    let length_decryptor = self
-                        .inbound_cipher
-                        .get_new_length_decryptor()
-                        .expect("The inbound cipher can't create a length decryptor");
-
-                    self.remaining = NUM_LENGTH_BYTES;
-                    (
-                        ReceivingPacketLen(length_decryptor),
-                        Ok(ProtocolStatus::Continue),
-                    )
-                } else {
-                    (ReceivingPacketTag(expected_tag), Ok(ProtocolStatus::End))
-                }
-            }
-        };
-
-        if res.is_ok() {
-            let _ = data.read(&mut vec![0u8; to_consume]).unwrap();
-        } else {
-            // TODO: see if you can represent this through typing
-            self.remaining += to_consume;
+        let length_bytes = self.parser.drain_length_bytes();
+        if !length_bytes.is_empty() {
+            self.relay_out
+                .borrow_mut()
+                .write_length_bytes(&length_bytes);
         }
 
-        (next_state, res)
-    }
+        let data_bytes = self.parser.drain_data_bytes();
+        if !data_bytes.is_empty() {
+            self.relay_out.borrow_mut().write_data_bytes(&data_bytes);
+        }
 
-    fn take_state(&mut self) -> Self::State {
-        self.state.take().unwrap()
-    }
+        let tag_bytes = self.parser.drain_tag_bytes();
+        if !tag_bytes.is_empty() {
+            self.relay_out.borrow_mut().write_tag_bytes(&tag_bytes);
+        }
 
-    fn set_state(&mut self, state: Self::State) {
-        self.state = Some(state);
+        if let Some(aad) = self.parser.take_aad() {
+            self.relay_out.borrow_mut().set_aad(&aad);
+        }
+
+        Ok(status)
     }
 }
 
 pub struct MitmImpersonatorLegWriter {
-    state: Option<LegWriterState>,
-
-    outbound_cipher: OutboundCipher,
+    parser: DataWriteParser,
     relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
 }
 
@@ -925,122 +562,53 @@ impl MitmImpersonatorLegWriter {
         relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
         outbound_cipher: OutboundCipher,
     ) -> Self {
-        Self {
-            state: Some(LegWriterState::new()),
-            outbound_cipher,
-            relay_in,
-        }
+        let parser = DataWriteParser::new(outbound_cipher);
+        Self { parser, relay_in }
+    }
+
+    pub(crate) fn new_from_parser(
+        relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
+        parser: DataWriteParser,
+    ) -> Self {
+        Self { parser, relay_in }
     }
 }
 
-impl ProtocolWriteParser for MitmImpersonatorLegWriter {
-    type State = LegWriterState;
+impl StreamWriteParser for MitmImpersonatorLegWriter {
     type Error = ();
 
-    fn transition(
-        &mut self,
-        state: Self::State,
-        data: &mut dyn BufWriter,
-    ) -> (Self::State, Result<ProtocolStatus, Self::Error>) {
-        use LegWriterState::*;
-
-        let mut relay_in = self.relay_in.borrow_mut();
-
-        match state {
-            SendingLength(remaining, written) => {
-                // TODO: replace unwrap
-                let buf = data.prewrite(relay_in.peek_length_bytes()).unwrap();
-
-                let size = relay_in.read_length_bytes(buf);
-                if size > remaining {
-                    // TODO: replace panic
-                    panic!("Received too many length bytes from the input relay");
-                }
-
-                // Append the written data before encrypting it
-                let new_written = [&written[..], &buf[..size]].concat();
-
-                self.outbound_cipher
-                    .encrypt_len_part_inplace(&mut buf[..size]);
-
-                if size == remaining {
-                    let length_bytes: [u8; 8] =
-                        [new_written, vec![0u8; 5]].concat().try_into().unwrap();
-                    // Add 1 for the header, which is not included in the length
-                    let payload_len = 1 + usize::from_le_bytes(length_bytes);
-                    let stream_cipher = self
-                        .outbound_cipher
-                        .packet_cipher
-                        .start_one_payload_stream_encryption();
-
-                    (
-                        SendingPayload(payload_len, stream_cipher),
-                        Ok(ProtocolStatus::Continue),
-                    )
-                } else {
-                    let new_remaining = remaining - size;
-                    (
-                        SendingLength(new_remaining, new_written),
-                        Ok(ProtocolStatus::End),
-                    )
-                }
-            }
-            SendingPayload(remaining, mut stream_cipher) => {
-                // TODO: replace unwrap
-                let buf = data.prewrite(relay_in.peek_data_bytes()).unwrap();
-
-                let size = relay_in.read_data_bytes(buf);
-                // TODO: replace panic
-                if size > remaining {
-                    panic!("Received too many data bytes from the input relay");
-                }
-
-                stream_cipher.encrypt_and_store_chunk(&mut buf[..size]);
-
-                if size == remaining {
-                    let aad = relay_in.read_aad().unwrap_or(vec![]);
-                    let tag = stream_cipher.get_tag(Some(&aad));
-                    self.outbound_cipher.packet_cipher.end_current_stream(&aad);
-                    (SendingTag(tag.to_vec()), Ok(ProtocolStatus::Continue))
-                } else {
-                    (
-                        SendingPayload(remaining - size, stream_cipher),
-                        Ok(ProtocolStatus::End),
-                    )
-                }
-            }
-            SendingTag(mut tag) => {
-                // TODO: replace unwrap
-                let buf = data.prewrite(relay_in.peek_tag_bytes()).unwrap();
-
-                let size = relay_in.read_tag_bytes(buf);
-                if size > tag.len() {
-                    // TODO: replace panic
-                    panic!("Received too many tag bytes from the input relay");
-                }
-
-                // Overwrite with our own tag
-                buf[..size].copy_from_slice(&tag.drain(0..size).collect::<Vec<_>>());
-
-                if tag.is_empty() {
-                    (
-                        SendingLength(NUM_LENGTH_BYTES, vec![]),
-                        Ok(ProtocolStatus::Continue),
-                    )
-                } else {
-                    (SendingTag(tag), Ok(ProtocolStatus::End))
-                }
+    fn step(&mut self, data: &mut dyn BufWriter) -> Result<ProtocolStatus, Self::Error> {
+        // Only push new bytes from relay when the parser has consumed the previous segment.
+        // This prevents mixing bytes from different packets into the same parser input buffer.
+        if self.parser.peek_input_length_bytes() == 0 {
+            let available = self.relay_in.borrow().peek_length_bytes();
+            if available > 0 {
+                let mut buf = vec![0u8; available];
+                let size = self.relay_in.borrow_mut().read_length_bytes(&mut buf);
+                self.parser.push_length_bytes(&buf[..size]);
             }
         }
-    }
+        if self.parser.peek_input_data_bytes() == 0 {
+            let available = self.relay_in.borrow().peek_data_bytes();
+            if available > 0 {
+                let mut buf = vec![0u8; available];
+                let size = self.relay_in.borrow_mut().read_data_bytes(&mut buf);
+                self.parser.push_data_bytes(&buf[..size]);
+            }
+        }
+        if self.parser.peek_input_tag_bytes() == 0 {
+            let available = self.relay_in.borrow().peek_tag_bytes();
+            if available > 0 {
+                let mut buf = vec![0u8; available];
+                let size = self.relay_in.borrow_mut().read_tag_bytes(&mut buf);
+                self.parser.push_tag_bytes(&buf[..size]);
+            }
+        }
+        if let Some(aad) = self.relay_in.borrow_mut().read_aad() {
+            self.parser.set_aad(&aad);
+        }
 
-    fn take_state(&mut self) -> Self::State {
-        // TODO: remove unwrap
-        self.state.take().unwrap()
-    }
-
-    fn set_state(&mut self, state: Self::State) {
-        self.state = Some(state);
+        self.parser.step(data)
     }
 }
 
@@ -1304,8 +872,8 @@ mod mitmfakepeerbip324_tests {
     use secp256k1::rand::rngs::mock::StepRng;
     use std::str::FromStr;
 
-    use crate::cipher::{InboundCipher, OutboundCipher, SessionKeyMaterial};
-    use crate::protocol::{NUM_GARBAGE_TERMINATOR_BYTES, PacketType};
+    use crate::cipher::{CipherSession, InboundCipher, OutboundCipher, SessionKeyMaterial};
+    use crate::protocol::{NUM_GARBAGE_TERMINATOR_BYTES, NUM_LENGTH_BYTES, PacketType};
 
     macro_rules! test_data {
         ($varname:ident, $name:ident { $($field:ident: $ty:ty = $val:expr),* $(,)? }) => {
@@ -1564,15 +1132,10 @@ mod mitmfakepeerbip324_tests {
         server
             .consume(&mut bufref)
             .expect("Error on pass_peer_data");
-        assert!(matches!(
-            server.reader_leg_state,
-            Some(ReaderLegState::Handshake(
-                MitmHandshakeImpersonatorLegReader {
-                    state: Some(HandshakeBIP324State::ReceivingKey(..)),
-                    ..
-                }
-            ))
-        ));
+        let Some(ReaderLegState::Handshake(ref reader_leg)) = server.reader_leg_state else {
+            panic!("Expected handshake state");
+        };
+        assert!(reader_leg.is_receiving_key());
 
         // Send another key byte
         let buf = [0xa3];
@@ -1580,15 +1143,10 @@ mod mitmfakepeerbip324_tests {
         server
             .consume(&mut bufref)
             .expect("Error on pass_peer_data");
-        assert!(matches!(
-            server.reader_leg_state,
-            Some(ReaderLegState::Handshake(
-                MitmHandshakeImpersonatorLegReader {
-                    state: Some(HandshakeBIP324State::ReceivingKey(..)),
-                    ..
-                }
-            ))
-        ));
+        let Some(ReaderLegState::Handshake(ref reader_leg)) = server.reader_leg_state else {
+            panic!("Expected handshake state");
+        };
+        assert!(reader_leg.is_receiving_key());
 
         // Send all the key bytes, except for the last one
         let buf = [0x73; NUM_ELLIGATOR_SWIFT_BYTES - 2 - 1];
@@ -1596,15 +1154,10 @@ mod mitmfakepeerbip324_tests {
         server
             .consume(&mut bufref)
             .expect("Error on pass_peer_data");
-        assert!(matches!(
-            server.reader_leg_state,
-            Some(ReaderLegState::Handshake(
-                MitmHandshakeImpersonatorLegReader {
-                    state: Some(HandshakeBIP324State::ReceivingKey(..)),
-                    ..
-                }
-            ))
-        ));
+        let Some(ReaderLegState::Handshake(ref reader_leg)) = server.reader_leg_state else {
+            panic!("Expected handshake state");
+        };
+        assert!(reader_leg.is_receiving_key());
 
         // Send all the key bytes, except for the last one
         let buf = [0x29];
@@ -1612,15 +1165,10 @@ mod mitmfakepeerbip324_tests {
         server
             .consume(&mut bufref)
             .expect("Error on pass_peer_data");
-        assert!(matches!(
-            server.reader_leg_state,
-            Some(ReaderLegState::Handshake(
-                MitmHandshakeImpersonatorLegReader {
-                    state: Some(HandshakeBIP324State::ReceivingGarbage(..)),
-                    ..
-                }
-            ))
-        ));
+        let Some(ReaderLegState::Handshake(ref reader_leg)) = server.reader_leg_state else {
+            panic!("Expected handshake state");
+        };
+        assert!(reader_leg.is_receiving_garbage());
     }
 
     #[test]
@@ -1633,15 +1181,10 @@ mod mitmfakepeerbip324_tests {
         server
             .consume(&mut bufref)
             .expect("Error on pass_peer_data");
-        assert!(matches!(
-            server.reader_leg_state,
-            Some(ReaderLegState::Handshake(
-                MitmHandshakeImpersonatorLegReader {
-                    state: Some(HandshakeBIP324State::ReceivingGarbage(..)),
-                    ..
-                }
-            ))
-        ));
+        let Some(ReaderLegState::Handshake(ref reader_leg)) = server.reader_leg_state else {
+            panic!("Expected handshake state");
+        };
+        assert!(reader_leg.is_receiving_garbage());
     }
 
     #[test]
@@ -1654,15 +1197,10 @@ mod mitmfakepeerbip324_tests {
         server
             .consume(&mut bufref)
             .expect("Error on pass_peer_data");
-        assert!(matches!(
-            server.reader_leg_state,
-            Some(ReaderLegState::Handshake(
-                MitmHandshakeImpersonatorLegReader {
-                    state: Some(HandshakeBIP324State::ReceivingGarbage(..)),
-                    ..
-                }
-            ))
-        ));
+        let Some(ReaderLegState::Handshake(ref reader_leg)) = server.reader_leg_state else {
+            panic!("Expected handshake state");
+        };
+        assert!(reader_leg.is_receiving_garbage());
     }
 
     // Tests that the fake server doesn't relay the key if the real server
@@ -1677,15 +1215,10 @@ mod mitmfakepeerbip324_tests {
         server
             .consume(&mut bufref)
             .expect("Error on pass_peer_data");
-        assert!(matches!(
-            server.reader_leg_state,
-            Some(ReaderLegState::Handshake(
-                MitmHandshakeImpersonatorLegReader {
-                    state: Some(HandshakeBIP324State::ReceivingGarbage(..)),
-                    ..
-                }
-            ))
-        ));
+        let Some(ReaderLegState::Handshake(ref reader_leg)) = server.reader_leg_state else {
+            panic!("Expected handshake state");
+        };
+        assert!(reader_leg.is_receiving_garbage());
 
         let mut buf = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
         let buf_len = buf.len();
@@ -1718,7 +1251,7 @@ mod mitmfakepeerbip324_tests {
         };
 
         assert_eq!(
-            *reader_leg.key_to_send.borrow(),
+            reader_leg.parser.elligator_swift_bytes(),
             server_key,
             "The generated secret key is different from the expected one"
         );
@@ -1728,21 +1261,20 @@ mod mitmfakepeerbip324_tests {
             .consume(&mut client_keyref)
             .expect("Error on pass_peer_data");
 
-        let Some(ReaderLegState::Handshake(reader_leg)) = &server.reader_leg_state else {
+        let Some(ReaderLegState::Handshake(ref reader_leg)) = server.reader_leg_state else {
             panic!("Wrong leg state");
         };
-        let Some(HandshakeBIP324State::ReceivingGarbage(other_garbage_terminator)) =
-            reader_leg.state
-        else {
-            panic!("Wrong state after receiving key");
-        };
+        assert!(reader_leg.is_receiving_garbage());
+        let other_garbage_terminator = *reader_leg
+            .inbound_garbage_terminator()
+            .expect("Expected garbage terminator to be set");
 
-        let Some(ReaderLegState::Handshake(reader_leg)) = server.reader_leg_state else {
+        let Some(ReaderLegState::Handshake(ref mut reader_leg)) = server.reader_leg_state else {
             panic!("Wrong leg state");
         };
 
-        let cipher = reader_leg.cipher.borrow_mut().take().unwrap();
-        let (inbound_cipher, outbound_cipher) = cipher.into_split();
+        let inbound_cipher = reader_leg.parser.take_inbound_cipher().unwrap();
+        let outbound_cipher = reader_leg.parser.take_outbound_cipher().unwrap();
 
         assert_eq!(inbound_cipher.length_cipher.unwrap().key_bytes, initiator_l);
         assert_eq!(inbound_cipher.packet_cipher.key_bytes, initiator_p);
@@ -1763,15 +1295,10 @@ mod mitmfakepeerbip324_tests {
         server
             .consume(&mut bufref)
             .expect("Error on pass_peer_data");
-        assert!(matches!(
-            server.reader_leg_state,
-            Some(ReaderLegState::Handshake(
-                MitmHandshakeImpersonatorLegReader {
-                    state: Some(HandshakeBIP324State::ReceivingGarbage(..)),
-                    ..
-                }
-            ))
-        ));
+        let Some(ReaderLegState::Handshake(ref reader_leg)) = server.reader_leg_state else {
+            panic!("Expected handshake state");
+        };
+        assert!(reader_leg.is_receiving_garbage());
 
         let buf = [0u8];
         let mut out_buf = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];

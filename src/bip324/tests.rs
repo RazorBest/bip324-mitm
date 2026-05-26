@@ -594,6 +594,7 @@ fn test_terminator_waits_for_ecdh() {
     // Parser is stuck at SendingGarbageTerminator, not Done
     assert!(!parser.is_done());
     assert!(parser.is_sending_terminator());
+    assert_eq!(buf, vec![0u8; 200]);
 }
 
 // 9. Create a handshake pair for Role::Responder using HANDSHAKE_PARAMS1.

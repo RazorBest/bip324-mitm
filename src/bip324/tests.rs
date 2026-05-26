@@ -899,7 +899,7 @@ fn test_aad_mismatch_panics() {
     // Alice encrypts with encryption_aad; Bob's parser expects reader_aad — mismatch.
     let ct = cipher_encrypt_packet_with_aad(&mut alice_out, b"version", &encryption_aad);
     let mut parser = DataReadParser::new(reader_aad, bob_in);
-    let mut data = &ct[..];
+    let mut data = ct.as_slice();
     parser.consume(&mut data).unwrap();
 }
 
@@ -917,7 +917,7 @@ fn test_corrupt_tag_panics() {
     ciphertext[len - 1] ^= 0xFF;
 
     let mut parser = DataReadParser::new(vec![], bob_in);
-    let mut data = &ciphertext[..];
+    let mut data = ciphertext.as_slice();
     parser.consume(&mut data).unwrap();
 }
 
@@ -943,14 +943,14 @@ fn test_known_vectors() {
     let mut parser = DataReadParser::new(vec![], bob_in);
 
     // Consume warmup packet
-    let mut data = &warmup_ct[..];
+    let mut data = warmup_ct.as_slice();
     parser.consume(&mut data).unwrap();
     parser.drain_length_bytes();
     parser.drain_data_bytes();
     parser.drain_tag_bytes();
 
     // Consume known vector packet
-    let mut data = &ct[..];
+    let mut data = ct.as_slice();
     parser.consume(&mut data).unwrap();
 
     let length_bytes = parser.drain_length_bytes();

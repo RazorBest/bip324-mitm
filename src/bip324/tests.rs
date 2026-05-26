@@ -109,7 +109,7 @@ fn secret_key_bytes_from_rng<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> [u8; 32
 
 fn reader_from_rng<Rng: RngCore + CryptoRng>(role: Role, rng: &mut Rng) -> HandshakeReadParser {
     let bytes = secret_key_bytes_from_rng(rng);
-    let point = crate::key_from_secret_bytes(bytes).unwrap();
+    let point = key_from_secret_bytes(bytes).unwrap();
     super::new_handshake_pair(role, MAGIC, point).0
 }
 
@@ -311,7 +311,7 @@ fn test_set_ecdh_point_during_key() {
     let server_point = {
         let mut rng = insecurerng(server_seed);
         let bytes = secret_key_bytes_from_rng(&mut rng);
-        crate::key_from_secret_bytes(bytes).unwrap()
+        key_from_secret_bytes(bytes).unwrap()
     };
     parser.set_ecdh_point(server_point).unwrap();
 
@@ -353,7 +353,7 @@ fn test_set_ecdh_point_after_key() {
     let server_point = {
         let mut rng = insecurerng(server_seed);
         let bytes = secret_key_bytes_from_rng(&mut rng);
-        crate::key_from_secret_bytes(bytes).unwrap()
+        key_from_secret_bytes(bytes).unwrap()
     };
     parser.set_ecdh_point(server_point).unwrap();
 
@@ -579,7 +579,7 @@ fn test_cipher_session_derivation_writer() {
 
     let mut rng = insecurerng(server_seed);
     let bytes = secret_key_bytes_from_rng(&mut rng);
-    let point = crate::key_from_secret_bytes(bytes).unwrap();
+    let point = key_from_secret_bytes(bytes).unwrap();
     let (mut reader, mut writer) = super::new_handshake_pair(Role::Responder, MAGIC, point);
 
     let mut buf = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];

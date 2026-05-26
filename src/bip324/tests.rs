@@ -1315,44 +1315,12 @@ fn test_full_protocol_flow() {
     assert_writer_has_consumed(&mut encrypt_parser);
 }
 
-// 3. Demonstrate that the protocol parsers work entirely standalone:
-//    no FakePeerRelay, no external wrapper types are involved.
-//    The reader and writer are created as a coupled pair via new_handshake_pair.
+// 3. Verify that data parsers generated from handshake material encrypt and decrypt correctly:
+//    DataWriteParser encrypts with alice's outbound cipher; DataReadParser decrypts with bob's inbound cipher.
 #[test]
-fn test_protocol_parsers_standalone() {
-    let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
-    let bob_key = key_from_secret_bytes(BOB_SECRET).unwrap();
+fn test_that_data_parsers_from_handshake_material_are_correct() {
+    let (_alice_inbound, alice_outbound, bob_inbound, _bob_outbound) = complete_handshake();
 
-    let (mut alice_hs, mut alice_hs_w) = super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
-    let (mut bob_hs, mut bob_hs_w) = super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
-
-    alice_hs_w.set_garbage_eof();
-    bob_hs_w.set_garbage_eof();
-
-    // Produce key bytes from each writer
-    let mut alice_wire_key = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-    alice_hs_w.produce(&mut alice_wire_key.as_mut_slice()).unwrap();
-    let mut bob_wire_key = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-    bob_hs_w.produce(&mut bob_wire_key.as_mut_slice()).unwrap();
-
-    // Cross-feed key bytes to readers (triggers ECDH on both sides)
-    alice_hs.consume(&mut bob_wire_key.as_slice()).unwrap();
-    bob_hs.consume(&mut alice_wire_key.as_slice()).unwrap();
-
-    // Produce garbage terminators (ECDH complete, terminator in shared state)
-    let mut alice_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
-    alice_hs_w.produce(&mut alice_term.as_mut_slice()).unwrap();
-    let mut bob_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
-    bob_hs_w.produce(&mut bob_term.as_mut_slice()).unwrap();
-
-    // Cross-feed terminators to readers
-    alice_hs.consume(&mut bob_term.as_slice()).unwrap();
-    bob_hs.consume(&mut alice_term.as_slice()).unwrap();
-
-    let alice_outbound = alice_hs.take_outbound_cipher().unwrap();
-    let bob_inbound = bob_hs.take_inbound_cipher().unwrap();
-
-    // Alice → Bob data transfer using only pure parser objects
     let msg = b"standalone parsers work without any external infrastructure";
     let mut write = DataWriteParser::new(alice_outbound);
     let ct = encrypt_with_parser(&mut write, msg, None);

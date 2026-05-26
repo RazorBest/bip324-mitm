@@ -402,6 +402,91 @@ fn test_set_ecdh_point_error_after_writer_started() {
     );
 }
 
+// 10. Verify is_receiving_key() is true before key bytes are fully received,
+//     and is_receiving_garbage() is true after key is complete.
+#[test]
+fn test_state_transitions() {
+    let mut parser = reader_from_seed(Role::Responder, 1010);
+    assert!(parser.is_receiving_key());
+    assert!(!parser.is_receiving_garbage());
+
+    let TestHandshakeParams { client_key, .. } = HANDSHAKE_PARAMS1;
+    let mut data = &client_key[..];
+    parser.consume(&mut data).unwrap();
+
+    assert!(!parser.is_receiving_key());
+    assert!(parser.is_receiving_garbage());
+}
+
+// 11. elligator_swift_bytes() returns the parser's own ellswift key.
+#[test]
+fn test_elligator_swift_bytes() {
+    let point = key_from_secret_bytes(ALICE_SECRET).unwrap();
+    let expected = point.elligator_swift.to_array();
+    let (reader, _) = super::new_handshake_pair(Role::Initiator, MAGIC, point);
+    assert_eq!(reader.elligator_swift_bytes(), expected);
+}
+
+// 12. After a complete handshake, take_aad() returns the garbage bytes that were received.
+#[test]
+fn test_take_aad_after_handshake() {
+    let TestHandshakeParams {
+        server_seed,
+        client_key,
+        client_garbage_terminator,
+        ..
+    } = HANDSHAKE_PARAMS1;
+
+    let mut parser = reader_from_seed(Role::Responder, server_seed);
+
+    let garbage = [0xCCu8; 15];
+    let mut input = Vec::new();
+    input.extend_from_slice(&client_key);
+    input.extend_from_slice(&garbage);
+    input.extend_from_slice(&client_garbage_terminator);
+
+    let mut data = &input[..];
+    parser.consume(&mut data).unwrap();
+
+    assert!(parser.is_handshake_done());
+    let aad = parser.take_aad().expect("Expected AAD after handshake done");
+    assert_eq!(aad, garbage, "AAD must equal the received garbage bytes");
+}
+
+// 13. After receiving the peer's full key and completing ECDH,
+//     outbound_garbage_terminator() returns Some.
+#[test]
+fn test_outbound_garbage_terminator_after_ecdh() {
+    let TestHandshakeParams {
+        server_seed,
+        client_key,
+        ..
+    } = HANDSHAKE_PARAMS1;
+
+    let mut parser = reader_from_seed(Role::Responder, server_seed);
+    let mut data = &client_key[..];
+    parser.consume(&mut data).unwrap();
+
+    assert!(
+        parser.outbound_garbage_terminator().is_some(),
+        "outbound_garbage_terminator must be Some after ECDH"
+    );
+}
+
+// 14. set_ecdh_point returns Ok when called before the writer has started sending.
+#[test]
+fn test_set_ecdh_point_ok_before_writer_starts() {
+    let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
+    let new_key = key_from_secret_bytes(BOB_SECRET).unwrap();
+    let (mut reader, _writer) = super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
+
+    let result = reader.set_ecdh_point(new_key);
+    assert!(
+        result.is_ok(),
+        "set_ecdh_point should succeed before writer starts sending"
+    );
+}
+
 const KEY_LEN: usize = NUM_ELLIGATOR_SWIFT_BYTES;
 const TERMINATOR_LEN: usize = NUM_GARBAGE_TERMINATOR_BYTES;
 
@@ -1273,42 +1358,7 @@ fn test_multiple_packets_roundtrip() {
     }
 }
 
-// 5. set_ecdh_point fails once the writer has started sending key bytes.
-#[test]
-fn test_set_ecdh_point_after_writer_started() {
-    let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
-    let new_key = key_from_secret_bytes(BOB_SECRET).unwrap();
-
-    let (mut reader, mut writer) = super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
-
-    // Start sending key bytes -- this sets writer_started_sending = true
-    let mut buf = vec![0u8; 1];
-    writer.produce(&mut buf.as_mut_slice()).unwrap();
-
-    // Now set_ecdh_point must return an error
-    let result = reader.set_ecdh_point(new_key);
-    assert!(
-        result.is_err(),
-        "set_ecdh_point should fail after writer started sending"
-    );
-}
-
-// 6. set_ecdh_point succeeds before the writer has started sending key bytes.
-#[test]
-fn test_set_ecdh_point_before_writer_started() {
-    let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
-    let new_key = key_from_secret_bytes(BOB_SECRET).unwrap();
-
-    let (mut reader, _writer) = super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
-
-    let result = reader.set_ecdh_point(new_key);
-    assert!(
-        result.is_ok(),
-        "set_ecdh_point should succeed before writer starts sending"
-    );
-}
-
-// 7. Both sides use new_handshake_pair and derive matching cipher sessions.
+// 5. Both sides use new_handshake_pair and derive matching cipher sessions.
 #[test]
 fn test_coupled_handshake() {
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
@@ -1357,7 +1407,7 @@ fn test_coupled_handshake() {
     );
 }
 
-// 8. The writer produces the correct ellswift bytes without any explicit key injection.
+// 6. The writer produces the correct ellswift bytes without any explicit key injection.
 #[test]
 fn test_writer_reads_key_from_shared_state() {
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
@@ -1429,7 +1479,7 @@ fn do_full_handshake() -> (
     (alice_reader, alice_writer, bob_reader, bob_writer)
 }
 
-// 9. Complete a handshake, call into_data_reader(), feed encrypted data to the resulting
+// 7. Complete a handshake, call into_data_reader(), feed encrypted data to the resulting
 //    DataReadParser, and verify decryption works.
 #[test]
 fn test_handshake_reader_into_data_reader() {
@@ -1453,7 +1503,7 @@ fn test_handshake_reader_into_data_reader() {
     assert_eq!(&decrypted[1..], plaintext);
 }
 
-// 10. Complete a handshake, call into_data_writer(), encrypt data, and verify decryption.
+// 8. Complete a handshake, call into_data_writer(), encrypt data, and verify decryption.
 #[test]
 fn test_handshake_writer_into_data_writer() {
     let (alice_reader, alice_writer, bob_reader, _bob_writer) = do_full_handshake();
@@ -1476,7 +1526,7 @@ fn test_handshake_writer_into_data_writer() {
     assert_eq!(&decrypted[1..], plaintext);
 }
 
-// 11. Both sides do handshake → data transition. Side A encrypts, side B decrypts.
+// 9. Both sides do handshake → data transition. Side A encrypts, side B decrypts.
 //     This replaces/extends test_full_protocol_flow by using the new transition methods
 //     instead of take_ciphers().
 #[test]
@@ -1505,7 +1555,7 @@ fn test_full_transition_roundtrip() {
     );
 }
 
-// 12. Call into_data_reader() before the handshake completes → should panic.
+// 10. Call into_data_reader() before the handshake completes → should panic.
 #[test]
 #[should_panic(expected = "Handshake must be done before transitioning to data phase")]
 fn test_into_data_reader_panics_if_not_done() {

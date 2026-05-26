@@ -912,11 +912,9 @@ fn test_corrupt_tag_panics() {
     let plaintext = b"tag corruption test";
     let mut ciphertext = cipher_encrypt_packet(&mut alice_out, plaintext);
 
-    // Corrupt all 16 tag bytes at the end
+    // Corrupt a single tag byte — sufficient to fail the AEAD check.
     let len = ciphertext.len();
-    for byte in &mut ciphertext[len - NUM_TAG_BYTES..] {
-        *byte ^= 0xFF;
-    }
+    ciphertext[len - 1] ^= 0xFF;
 
     let mut parser = DataReadParser::new(vec![], bob_in);
     let mut data = &ciphertext[..];

@@ -1219,34 +1219,7 @@ const BOB_SECRET: [u8; 32] =
 
 // Complete a BIP-324 handshake using new_handshake_pair. Returns ciphers for both sides.
 fn complete_handshake() -> (InboundCipher, OutboundCipher, InboundCipher, OutboundCipher) {
-    let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
-    let bob_key = key_from_secret_bytes(BOB_SECRET).unwrap();
-
-    let bob_wire_key = bob_key.elligator_swift.to_array().to_vec();
-    let alice_wire_key = alice_key.elligator_swift.to_array().to_vec();
-
-    let (mut alice_reader, _alice_writer) =
-        super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
-    let (mut bob_reader, _bob_writer) = super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
-
-    // Exchange public keys
-    alice_reader.consume(&mut bob_wire_key.as_slice()).unwrap();
-    bob_reader.consume(&mut alice_wire_key.as_slice()).unwrap();
-
-    // Exchange garbage terminators (no garbage content -- empty garbage is valid)
-    let alice_outbound_term = alice_reader.outbound_garbage_terminator().unwrap().to_vec();
-    let bob_outbound_term = bob_reader.outbound_garbage_terminator().unwrap().to_vec();
-
-    alice_reader
-        .consume(&mut bob_outbound_term.as_slice())
-        .unwrap();
-    bob_reader
-        .consume(&mut alice_outbound_term.as_slice())
-        .unwrap();
-
-    assert!(alice_reader.is_handshake_done());
-    assert!(bob_reader.is_handshake_done());
-
+    let (mut alice_reader, _, mut bob_reader, _) = do_full_handshake();
     let alice_inbound = alice_reader.take_inbound_cipher().unwrap();
     let alice_outbound = alice_reader.take_outbound_cipher().unwrap();
     let bob_inbound = bob_reader.take_inbound_cipher().unwrap();
@@ -1305,25 +1278,41 @@ fn test_handshake_roundtrip() {
     );
 
     // Both sides complete the handshake via parsers alone
-    let bob_wire_key = bob_key_for_parser.elligator_swift.to_array().to_vec();
-    let alice_wire_key = alice_key_for_parser.elligator_swift.to_array().to_vec();
-
-    let (mut alice_parser, _) =
+    let (mut alice_parser, mut alice_hs_writer) =
         super::new_handshake_pair(Role::Initiator, MAGIC, alice_key_for_parser);
-    let (mut bob_parser, _) = super::new_handshake_pair(Role::Responder, MAGIC, bob_key_for_parser);
+    let (mut bob_parser, mut bob_hs_writer) =
+        super::new_handshake_pair(Role::Responder, MAGIC, bob_key_for_parser);
 
+    alice_hs_writer.set_garbage_eof();
+    bob_hs_writer.set_garbage_eof();
+
+    // Produce key bytes from each writer
+    let mut alice_wire_key = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+    alice_hs_writer
+        .produce(&mut alice_wire_key.as_mut_slice())
+        .unwrap();
+    let mut bob_wire_key = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+    bob_hs_writer
+        .produce(&mut bob_wire_key.as_mut_slice())
+        .unwrap();
+
+    // Cross-feed key bytes to readers (triggers ECDH on both sides)
     alice_parser.consume(&mut bob_wire_key.as_slice()).unwrap();
     bob_parser.consume(&mut alice_wire_key.as_slice()).unwrap();
 
-    let alice_outbound_term = alice_parser.outbound_garbage_terminator().unwrap().to_vec();
-    let bob_outbound_term = bob_parser.outbound_garbage_terminator().unwrap().to_vec();
+    // Produce garbage terminators (ECDH complete, terminator in shared state)
+    let mut alice_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
+    alice_hs_writer
+        .produce(&mut alice_term.as_mut_slice())
+        .unwrap();
+    let mut bob_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
+    bob_hs_writer
+        .produce(&mut bob_term.as_mut_slice())
+        .unwrap();
 
-    alice_parser
-        .consume(&mut bob_outbound_term.as_slice())
-        .unwrap();
-    bob_parser
-        .consume(&mut alice_outbound_term.as_slice())
-        .unwrap();
+    // Cross-feed terminators to readers
+    alice_parser.consume(&mut bob_term.as_slice()).unwrap();
+    bob_parser.consume(&mut alice_term.as_slice()).unwrap();
 
     assert!(
         alice_parser.is_handshake_done(),
@@ -1367,19 +1356,29 @@ fn test_protocol_parsers_standalone() {
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
     let bob_key = key_from_secret_bytes(BOB_SECRET).unwrap();
 
-    let bob_wire_key = bob_key.elligator_swift.to_array().to_vec();
-    let alice_wire_key = alice_key.elligator_swift.to_array().to_vec();
+    let (mut alice_hs, mut alice_hs_w) = super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
+    let (mut bob_hs, mut bob_hs_w) = super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
 
-    let (mut alice_hs, _alice_w) = super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
-    let (mut bob_hs, _bob_w) = super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
+    alice_hs_w.set_garbage_eof();
+    bob_hs_w.set_garbage_eof();
 
-    // Key exchange
+    // Produce key bytes from each writer
+    let mut alice_wire_key = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+    alice_hs_w.produce(&mut alice_wire_key.as_mut_slice()).unwrap();
+    let mut bob_wire_key = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+    bob_hs_w.produce(&mut bob_wire_key.as_mut_slice()).unwrap();
+
+    // Cross-feed key bytes to readers (triggers ECDH on both sides)
     alice_hs.consume(&mut bob_wire_key.as_slice()).unwrap();
     bob_hs.consume(&mut alice_wire_key.as_slice()).unwrap();
 
-    // Terminator exchange
-    let alice_term = alice_hs.outbound_garbage_terminator().unwrap().to_vec();
-    let bob_term = bob_hs.outbound_garbage_terminator().unwrap().to_vec();
+    // Produce garbage terminators (ECDH complete, terminator in shared state)
+    let mut alice_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
+    alice_hs_w.produce(&mut alice_term.as_mut_slice()).unwrap();
+    let mut bob_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
+    bob_hs_w.produce(&mut bob_term.as_mut_slice()).unwrap();
+
+    // Cross-feed terminators to readers
     alice_hs.consume(&mut bob_term.as_slice()).unwrap();
     bob_hs.consume(&mut alice_term.as_slice()).unwrap();
 
@@ -1428,20 +1427,31 @@ fn test_coupled_handshake() {
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
     let bob_key = key_from_secret_bytes(BOB_SECRET).unwrap();
 
-    let alice_wire = alice_key.elligator_swift.to_array().to_vec();
-    let bob_wire = bob_key.elligator_swift.to_array().to_vec();
-
-    let (mut alice_reader, _alice_writer) =
+    let (mut alice_reader, mut alice_hs_writer) =
         super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
-    let (mut bob_reader, _bob_writer) = super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
+    let (mut bob_reader, mut bob_hs_writer) =
+        super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
 
-    // Exchange keys
+    alice_hs_writer.set_garbage_eof();
+    bob_hs_writer.set_garbage_eof();
+
+    // Produce key bytes from each writer
+    let mut alice_wire = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+    alice_hs_writer.produce(&mut alice_wire.as_mut_slice()).unwrap();
+    let mut bob_wire = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+    bob_hs_writer.produce(&mut bob_wire.as_mut_slice()).unwrap();
+
+    // Cross-feed key bytes to readers (triggers ECDH)
     alice_reader.consume(&mut bob_wire.as_slice()).unwrap();
     bob_reader.consume(&mut alice_wire.as_slice()).unwrap();
 
-    // Exchange terminators
-    let alice_term = alice_reader.outbound_garbage_terminator().unwrap().to_vec();
-    let bob_term = bob_reader.outbound_garbage_terminator().unwrap().to_vec();
+    // Produce garbage terminators (ECDH complete, terminator in shared state)
+    let mut alice_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
+    alice_hs_writer.produce(&mut alice_term.as_mut_slice()).unwrap();
+    let mut bob_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
+    bob_hs_writer.produce(&mut bob_term.as_mut_slice()).unwrap();
+
+    // Cross-feed terminators to readers
     alice_reader.consume(&mut bob_term.as_slice()).unwrap();
     bob_reader.consume(&mut alice_term.as_slice()).unwrap();
 
@@ -1489,7 +1499,8 @@ fn test_writer_reads_key_from_shared_state() {
 }
 
 // Helper: run a full BIP-324 handshake for both sides using new_handshake_pair.
-// Returns (alice_reader, alice_writer, bob_reader, bob_writer), all in HandshakeDone state.
+// Returns (alice_reader, alice_writer, bob_reader, bob_writer), all in HandshakeDone/Done state.
+// All bytes flow through produce() → consume(); no internal state is accessed directly.
 fn do_full_handshake() -> (
     HandshakeReadParser,
     HandshakeWriteParser,
@@ -1499,46 +1510,44 @@ fn do_full_handshake() -> (
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
     let bob_key = key_from_secret_bytes(BOB_SECRET).unwrap();
 
-    let bob_wire_key = bob_key.elligator_swift.to_array().to_vec();
-    let alice_wire_key = alice_key.elligator_swift.to_array().to_vec();
-
     let (mut alice_reader, mut alice_writer) =
         super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
     let (mut bob_reader, mut bob_writer) =
         super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
 
-    // Exchange public keys (also derives ECDH, making outbound_garbage_terminator available)
+    alice_writer.set_garbage_eof();
+    bob_writer.set_garbage_eof();
+
+    // Phase 1: each writer produces its ellswift key bytes
+    let mut alice_wire_key = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+    alice_writer.produce(&mut alice_wire_key.as_mut_slice()).unwrap();
+    let mut bob_wire_key = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+    bob_writer.produce(&mut bob_wire_key.as_mut_slice()).unwrap();
+
+    // Phase 2: readers consume peer key bytes, triggering ECDH on both sides
     alice_reader.consume(&mut bob_wire_key.as_slice()).unwrap();
     bob_reader.consume(&mut alice_wire_key.as_slice()).unwrap();
 
-    // Exchange garbage terminators (no garbage content)
-    let alice_term = alice_reader.outbound_garbage_terminator().unwrap().to_vec();
-    let bob_term = bob_reader.outbound_garbage_terminator().unwrap().to_vec();
+    // Phase 3: writers produce garbage terminators (ECDH complete, terminator in shared state)
+    let mut alice_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
+    alice_writer.produce(&mut alice_term.as_mut_slice()).unwrap();
+    assert!(
+        alice_writer.is_done(),
+        "alice writer must reach Done after produce()"
+    );
+    let mut bob_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
+    bob_writer.produce(&mut bob_term.as_mut_slice()).unwrap();
+    assert!(
+        bob_writer.is_done(),
+        "bob writer must reach Done after produce()"
+    );
 
+    // Phase 4: readers consume peer garbage terminators, completing the handshake
     alice_reader.consume(&mut bob_term.as_slice()).unwrap();
     bob_reader.consume(&mut alice_term.as_slice()).unwrap();
 
     assert!(alice_reader.is_handshake_done());
     assert!(bob_reader.is_handshake_done());
-
-    // Drive write parsers to Done: send key bytes + no garbage + garbage terminator.
-    // ECDH is complete, so outbound_garbage_terminator is in shared state.
-    alice_writer.set_garbage_eof();
-    bob_writer.set_garbage_eof();
-
-    let mut discard = vec![0u8; 256];
-    alice_writer.produce(&mut discard.as_mut_slice()).unwrap();
-    assert!(
-        alice_writer.is_done(),
-        "alice writer must reach Done after produce()"
-    );
-
-    let mut discard = vec![0u8; 256];
-    bob_writer.produce(&mut discard.as_mut_slice()).unwrap();
-    assert!(
-        bob_writer.is_done(),
-        "bob writer must reach Done after produce()"
-    );
 
     (alice_reader, alice_writer, bob_reader, bob_writer)
 }

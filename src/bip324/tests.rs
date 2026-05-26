@@ -169,8 +169,8 @@ fn test_parse_key_overflow() {
     assert!(parser.is_key_eof());
 }
 
-// 4. Feed HANDSHAKE_PARAMS1.client_key as the peer's key. Verify take_ciphers()
-//    returns Some((inbound, outbound)). Confirm derived key material matches
+// 4. Feed HANDSHAKE_PARAMS1.client_key as the peer's key. Verify take_inbound_cipher()
+//    and take_outbound_cipher() each return Some. Confirm derived key material matches
 //    expected vectors.
 #[test]
 fn test_cipher_session_derivation() {
@@ -558,6 +558,66 @@ fn test_terminator_waits_for_ecdh() {
     // Parser is stuck at SendingGarbageTerminator, not Done
     assert!(!parser.is_done());
     assert!(parser.is_sending_terminator());
+}
+
+// 9. Create a handshake pair for Role::Responder using HANDSHAKE_PARAMS1.
+//    Verify the writer produces server_key. Feed client_key to the paired reader.
+//    Confirm derived key material and outbound garbage terminator match expected vectors.
+#[test]
+fn test_cipher_session_derivation_writer() {
+    let TestHandshakeParams {
+        server_seed,
+        server_key,
+        server_garbage_terminator,
+        client_key,
+        initiator_l,
+        initiator_p,
+        responder_l,
+        responder_p,
+        ..
+    } = HANDSHAKE_PARAMS1;
+
+    let mut rng = insecurerng(server_seed);
+    let bytes = secret_key_bytes_from_rng(&mut rng);
+    let point = crate::key_from_secret_bytes(bytes).unwrap();
+    let (mut reader, mut writer) = super::new_handshake_pair(Role::Responder, MAGIC, point);
+
+    let mut buf = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+    writer.produce(&mut buf.as_mut_slice()).unwrap();
+    assert_eq!(buf, server_key, "writer key bytes mismatch");
+
+    let mut data = &client_key[..];
+    reader.consume(&mut data).unwrap();
+
+    let inbound = reader
+        .take_inbound_cipher()
+        .expect("Expected inbound cipher after key phase");
+    let outbound = reader
+        .take_outbound_cipher()
+        .expect("Expected outbound cipher after key phase");
+
+    assert_eq!(
+        inbound.length_cipher.unwrap().key_bytes,
+        initiator_l,
+        "inbound length key mismatch"
+    );
+    assert_eq!(
+        inbound.packet_cipher.key_bytes, initiator_p,
+        "inbound packet key mismatch"
+    );
+    assert_eq!(
+        outbound.length_cipher.key_bytes, responder_l,
+        "outbound length key mismatch"
+    );
+    assert_eq!(
+        outbound.packet_cipher.key_bytes, responder_p,
+        "outbound packet key mismatch"
+    );
+
+    let outbound_term = reader
+        .outbound_garbage_terminator()
+        .expect("Expected outbound garbage terminator");
+    assert_eq!(outbound_term, server_garbage_terminator);
 }
 
 // Data read tests

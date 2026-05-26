@@ -1011,6 +1011,15 @@ fn encrypt_with_parser(
     out
 }
 
+// Assert the writer holds no pending input: produce into a 1-byte buffer and
+// verify the slice was not advanced (nothing was written).
+fn assert_writer_has_consumed(parser: &mut DataWriteParser) {
+    let mut buf = [0u8; 1];
+    let mut slice: &mut [u8] = &mut buf;
+    parser.produce(&mut slice).unwrap();
+    assert_eq!(slice.len(), 1, "writer has unconsumed data");
+}
+
 // 1. Push 3 length bytes + header+payload + 16 tag bytes. produce(). Decrypt the output
 //    with matching InboundCipher. Verify roundtrip.
 #[test]
@@ -1027,6 +1036,7 @@ fn test_encrypt_single_packet() {
 
     // msg[0] is the header byte; msg[1..] is plaintext
     assert_eq!(&msg[1..], plaintext);
+    assert_writer_has_consumed(&mut parser);
 }
 
 // 2. Push one byte at a time. step() after each. Verify correct encrypted output.
@@ -1060,6 +1070,7 @@ fn test_encrypt_byte_by_byte() {
     let (_pkt_type, msg) = bob_in.decrypt_in_place(&mut ct_body, None).unwrap();
 
     assert_eq!(&msg[1..], plaintext);
+    assert_writer_has_consumed(&mut parser);
 }
 
 // 3. Push two packets' worth of data. Verify both encrypted correctly.
@@ -1086,6 +1097,7 @@ fn test_encrypt_multiple_packets() {
     let mut body2 = ct2[NUM_LENGTH_BYTES..NUM_LENGTH_BYTES + len2].to_vec();
     let (_pkt, msg) = bob_in.decrypt_in_place(&mut body2, None).unwrap();
     assert_eq!(&msg[1..], msg2.as_slice());
+    assert_writer_has_consumed(&mut parser);
 }
 
 // 4. Set AAD before first packet. Verify encrypted output decrypts correctly with matching AAD.
@@ -1106,6 +1118,7 @@ fn test_encrypt_with_aad() {
         .unwrap();
 
     assert_eq!(&msg[1..], plaintext);
+    assert_writer_has_consumed(&mut parser);
 }
 
 // 5. Push arbitrary tag bytes (not matching computed tag). Verify output uses the parser's
@@ -1161,6 +1174,7 @@ fn test_roundtrip_with_data_read_parser() {
     // data_bytes[0] = header byte, data_bytes[1..] = plaintext
     assert_eq!(data_bytes[0], 0x00, "genuine packet header byte");
     assert_eq!(&data_bytes[1..], plaintext);
+    assert_writer_has_consumed(&mut write_parser);
 }
 
 // Integration tests
@@ -1310,6 +1324,7 @@ fn test_full_protocol_flow() {
         plaintext,
         "Decrypted payload must match original plaintext"
     );
+    assert_writer_has_consumed(&mut encrypt_parser);
 }
 
 // 3. Demonstrate that the protocol parsers work entirely standalone:
@@ -1349,6 +1364,7 @@ fn test_protocol_parsers_standalone() {
 
     let plain = read.drain_data_bytes();
     assert_eq!(&plain[1..], msg);
+    assert_writer_has_consumed(&mut write);
 }
 
 // 4. Multiple consecutive packets through DataWriteParser → DataReadParser.
@@ -1371,6 +1387,7 @@ fn test_multiple_packets_roundtrip() {
         let decrypted = read_parser.drain_data_bytes();
         assert_eq!(&decrypted[1..], *expected, "Packet {i} roundtrip failed");
     }
+    assert_writer_has_consumed(&mut write_parser);
 }
 
 // 5. Both sides use new_handshake_pair and derive matching cipher sessions.
@@ -1516,6 +1533,7 @@ fn test_handshake_reader_into_data_reader() {
 
     assert_eq!(decrypted[0], 0x00, "Expected genuine header byte");
     assert_eq!(&decrypted[1..], plaintext);
+    assert_writer_has_consumed(&mut alice_data_writer);
 }
 
 // 8. Complete a handshake, call into_data_writer(), encrypt data, and verify decryption.
@@ -1539,6 +1557,7 @@ fn test_handshake_writer_into_data_writer() {
 
     assert_eq!(decrypted[0], 0x00, "Expected genuine header byte");
     assert_eq!(&decrypted[1..], plaintext);
+    assert_writer_has_consumed(&mut alice_data_writer);
 }
 
 // 9. Both sides do handshake → data transition. Side A encrypts, side B decrypts.
@@ -1568,6 +1587,7 @@ fn test_full_transition_roundtrip() {
         plaintext,
         "Decrypted payload must match original plaintext"
     );
+    assert_writer_has_consumed(&mut alice_data_writer);
 }
 
 // 10. Call into_data_reader() before the handshake completes → should panic.

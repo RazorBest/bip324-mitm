@@ -1227,24 +1227,6 @@ fn complete_handshake() -> (InboundCipher, OutboundCipher, InboundCipher, Outbou
     (alice_inbound, alice_outbound, bob_inbound, bob_outbound)
 }
 
-// Encrypt one plaintext packet with DataWriteParser and return the ciphertext.
-fn encrypt_packet(parser: &mut DataWriteParser, plaintext: &[u8]) -> Vec<u8> {
-    let len_val = plaintext.len() as u32;
-    let length_bytes = len_val.to_le_bytes()[..NUM_LENGTH_BYTES].to_vec();
-    let mut data_bytes = vec![0x00u8]; // genuine header byte
-    data_bytes.extend_from_slice(plaintext);
-    let tag_placeholder = vec![0u8; NUM_TAG_BYTES]; // pacing only; parser overwrites with real AEAD tag
-
-    parser.push_length_bytes(&length_bytes);
-    parser.push_data_bytes(&data_bytes);
-    parser.push_tag_bytes(&tag_placeholder);
-
-    let out_len = NUM_LENGTH_BYTES + data_bytes.len() + NUM_TAG_BYTES;
-    let mut out = vec![0u8; out_len];
-    parser.produce(&mut out.as_mut_slice()).unwrap();
-    out
-}
-
 // 1. Both sides exchange keys via HandshakeReadParser and independently derive a matching
 //    session ID. Verifies the ECDH is symmetric and the parsers report completion.
 #[test]
@@ -1300,7 +1282,7 @@ fn test_handshake_roundtrip() {
     alice_parser.consume(&mut bob_wire_key.as_slice()).unwrap();
     bob_parser.consume(&mut alice_wire_key.as_slice()).unwrap();
 
-    // Produce garbage terminators (ECDH complete, terminator in shared state)
+    // Produce garbage terminators 
     let mut alice_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
     alice_hs_writer
         .produce(&mut alice_term.as_mut_slice())
@@ -1333,7 +1315,7 @@ fn test_full_protocol_flow() {
     let plaintext = b"hello from alice to bob";
 
     let mut encrypt_parser = DataWriteParser::new(alice_outbound);
-    let ciphertext = encrypt_packet(&mut encrypt_parser, plaintext);
+    let ciphertext = encrypt_with_parser(&mut encrypt_parser, plaintext, None);
 
     let mut decrypt_parser = DataReadParser::new(vec![], bob_inbound);
     decrypt_parser.consume(&mut ciphertext.as_slice()).unwrap();
@@ -1388,7 +1370,7 @@ fn test_protocol_parsers_standalone() {
     // Alice → Bob data transfer using only pure parser objects
     let msg = b"standalone parsers work without any external infrastructure";
     let mut write = DataWriteParser::new(alice_outbound);
-    let ct = encrypt_packet(&mut write, msg);
+    let ct = encrypt_with_parser(&mut write, msg, None);
 
     let mut read = DataReadParser::new(vec![], bob_inbound);
     read.consume(&mut ct.as_slice()).unwrap();
@@ -1409,7 +1391,7 @@ fn test_multiple_packets_roundtrip() {
     let mut write_parser = DataWriteParser::new(alice_outbound);
     let ciphertexts: Vec<Vec<u8>> = messages
         .iter()
-        .map(|msg| encrypt_packet(&mut write_parser, msg))
+        .map(|msg| encrypt_with_parser(&mut write_parser, msg, None))
         .collect();
 
     let mut read_parser = DataReadParser::new(vec![], bob_inbound);
@@ -1567,7 +1549,7 @@ fn test_handshake_reader_into_data_reader() {
 
     // Alice encrypts, bob decrypts
     let plaintext = b"into_data_reader test";
-    let ciphertext = encrypt_packet(&mut alice_data_writer, plaintext);
+    let ciphertext = encrypt_with_parser(&mut alice_data_writer, plaintext, None);
 
     bob_data_reader.consume(&mut ciphertext.as_slice()).unwrap();
     let decrypted = bob_data_reader.drain_data_bytes();
@@ -1591,7 +1573,7 @@ fn test_handshake_writer_into_data_writer() {
     let (mut bob_data_reader, _) = bob_reader.into_data_reader();
 
     let plaintext = b"into_data_writer test";
-    let ciphertext = encrypt_packet(&mut alice_data_writer, plaintext);
+    let ciphertext = encrypt_with_parser(&mut alice_data_writer, plaintext, None);
 
     bob_data_reader.consume(&mut ciphertext.as_slice()).unwrap();
     let decrypted = bob_data_reader.drain_data_bytes();
@@ -1617,7 +1599,7 @@ fn test_full_transition_roundtrip() {
 
     // Alice encrypts → Bob decrypts
     let plaintext = b"full transition roundtrip";
-    let ciphertext = encrypt_packet(&mut alice_data_writer, plaintext);
+    let ciphertext = encrypt_with_parser(&mut alice_data_writer, plaintext, None);
 
     bob_data_reader.consume(&mut ciphertext.as_slice()).unwrap();
     let decrypted = bob_data_reader.drain_data_bytes();

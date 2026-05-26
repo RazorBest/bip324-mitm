@@ -886,7 +886,24 @@ fn test_aad_first_packet() {
     );
 }
 
-// 5. Feed correct length + content, then corrupt tag bytes. Verify panic.
+// 5. Encrypt a packet with AAD_A; create parser with a different AAD_B.
+//    Verify consume() panics with "AEAD tag check fail".
+#[test]
+#[should_panic(expected = "AEAD tag check fail")]
+fn test_aad_mismatch_panics() {
+    let (mut alice_out, bob_in) = make_cipher_pair();
+
+    let encryption_aad: Vec<u8> = vec![0xAA; 32];
+    let reader_aad: Vec<u8> = vec![0xBB; 32];
+
+    // Alice encrypts with encryption_aad; Bob's parser expects reader_aad — mismatch.
+    let ct = cipher_encrypt_packet_with_aad(&mut alice_out, b"version", &encryption_aad);
+    let mut parser = DataReadParser::new(reader_aad, bob_in);
+    let mut data = &ct[..];
+    parser.consume(&mut data).unwrap();
+}
+
+// 6. Feed correct length + content, then corrupt tag bytes. Verify panic.
 #[test]
 #[should_panic(expected = "AEAD tag check fail")]
 fn test_corrupt_tag_panics() {
@@ -906,7 +923,7 @@ fn test_corrupt_tag_panics() {
     parser.consume(&mut data).unwrap();
 }
 
-// 6. Use known session keys. Verify the parser decodes the known ciphertext vector.
+// 7. Use known session keys. Verify the parser decodes the known ciphertext vector.
 //    Matches test_vector_1 in cipher.rs: alice encrypts [0x8e] after one warmup packet,
 //    producing ciphertext "7530d2a18720162ac09c25329a60d75adf36eda3c3".
 #[test]

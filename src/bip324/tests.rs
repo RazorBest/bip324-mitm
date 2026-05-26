@@ -1259,42 +1259,27 @@ fn test_handshake_roundtrip() {
         "Session IDs must match from both sides"
     );
 
-    // Both sides complete the handshake via parsers alone
-    let (mut alice_parser, mut alice_hs_writer) =
-        super::new_handshake_pair(Role::Initiator, MAGIC, alice_key_for_parser);
-    let (mut bob_parser, mut bob_hs_writer) =
-        super::new_handshake_pair(Role::Responder, MAGIC, bob_key_for_parser);
+    // Both sides complete the handshake via HandshakeReadParser alone
+    let mut alice_parser =
+        super::new_handshake_pair(Role::Initiator, MAGIC, alice_key_for_parser).0;
+    let mut bob_parser =
+        super::new_handshake_pair(Role::Responder, MAGIC, bob_key_for_parser).0;
 
-    alice_hs_writer.set_garbage_eof();
-    bob_hs_writer.set_garbage_eof();
-
-    // Produce key bytes from each writer
-    let mut alice_wire_key = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-    alice_hs_writer
-        .produce(&mut alice_wire_key.as_mut_slice())
-        .unwrap();
-    let mut bob_wire_key = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-    bob_hs_writer
-        .produce(&mut bob_wire_key.as_mut_slice())
-        .unwrap();
-
-    // Cross-feed key bytes to readers (triggers ECDH on both sides)
+    // Cross-feed key bytes directly from each parser's ellswift point (triggers ECDH on both sides)
+    let alice_wire_key = alice_parser.elligator_swift_bytes();
+    let bob_wire_key = bob_parser.elligator_swift_bytes();
     alice_parser.consume(&mut bob_wire_key.as_slice()).unwrap();
     bob_parser.consume(&mut alice_wire_key.as_slice()).unwrap();
 
-    // Produce garbage terminators 
-    let mut alice_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
-    alice_hs_writer
-        .produce(&mut alice_term.as_mut_slice())
+    // Fetch outbound garbage terminators from parsers and cross-feed to complete handshake
+    let alice_outbound_term = alice_parser.outbound_garbage_terminator().unwrap();
+    let bob_outbound_term = bob_parser.outbound_garbage_terminator().unwrap();
+    alice_parser
+        .consume(&mut bob_outbound_term.as_slice())
         .unwrap();
-    let mut bob_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
-    bob_hs_writer
-        .produce(&mut bob_term.as_mut_slice())
+    bob_parser
+        .consume(&mut alice_outbound_term.as_slice())
         .unwrap();
-
-    // Cross-feed terminators to readers
-    alice_parser.consume(&mut bob_term.as_slice()).unwrap();
-    bob_parser.consume(&mut alice_term.as_slice()).unwrap();
 
     assert!(
         alice_parser.is_handshake_done(),

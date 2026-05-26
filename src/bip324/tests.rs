@@ -366,43 +366,7 @@ fn test_set_ecdh_point_after_key() {
     assert_eq!(outbound.packet_cipher.key_bytes, responder_p);
 }
 
-// 9. set_ecdh_point returns an error once the writer has started sending, even
-//    when called after the full peer key has been received (ReceivingGarbage).
-//    Mirrors the setup of test_set_ecdh_point_after_key but commits the writer first.
-#[test]
-fn test_set_ecdh_point_error_after_writer_started() {
-    let TestHandshakeParams {
-        server_seed,
-        client_key,
-        ..
-    } = HANDSHAKE_PARAMS1;
-
-    let server_point = {
-        let mut rng = insecurerng(server_seed);
-        let bytes = secret_key_bytes_from_rng(&mut rng);
-        key_from_secret_bytes(bytes).unwrap()
-    };
-    let (mut reader, mut writer) =
-        super::new_handshake_pair(Role::Responder, MAGIC, server_point);
-
-    // Feed full client key so reader moves to ReceivingGarbage (same as test_set_ecdh_point_after_key)
-    let mut data = &client_key[..];
-    reader.consume(&mut data).unwrap();
-
-    // Commit the writer: once it has sent any byte, key replacement is forbidden
-    let mut buf = vec![0u8; 1];
-    writer.produce(&mut buf.as_mut_slice()).unwrap();
-
-    // Any replacement point must now be rejected
-    let replacement = key_from_secret_bytes(ALICE_SECRET).unwrap();
-    let result = reader.set_ecdh_point(replacement);
-    assert!(
-        result.is_err(),
-        "set_ecdh_point must fail after writer has started sending"
-    );
-}
-
-// 10. Verify is_receiving_key() is true before key bytes are fully received,
+// 9. Verify is_receiving_key() is true before key bytes are fully received,
 //     and is_receiving_garbage() is true after key is complete.
 #[test]
 fn test_state_transitions() {
@@ -418,7 +382,7 @@ fn test_state_transitions() {
     assert!(parser.is_receiving_garbage());
 }
 
-// 11. elligator_swift_bytes() returns the parser's own ellswift key.
+// 10. elligator_swift_bytes() returns the parser's own ellswift key.
 #[test]
 fn test_elligator_swift_bytes() {
     let point = key_from_secret_bytes(ALICE_SECRET).unwrap();
@@ -427,7 +391,7 @@ fn test_elligator_swift_bytes() {
     assert_eq!(reader.elligator_swift_bytes(), expected);
 }
 
-// 12. After a complete handshake, take_aad() returns the garbage bytes that were received.
+// 11. After a complete handshake, take_aad() returns the garbage bytes that were received.
 #[test]
 fn test_take_aad_after_handshake() {
     let TestHandshakeParams {
@@ -453,7 +417,7 @@ fn test_take_aad_after_handshake() {
     assert_eq!(aad, garbage, "AAD must equal the received garbage bytes");
 }
 
-// 13. After receiving the peer's full key and completing ECDH,
+// 12. After receiving the peer's full key and completing ECDH,
 //     outbound_garbage_terminator() returns Some.
 #[test]
 fn test_outbound_garbage_terminator_after_ecdh() {
@@ -473,7 +437,7 @@ fn test_outbound_garbage_terminator_after_ecdh() {
     );
 }
 
-// 14. set_ecdh_point returns Ok when called before the writer has started sending.
+// 13. set_ecdh_point returns Ok when called before the writer has started sending.
 #[test]
 fn test_set_ecdh_point_ok_before_writer_starts() {
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
@@ -604,7 +568,43 @@ fn test_writer_started_sending_flag() {
     assert!(parser.writer_started_sending());
 }
 
-// 6. Push garbage in small chunks, calling step() after each. Verify output accumulates correctly.
+// 6. set_ecdh_point returns an error once the writer has started sending, even
+//    when called after the full peer key has been received (ReceivingGarbage).
+//    Mirrors the setup of test_set_ecdh_point_after_key but commits the writer first.
+#[test]
+fn test_set_ecdh_point_error_after_writer_started() {
+    let TestHandshakeParams {
+        server_seed,
+        client_key,
+        ..
+    } = HANDSHAKE_PARAMS1;
+
+    let server_point = {
+        let mut rng = insecurerng(server_seed);
+        let bytes = secret_key_bytes_from_rng(&mut rng);
+        key_from_secret_bytes(bytes).unwrap()
+    };
+    let (mut reader, mut writer) =
+        super::new_handshake_pair(Role::Responder, MAGIC, server_point);
+
+    // Feed full client key so reader moves to ReceivingGarbage (same as test_set_ecdh_point_after_key)
+    let mut data = &client_key[..];
+    reader.consume(&mut data).unwrap();
+
+    // Commit the writer: once it has sent any byte, key replacement is forbidden
+    let mut buf = vec![0u8; 1];
+    writer.produce(&mut buf.as_mut_slice()).unwrap();
+
+    // Any replacement point must now be rejected
+    let replacement = key_from_secret_bytes(ALICE_SECRET).unwrap();
+    let result = reader.set_ecdh_point(replacement);
+    assert!(
+        result.is_err(),
+        "set_ecdh_point must fail after writer has started sending"
+    );
+}
+
+// 7. Push garbage in small chunks, calling step() after each. Verify output accumulates correctly.
 #[test]
 fn test_pacing_garbage() {
     let point = key_from_secret_bytes(SECRET_A).unwrap();
@@ -636,7 +636,7 @@ fn test_pacing_garbage() {
     assert_eq!(all_garbage_out, full_garbage);
 }
 
-// 7. Push garbage without setting EOF. Verify parser stays in SendingGarbage and returns End.
+// 8. Push garbage without setting EOF. Verify parser stays in SendingGarbage and returns End.
 #[test]
 fn test_no_output_when_no_garbage_eof() {
     let (mut parser, _) = make_writer();
@@ -659,7 +659,7 @@ fn test_no_output_when_no_garbage_eof() {
     assert!(parser.is_sending_garbage());
 }
 
-// 8. SendingGarbageTerminator waits when outbound_garbage_terminator is not yet ready.
+// 9. SendingGarbageTerminator waits when outbound_garbage_terminator is not yet ready.
 #[test]
 fn test_terminator_waits_for_ecdh() {
     let (mut parser, _) = make_writer();
@@ -682,7 +682,7 @@ fn test_terminator_waits_for_ecdh() {
     assert_eq!(buf, vec![0u8; 200]);
 }
 
-// 9. Create a handshake pair for Role::Responder using HANDSHAKE_PARAMS1.
+// 10. Create a handshake pair for Role::Responder using HANDSHAKE_PARAMS1.
 //    Verify the writer produces server_key. Feed client_key to the paired reader.
 //    Confirm derived key material and outbound garbage terminator match expected vectors.
 #[test]

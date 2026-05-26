@@ -744,7 +744,7 @@ fn test_cipher_session_derivation_writer() {
 
 // Data read tests
 
-// Encrypt plaintext with OutboundCipher (bypassing DataWriteParser, for read-side tests).
+// Encrypt plaintext with OutboundCipher (mocking DataWriteParser, for read-side tests).
 fn cipher_encrypt_packet(outbound: &mut OutboundCipher, plaintext: &[u8]) -> Vec<u8> {
     outbound.encrypt_to_vec(plaintext, PacketType::Genuine, None)
 }

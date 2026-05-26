@@ -366,6 +366,42 @@ fn test_set_ecdh_point_after_key() {
     assert_eq!(outbound.packet_cipher.key_bytes, responder_p);
 }
 
+// 9. set_ecdh_point returns an error once the writer has started sending, even
+//    when called after the full peer key has been received (ReceivingGarbage).
+//    Mirrors the setup of test_set_ecdh_point_after_key but commits the writer first.
+#[test]
+fn test_set_ecdh_point_error_after_writer_started() {
+    let TestHandshakeParams {
+        server_seed,
+        client_key,
+        ..
+    } = HANDSHAKE_PARAMS1;
+
+    let server_point = {
+        let mut rng = insecurerng(server_seed);
+        let bytes = secret_key_bytes_from_rng(&mut rng);
+        key_from_secret_bytes(bytes).unwrap()
+    };
+    let (mut reader, mut writer) =
+        super::new_handshake_pair(Role::Responder, MAGIC, server_point);
+
+    // Feed full client key so reader moves to ReceivingGarbage (same as test_set_ecdh_point_after_key)
+    let mut data = &client_key[..];
+    reader.consume(&mut data).unwrap();
+
+    // Commit the writer: once it has sent any byte, key replacement is forbidden
+    let mut buf = vec![0u8; 1];
+    writer.produce(&mut buf.as_mut_slice()).unwrap();
+
+    // Any replacement point must now be rejected
+    let replacement = key_from_secret_bytes(ALICE_SECRET).unwrap();
+    let result = reader.set_ecdh_point(replacement);
+    assert!(
+        result.is_err(),
+        "set_ecdh_point must fail after writer has started sending"
+    );
+}
+
 const KEY_LEN: usize = NUM_ELLIGATOR_SWIFT_BYTES;
 const TERMINATOR_LEN: usize = NUM_GARBAGE_TERMINATOR_BYTES;
 

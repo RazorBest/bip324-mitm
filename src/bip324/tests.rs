@@ -1121,7 +1121,39 @@ fn test_encrypt_with_aad() {
     assert_writer_has_consumed(&mut parser);
 }
 
-// 5. Push arbitrary tag bytes (not matching computed tag). Verify output uses the parser's
+// 5. Set AAD before first packet; send a second packet without AAD. Verify first decrypts
+//    with matching AAD, and second decrypts with None (AAD is consumed after the first packet).
+#[test]
+fn test_aad_applies_only_to_first_packet() {
+    let (alice_out, mut bob_in) = make_cipher_pair();
+
+    let garbage_aad: Vec<u8> = vec![0xAA; 32];
+    let msg1 = b"aad packet";
+    let msg2 = b"second packet no aad";
+
+    let mut parser = DataWriteParser::new(alice_out);
+    let ct1 = encrypt_with_parser(&mut parser, msg1, Some(&garbage_aad));
+    let ct2 = encrypt_with_parser(&mut parser, msg2, None);
+
+    // First packet must decrypt with the matching AAD.
+    let len1 = bob_in.decrypt_packet_len(ct1[..NUM_LENGTH_BYTES].try_into().unwrap());
+    let mut body1 = ct1[NUM_LENGTH_BYTES..NUM_LENGTH_BYTES + len1].to_vec();
+    let (_pkt, dec1) = bob_in
+        .decrypt_in_place(&mut body1, Some(&garbage_aad))
+        .unwrap();
+    assert_eq!(&dec1[1..], msg1.as_slice());
+
+    // Second packet was encrypted without AAD, so None is the correct key.
+    // If AAD had leaked into the second packet this would fail.
+    let len2 = bob_in.decrypt_packet_len(ct2[..NUM_LENGTH_BYTES].try_into().unwrap());
+    let mut body2 = ct2[NUM_LENGTH_BYTES..NUM_LENGTH_BYTES + len2].to_vec();
+    let (_pkt, dec2) = bob_in.decrypt_in_place(&mut body2, None).unwrap();
+    assert_eq!(&dec2[1..], msg2.as_slice());
+
+    assert_writer_has_consumed(&mut parser);
+}
+
+// 6. Push arbitrary tag bytes (not matching computed tag). Verify output uses the parser's
 //    computed tag (not the input tag bytes).
 #[test]
 fn test_tag_replacement() {
@@ -1156,7 +1188,7 @@ fn test_tag_replacement() {
     assert_eq!(&msg[1..], plaintext);
 }
 
-// 6. Encrypt with DataWriteParser, decrypt with DataReadParser. Verify plaintext matches.
+// 7. Encrypt with DataWriteParser, decrypt with DataReadParser. Verify plaintext matches.
 #[test]
 fn test_roundtrip_with_data_read_parser() {
     let (alice_out, bob_in) = make_cipher_pair();

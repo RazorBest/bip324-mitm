@@ -416,8 +416,8 @@ fn make_writer() -> (HandshakeWriteParser, [u8; KEY_LEN]) {
     (writer, expected_key)
 }
 
-// 1. Create parser with key from shared state. produce() with 64-byte buffer.
-//    Verify all key bytes written match the ellswift bytes.
+// 1. Create writer. Call produce() with a full KEY_LEN buffer.
+//    Verify the output matches the expected ellswift bytes.
 #[test]
 fn test_write_key_complete() {
     let (mut parser, expected_key) = make_writer();

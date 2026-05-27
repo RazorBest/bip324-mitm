@@ -413,7 +413,9 @@ fn test_take_aad_after_handshake() {
     parser.consume(&mut data).unwrap();
 
     assert!(parser.is_handshake_done());
-    let aad = parser.take_aad().expect("Expected AAD after handshake done");
+    let aad = parser
+        .take_aad()
+        .expect("Expected AAD after handshake done");
     assert_eq!(aad, garbage, "AAD must equal the received garbage bytes");
 }
 
@@ -434,20 +436,6 @@ fn test_outbound_garbage_terminator_after_ecdh() {
     assert!(
         parser.outbound_garbage_terminator().is_some(),
         "outbound_garbage_terminator must be Some after ECDH"
-    );
-}
-
-// 13. set_ecdh_point returns Ok when called before the writer has started sending.
-#[test]
-fn test_set_ecdh_point_ok_before_writer_starts() {
-    let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
-    let new_key = key_from_secret_bytes(BOB_SECRET).unwrap();
-    let (mut reader, _writer) = super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
-
-    let result = reader.set_ecdh_point(new_key);
-    assert!(
-        result.is_ok(),
-        "set_ecdh_point should succeed before writer starts sending"
     );
 }
 
@@ -568,7 +556,21 @@ fn test_writer_started_sending_flag() {
     assert!(parser.writer_started_sending());
 }
 
-// 6. set_ecdh_point returns an error once the writer has started sending, even
+// 6. set_ecdh_point returns Ok when called before the writer has started sending.
+#[test]
+fn test_set_ecdh_point_ok_before_writer_starts() {
+    let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
+    let new_key = key_from_secret_bytes(BOB_SECRET).unwrap();
+    let (mut reader, _writer) = super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
+
+    let result = reader.set_ecdh_point(new_key);
+    assert!(
+        result.is_ok(),
+        "set_ecdh_point should succeed before writer starts sending"
+    );
+}
+
+// 7. set_ecdh_point returns an error once the writer has started sending, even
 //    when called after the full peer key has been received (ReceivingGarbage).
 //    Mirrors the setup of test_set_ecdh_point_after_key but commits the writer first.
 #[test]
@@ -584,8 +586,7 @@ fn test_set_ecdh_point_error_after_writer_started() {
         let bytes = secret_key_bytes_from_rng(&mut rng);
         key_from_secret_bytes(bytes).unwrap()
     };
-    let (mut reader, mut writer) =
-        super::new_handshake_pair(Role::Responder, MAGIC, server_point);
+    let (mut reader, mut writer) = super::new_handshake_pair(Role::Responder, MAGIC, server_point);
 
     // Feed full client key so reader moves to ReceivingGarbage (same as test_set_ecdh_point_after_key)
     let mut data = &client_key[..];
@@ -604,7 +605,7 @@ fn test_set_ecdh_point_error_after_writer_started() {
     );
 }
 
-// 7. Push garbage in small chunks, calling step() after each. Verify output accumulates correctly.
+// 8. Push garbage in small chunks, calling step() after each. Verify output accumulates correctly.
 #[test]
 fn test_pacing_garbage() {
     let point = key_from_secret_bytes(SECRET_A).unwrap();
@@ -636,7 +637,7 @@ fn test_pacing_garbage() {
     assert_eq!(all_garbage_out, full_garbage);
 }
 
-// 8. Push garbage without setting EOF. Verify parser stays in SendingGarbage and returns End.
+// 9. Push garbage without setting EOF. Verify parser stays in SendingGarbage and returns End.
 #[test]
 fn test_no_output_when_no_garbage_eof() {
     let (mut parser, _) = make_writer();
@@ -659,7 +660,7 @@ fn test_no_output_when_no_garbage_eof() {
     assert!(parser.is_sending_garbage());
 }
 
-// 9. SendingGarbageTerminator waits when outbound_garbage_terminator is not yet ready.
+// 10. SendingGarbageTerminator waits when outbound_garbage_terminator is not yet ready.
 #[test]
 fn test_terminator_waits_for_ecdh() {
     let (mut parser, _) = make_writer();
@@ -682,7 +683,7 @@ fn test_terminator_waits_for_ecdh() {
     assert_eq!(buf, vec![0u8; 200]);
 }
 
-// 10. Create a handshake pair for Role::Responder using HANDSHAKE_PARAMS1.
+// 11. Create a handshake pair for Role::Responder using HANDSHAKE_PARAMS1.
 //    Verify the writer produces server_key. Feed client_key to the paired reader.
 //    Confirm derived key material and outbound garbage terminator match expected vectors.
 #[test]
@@ -1262,8 +1263,7 @@ fn test_handshake_roundtrip() {
     // Both sides complete the handshake via HandshakeReadParser alone
     let mut alice_parser =
         super::new_handshake_pair(Role::Initiator, MAGIC, alice_key_for_parser).0;
-    let mut bob_parser =
-        super::new_handshake_pair(Role::Responder, MAGIC, bob_key_for_parser).0;
+    let mut bob_parser = super::new_handshake_pair(Role::Responder, MAGIC, bob_key_for_parser).0;
 
     // Cross-feed key bytes directly from each parser's ellswift point (triggers ECDH on both sides)
     let alice_wire_key = alice_parser.elligator_swift_bytes();
@@ -1372,7 +1372,9 @@ fn test_coupled_handshake() {
 
     // Produce key bytes from each writer
     let mut alice_wire = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-    alice_hs_writer.produce(&mut alice_wire.as_mut_slice()).unwrap();
+    alice_hs_writer
+        .produce(&mut alice_wire.as_mut_slice())
+        .unwrap();
     let mut bob_wire = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
     bob_hs_writer.produce(&mut bob_wire.as_mut_slice()).unwrap();
 
@@ -1382,7 +1384,9 @@ fn test_coupled_handshake() {
 
     // Produce garbage terminators (ECDH complete, terminator in shared state)
     let mut alice_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
-    alice_hs_writer.produce(&mut alice_term.as_mut_slice()).unwrap();
+    alice_hs_writer
+        .produce(&mut alice_term.as_mut_slice())
+        .unwrap();
     let mut bob_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
     bob_hs_writer.produce(&mut bob_term.as_mut_slice()).unwrap();
 
@@ -1455,9 +1459,13 @@ fn do_full_handshake() -> (
 
     // Phase 1: each writer produces its ellswift key bytes
     let mut alice_wire_key = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-    alice_writer.produce(&mut alice_wire_key.as_mut_slice()).unwrap();
+    alice_writer
+        .produce(&mut alice_wire_key.as_mut_slice())
+        .unwrap();
     let mut bob_wire_key = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-    bob_writer.produce(&mut bob_wire_key.as_mut_slice()).unwrap();
+    bob_writer
+        .produce(&mut bob_wire_key.as_mut_slice())
+        .unwrap();
 
     // Phase 2: readers consume peer key bytes, triggering ECDH on both sides
     alice_reader.consume(&mut bob_wire_key.as_slice()).unwrap();
@@ -1465,7 +1473,9 @@ fn do_full_handshake() -> (
 
     // Phase 3: writers produce garbage terminators (ECDH complete, terminator in shared state)
     let mut alice_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
-    alice_writer.produce(&mut alice_term.as_mut_slice()).unwrap();
+    alice_writer
+        .produce(&mut alice_term.as_mut_slice())
+        .unwrap();
     assert!(
         alice_writer.is_done(),
         "alice writer must reach Done after produce()"

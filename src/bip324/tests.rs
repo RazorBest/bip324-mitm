@@ -1228,70 +1228,7 @@ fn complete_handshake() -> (InboundCipher, OutboundCipher, InboundCipher, Outbou
     (alice_inbound, alice_outbound, bob_inbound, bob_outbound)
 }
 
-// 1. Both sides exchange keys via HandshakeReadParser and independently derive a matching
-//    session ID. Verifies the ECDH is symmetric and the parsers report completion.
-#[test]
-fn test_handshake_roundtrip() {
-    let alice_key_for_session = key_from_secret_bytes(ALICE_SECRET).unwrap();
-    let bob_key_for_session = key_from_secret_bytes(BOB_SECRET).unwrap();
-    let alice_key_for_parser = key_from_secret_bytes(ALICE_SECRET).unwrap();
-    let bob_key_for_parser = key_from_secret_bytes(BOB_SECRET).unwrap();
-
-    // Compute session IDs from both sides independently using raw ECDH
-    let alice_session = SessionKeyMaterial::from_ecdh(
-        alice_key_for_session.elligator_swift,
-        bob_key_for_session.elligator_swift,
-        alice_key_for_session.secret_key,
-        ElligatorSwiftParty::A,
-        MAGIC,
-    )
-    .unwrap();
-    let bob_session = SessionKeyMaterial::from_ecdh(
-        alice_key_for_session.elligator_swift, // ElligatorSwift is Copy
-        bob_key_for_session.elligator_swift,
-        bob_key_for_session.secret_key,
-        ElligatorSwiftParty::B,
-        MAGIC,
-    )
-    .unwrap();
-
-    assert_eq!(
-        alice_session.session_id, bob_session.session_id,
-        "Session IDs must match from both sides"
-    );
-
-    // Both sides complete the handshake via HandshakeReadParser alone
-    let mut alice_parser =
-        super::new_handshake_pair(Role::Initiator, MAGIC, alice_key_for_parser).0;
-    let mut bob_parser = super::new_handshake_pair(Role::Responder, MAGIC, bob_key_for_parser).0;
-
-    // Cross-feed key bytes directly from each parser's ellswift point (triggers ECDH on both sides)
-    let alice_wire_key = alice_parser.elligator_swift_bytes();
-    let bob_wire_key = bob_parser.elligator_swift_bytes();
-    alice_parser.consume(&mut bob_wire_key.as_slice()).unwrap();
-    bob_parser.consume(&mut alice_wire_key.as_slice()).unwrap();
-
-    // Fetch outbound garbage terminators from parsers and cross-feed to complete handshake
-    let alice_outbound_term = alice_parser.outbound_garbage_terminator().unwrap();
-    let bob_outbound_term = bob_parser.outbound_garbage_terminator().unwrap();
-    alice_parser
-        .consume(&mut bob_outbound_term.as_slice())
-        .unwrap();
-    bob_parser
-        .consume(&mut alice_outbound_term.as_slice())
-        .unwrap();
-
-    assert!(
-        alice_parser.is_handshake_done(),
-        "Alice handshake must complete"
-    );
-    assert!(
-        bob_parser.is_handshake_done(),
-        "Bob handshake must complete"
-    );
-}
-
-// 2. Complete handshake bidirectionally, then verify a data roundtrip:
+// 1. Complete handshake bidirectionally, then verify a data roundtrip:
 //    Side A encrypts with DataWriteParser → Side B decrypts with DataReadParser → matches plaintext.
 #[test]
 fn test_full_protocol_flow() {
@@ -1315,7 +1252,7 @@ fn test_full_protocol_flow() {
     assert_writer_has_consumed(&mut encrypt_parser);
 }
 
-// 3. Verify that data parsers generated from handshake material encrypt and decrypt correctly:
+// 2. Verify that data parsers generated from handshake material encrypt and decrypt correctly:
 //    DataWriteParser encrypts with alice's outbound cipher; DataReadParser decrypts with bob's inbound cipher.
 #[test]
 fn test_that_data_parsers_from_handshake_material_are_correct() {
@@ -1333,7 +1270,7 @@ fn test_that_data_parsers_from_handshake_material_are_correct() {
     assert_writer_has_consumed(&mut write);
 }
 
-// 4. Multiple consecutive packets through DataWriteParser → DataReadParser.
+// 3. Multiple consecutive packets through DataWriteParser → DataReadParser.
 //    Verifies that cipher key ratcheting works correctly across packet boundaries.
 #[test]
 fn test_multiple_packets_roundtrip() {
@@ -1356,7 +1293,8 @@ fn test_multiple_packets_roundtrip() {
     assert_writer_has_consumed(&mut write_parser);
 }
 
-// 5. Both sides use new_handshake_pair and derive matching cipher sessions.
+// 4. Both sides use new_handshake_pair and derive matching cipher sessions.
+
 #[test]
 fn test_coupled_handshake() {
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
@@ -1401,7 +1339,7 @@ fn test_coupled_handshake() {
     // Alice's outbound keys must match Bob's inbound keys
     assert_eq!(
         alice_outbound.length_cipher.key_bytes,
-        bob_inbound.length_cipher.unwrap().key_bytes,
+        bob_inbound.length_cipher.as_ref().unwrap().key_bytes,
         "alice outbound length key must equal bob inbound length key"
     );
     assert_eq!(
@@ -1411,16 +1349,34 @@ fn test_coupled_handshake() {
     // Bob's outbound keys must match Alice's inbound keys
     assert_eq!(
         bob_outbound.length_cipher.key_bytes,
-        alice_inbound.length_cipher.unwrap().key_bytes,
+        alice_inbound.length_cipher.as_ref().unwrap().key_bytes,
         "bob outbound length key must equal alice inbound length key"
     );
     assert_eq!(
         bob_outbound.packet_cipher.key_bytes, alice_inbound.packet_cipher.key_bytes,
         "bob outbound packet key must equal alice inbound packet key"
     );
+
+    // Verify the derived ciphers actually work end-to-end: encrypt with alice's outbound,
+    // decrypt with bob's inbound.
+    let plaintext = b"coupled handshake roundtrip";
+    let mut write_parser = DataWriteParser::new(alice_outbound);
+    let ciphertext = encrypt_with_parser(&mut write_parser, plaintext, None);
+
+    let mut read_parser = DataReadParser::new(vec![], bob_inbound);
+    read_parser.consume(&mut ciphertext.as_slice()).unwrap();
+
+    let decrypted = read_parser.drain_data_bytes();
+    assert_eq!(decrypted[0], 0x00, "Expected genuine header byte");
+    assert_eq!(
+        &decrypted[1..],
+        plaintext,
+        "Decrypted payload must match plaintext"
+    );
+    assert_writer_has_consumed(&mut write_parser);
 }
 
-// 6. The writer produces the correct ellswift bytes without any explicit key injection.
+// 5. The writer produces the correct ellswift bytes without any explicit key injection.
 #[test]
 fn test_writer_reads_key_from_shared_state() {
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
@@ -1497,7 +1453,7 @@ fn do_full_handshake() -> (
     (alice_reader, alice_writer, bob_reader, bob_writer)
 }
 
-// 7. Complete a handshake, call into_data_reader(), feed encrypted data to the resulting
+// 6. Complete a handshake, call into_data_reader(), feed encrypted data to the resulting
 //    DataReadParser, and verify decryption works.
 #[test]
 fn test_handshake_reader_into_data_reader() {
@@ -1522,7 +1478,7 @@ fn test_handshake_reader_into_data_reader() {
     assert_writer_has_consumed(&mut alice_data_writer);
 }
 
-// 8. Complete a handshake, call into_data_writer(), encrypt data, and verify decryption.
+// 7. Complete a handshake, call into_data_writer(), encrypt data, and verify decryption.
 #[test]
 fn test_handshake_writer_into_data_writer() {
     let (alice_reader, alice_writer, bob_reader, _bob_writer) = do_full_handshake();
@@ -1546,7 +1502,7 @@ fn test_handshake_writer_into_data_writer() {
     assert_writer_has_consumed(&mut alice_data_writer);
 }
 
-// 9. Both sides do handshake → data transition. Side A encrypts, side B decrypts.
+// 8. Both sides do handshake → data transition. Side A encrypts, side B decrypts.
 //     This replaces/extends test_full_protocol_flow by using the new transition methods
 //     instead of take_ciphers().
 #[test]
@@ -1576,7 +1532,7 @@ fn test_full_transition_roundtrip() {
     assert_writer_has_consumed(&mut alice_data_writer);
 }
 
-// 10. Call into_data_reader() before the handshake completes → should panic.
+// 9. Call into_data_reader() before the handshake completes → should panic.
 #[test]
 #[should_panic(expected = "Handshake must be done before transitioning to data phase")]
 fn test_into_data_reader_panics_if_not_done() {

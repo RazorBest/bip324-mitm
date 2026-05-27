@@ -1297,40 +1297,7 @@ fn test_multiple_packets_roundtrip() {
 
 #[test]
 fn test_coupled_handshake() {
-    let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
-    let bob_key = key_from_secret_bytes(BOB_SECRET).unwrap();
-
-    let (mut alice_reader, mut alice_hs_writer) =
-        super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
-    let (mut bob_reader, mut bob_hs_writer) =
-        super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
-
-    alice_hs_writer.set_garbage_eof();
-    bob_hs_writer.set_garbage_eof();
-
-    // Produce key bytes from each writer
-    let mut alice_wire = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-    alice_hs_writer
-        .produce(&mut alice_wire.as_mut_slice())
-        .unwrap();
-    let mut bob_wire = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-    bob_hs_writer.produce(&mut bob_wire.as_mut_slice()).unwrap();
-
-    // Cross-feed key bytes to readers (triggers ECDH)
-    alice_reader.consume(&mut bob_wire.as_slice()).unwrap();
-    bob_reader.consume(&mut alice_wire.as_slice()).unwrap();
-
-    // Produce garbage terminators (ECDH complete, terminator in shared state)
-    let mut alice_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
-    alice_hs_writer
-        .produce(&mut alice_term.as_mut_slice())
-        .unwrap();
-    let mut bob_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
-    bob_hs_writer.produce(&mut bob_term.as_mut_slice()).unwrap();
-
-    // Cross-feed terminators to readers
-    alice_reader.consume(&mut bob_term.as_slice()).unwrap();
-    bob_reader.consume(&mut alice_term.as_slice()).unwrap();
+    let (mut alice_reader, _, mut bob_reader, _) = do_full_handshake();
 
     let alice_inbound = alice_reader.take_inbound_cipher().unwrap();
     let alice_outbound = alice_reader.take_outbound_cipher().unwrap();

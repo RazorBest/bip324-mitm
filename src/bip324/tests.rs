@@ -1469,14 +1469,12 @@ fn test_handshake_writer_into_data_writer() {
     assert_writer_has_consumed(&mut alice_data_writer);
 }
 
-// 8. Both sides do handshake → data transition. Side A encrypts, side B decrypts.
-//     This replaces/extends test_full_protocol_flow by using the new transition methods
-//     instead of take_ciphers().
+// 8. Both sides complete a handshake and transition to the data phase. Alice encrypts
+//    a message and Bob decrypts it.
 #[test]
-fn test_full_transition_roundtrip() {
+fn test_data_phase_roundtrip() {
     let (alice_reader, alice_writer, bob_reader, bob_writer) = do_full_handshake();
 
-    // Both sides transition to data phase using the new methods
     let (_alice_data_reader, _) = alice_reader.into_data_reader();
     let mut alice_data_writer = alice_writer.into_data_writer();
 

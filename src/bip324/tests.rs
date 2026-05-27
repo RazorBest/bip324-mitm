@@ -972,6 +972,68 @@ fn test_known_vectors() {
     );
 }
 
+// 8. Feed ciphertext in two halves without draining between consume() calls.
+//    Verifies output buffers accumulate correctly across partial reads.
+#[test]
+fn test_partial_read_no_intermediate_drain() {
+    let (mut alice_out, bob_in) = make_cipher_pair();
+
+    let plaintext = b"partial read test";
+    let ciphertext = cipher_encrypt_packet(&mut alice_out, plaintext);
+
+    let mut parser = DataReadParser::new(vec![], bob_in);
+    let mid = ciphertext.len() / 2;
+
+    let mut data = &ciphertext[..mid];
+    parser.consume(&mut data).unwrap();
+
+    let mut data = &ciphertext[mid..];
+    parser.consume(&mut data).unwrap();
+
+    assert_packet_outputs(&mut parser, plaintext, &ciphertext);
+}
+
+// 9. Feed exactly the length phase bytes, drain them immediately, then feed the rest.
+//    Verifies drain_length_bytes() returns a partial result mid-packet and the
+//    subsequent drains complete the packet correctly.
+#[test]
+fn test_partial_drain_phase_boundary() {
+    let (mut alice_out, bob_in) = make_cipher_pair();
+
+    let plaintext = b"phase boundary drain";
+    let ciphertext = cipher_encrypt_packet(&mut alice_out, plaintext);
+
+    let mut parser = DataReadParser::new(vec![], bob_in);
+
+    let mut data = &ciphertext[..NUM_LENGTH_BYTES];
+    parser.consume(&mut data).unwrap();
+
+    let length_bytes = parser.drain_length_bytes();
+    assert_eq!(
+        length_bytes.len(),
+        NUM_LENGTH_BYTES,
+        "length bytes after length phase"
+    );
+    assert!(parser.drain_data_bytes().is_empty(), "no data bytes yet");
+    assert!(parser.drain_tag_bytes().is_empty(), "no tag bytes yet");
+
+    let mut data = &ciphertext[NUM_LENGTH_BYTES..];
+    parser.consume(&mut data).unwrap();
+
+    let data_bytes = parser.drain_data_bytes();
+    let tag_bytes = parser.drain_tag_bytes();
+
+    assert_eq!(data_bytes.len(), 1 + plaintext.len(), "data bytes length");
+    assert_eq!(data_bytes[0], 0x00, "genuine packet header byte");
+    assert_eq!(&data_bytes[1..], plaintext, "decrypted plaintext");
+    assert_eq!(tag_bytes.len(), NUM_TAG_BYTES, "tag bytes length");
+    assert_eq!(
+        tag_bytes,
+        &ciphertext[ciphertext.len() - NUM_TAG_BYTES..],
+        "tag bytes match ciphertext"
+    );
+}
+
 // Data write tests
 
 // Prepare the three input slices needed by DataWriteParser for one packet.

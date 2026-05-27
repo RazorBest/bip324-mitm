@@ -1343,9 +1343,9 @@ fn test_coupled_handshake() {
     assert_writer_has_consumed(&mut write_parser);
 }
 
-// 5. The writer produces the correct ellswift bytes without any explicit key injection.
+// 5. The writer produces the correct ellswift bytes when constructed via new_handshake_pair.
 #[test]
-fn test_writer_reads_key_from_shared_state() {
+fn test_writer_reads_key_from_handshake_pair() {
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
     let expected_bytes = alice_key.elligator_swift.to_array();
 

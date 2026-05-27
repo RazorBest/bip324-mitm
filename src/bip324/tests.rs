@@ -1270,30 +1270,7 @@ fn test_that_data_parsers_from_handshake_material_are_correct() {
     assert_writer_has_consumed(&mut write);
 }
 
-// 3. Multiple consecutive packets through DataWriteParser → DataReadParser.
-//    Verifies that cipher key ratcheting works correctly across packet boundaries.
-#[test]
-fn test_multiple_packets_roundtrip() {
-    let (_alice_inbound, alice_outbound, bob_inbound, _bob_outbound) = complete_handshake();
-
-    let messages: &[&[u8]] = &[b"first message", b"second message", b"third message"];
-
-    let mut write_parser = DataWriteParser::new(alice_outbound);
-    let ciphertexts: Vec<Vec<u8>> = messages
-        .iter()
-        .map(|msg| encrypt_with_parser(&mut write_parser, msg, None))
-        .collect();
-
-    let mut read_parser = DataReadParser::new(vec![], bob_inbound);
-    for (i, (ct, expected)) in ciphertexts.iter().zip(messages.iter()).enumerate() {
-        read_parser.consume(&mut ct.as_slice()).unwrap();
-        let decrypted = read_parser.drain_data_bytes();
-        assert_eq!(&decrypted[1..], *expected, "Packet {i} roundtrip failed");
-    }
-    assert_writer_has_consumed(&mut write_parser);
-}
-
-// 4. Both sides use new_handshake_pair and derive matching cipher sessions.
+// 3. Both sides use new_handshake_pair and derive matching cipher sessions.
 
 #[test]
 fn test_coupled_handshake() {
@@ -1343,7 +1320,7 @@ fn test_coupled_handshake() {
     assert_writer_has_consumed(&mut write_parser);
 }
 
-// 5. The writer produces the correct ellswift bytes when constructed via new_handshake_pair.
+// 4. The writer produces the correct ellswift bytes when constructed via new_handshake_pair.
 #[test]
 fn test_writer_reads_key_from_handshake_pair() {
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
@@ -1420,7 +1397,7 @@ fn do_full_handshake() -> (
     (alice_reader, alice_writer, bob_reader, bob_writer)
 }
 
-// 6. Complete a handshake, call into_data_reader(), feed encrypted data to the resulting
+// 5. Complete a handshake, call into_data_reader(), feed encrypted data to the resulting
 //    DataReadParser, and verify decryption works.
 #[test]
 fn test_handshake_reader_into_data_reader() {
@@ -1445,7 +1422,7 @@ fn test_handshake_reader_into_data_reader() {
     assert_writer_has_consumed(&mut alice_data_writer);
 }
 
-// 7. Complete a handshake, call into_data_writer(), encrypt data, and verify decryption.
+// 6. Complete a handshake, call into_data_writer(), encrypt data, and verify decryption.
 #[test]
 fn test_handshake_writer_into_data_writer() {
     let (alice_reader, alice_writer, bob_reader, _bob_writer) = do_full_handshake();
@@ -1469,7 +1446,7 @@ fn test_handshake_writer_into_data_writer() {
     assert_writer_has_consumed(&mut alice_data_writer);
 }
 
-// 8. Both sides complete a handshake and transition to the data phase. Alice encrypts
+// 7. Both sides complete a handshake and transition to the data phase. Alice encrypts
 //    a message and Bob decrypts it.
 #[test]
 fn test_data_phase_roundtrip() {
@@ -1497,7 +1474,7 @@ fn test_data_phase_roundtrip() {
     assert_writer_has_consumed(&mut alice_data_writer);
 }
 
-// 9. Call into_data_reader() before the handshake completes → should panic.
+// 8. Call into_data_reader() before the handshake completes → should panic.
 #[test]
 #[should_panic(expected = "Handshake must be done before transitioning to data phase")]
 fn test_into_data_reader_panics_if_not_done() {

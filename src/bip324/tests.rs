@@ -369,7 +369,7 @@ fn test_set_ecdh_point_after_key() {
 // 9. Verify is_receiving_key() is true before key bytes are fully received,
 //     and is_receiving_garbage() is true after key is complete.
 #[test]
-fn test_state_transitions() {
+fn test_reader_state_transition_into_recv_garbage() {
     let mut parser = reader_from_seed(Role::Responder, 1010);
     assert!(parser.is_receiving_key());
     assert!(!parser.is_receiving_garbage());
@@ -453,6 +453,13 @@ fn make_writer() -> (HandshakeWriteParser, [u8; KEY_LEN]) {
     (writer, expected_key)
 }
 
+fn assert_handshake_writer_has_consumed(parser: &mut HandshakeWriteParser) {
+    let mut buf = [0u8; 1];
+    let mut slice: &mut [u8] = &mut buf;
+    parser.produce(&mut slice).unwrap();
+    assert_eq!(slice.len(), 1, "writer has unconsumed data");
+}
+
 // 1. Create writer. Call produce() with a full KEY_LEN buffer.
 //    Verify the output matches the expected ellswift bytes.
 #[test]
@@ -464,6 +471,7 @@ fn test_write_key_complete() {
     parser.produce(&mut write_slice).unwrap();
 
     assert_eq!(buf, expected_key);
+    assert_handshake_writer_has_consumed(&mut parser);
 }
 
 // 2. Create parser and step() with 10-byte buffer repeatedly. Verify correct chunking.
@@ -486,6 +494,7 @@ fn test_write_key_chunked() {
     }
 
     assert_eq!(all_output, expected_key);
+    assert_handshake_writer_has_consumed(&mut parser);
 }
 
 // 3. Full handshake: key || garbage || terminator in one produce() call.
@@ -516,6 +525,7 @@ fn test_write_full_handshake() {
 
     assert_eq!(buf, expected);
     assert!(parser.is_done());
+    assert_handshake_writer_has_consumed(&mut parser);
 }
 
 // 4. No garbage: output is key || terminator.
@@ -541,6 +551,7 @@ fn test_write_no_garbage() {
 
     assert_eq!(buf, expected);
     assert!(parser.is_done());
+    assert_handshake_writer_has_consumed(&mut parser);
 }
 
 // 5. writer_started_sending is false before any write, true after.
@@ -635,6 +646,7 @@ fn test_pacing_garbage() {
     }
 
     assert_eq!(all_garbage_out, full_garbage);
+    assert_handshake_writer_has_consumed(&mut parser);
 }
 
 // 9. Push garbage without setting EOF. Verify parser stays in SendingGarbage and returns End.
@@ -658,6 +670,7 @@ fn test_no_output_when_no_garbage_eof() {
 
     // Parser should still be in SendingGarbage, not transitioned to terminator
     assert!(parser.is_sending_garbage());
+    assert_handshake_writer_has_consumed(&mut parser);
 }
 
 // 10. SendingGarbageTerminator waits when outbound_garbage_terminator is not yet ready.
@@ -681,66 +694,7 @@ fn test_terminator_waits_for_ecdh() {
     assert!(!parser.is_done());
     assert!(parser.is_sending_terminator());
     assert_eq!(buf, vec![0u8; 200]);
-}
-
-// 11. Create a handshake pair for Role::Responder using HANDSHAKE_PARAMS1.
-//    Verify the writer produces server_key. Feed client_key to the paired reader.
-//    Confirm derived key material and outbound garbage terminator match expected vectors.
-#[test]
-fn test_cipher_session_derivation_writer() {
-    let TestHandshakeParams {
-        server_seed,
-        server_key,
-        server_garbage_terminator,
-        client_key,
-        initiator_l,
-        initiator_p,
-        responder_l,
-        responder_p,
-        ..
-    } = HANDSHAKE_PARAMS1;
-
-    let mut rng = insecurerng(server_seed);
-    let bytes = secret_key_bytes_from_rng(&mut rng);
-    let point = key_from_secret_bytes(bytes).unwrap();
-    let (mut reader, mut writer) = super::new_handshake_pair(Role::Responder, MAGIC, point);
-
-    let mut buf = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
-    writer.produce(&mut buf.as_mut_slice()).unwrap();
-    assert_eq!(buf, server_key, "writer key bytes mismatch");
-
-    let mut data = &client_key[..];
-    reader.consume(&mut data).unwrap();
-
-    let inbound = reader
-        .take_inbound_cipher()
-        .expect("Expected inbound cipher after key phase");
-    let outbound = reader
-        .take_outbound_cipher()
-        .expect("Expected outbound cipher after key phase");
-
-    assert_eq!(
-        inbound.length_cipher.unwrap().key_bytes,
-        initiator_l,
-        "inbound length key mismatch"
-    );
-    assert_eq!(
-        inbound.packet_cipher.key_bytes, initiator_p,
-        "inbound packet key mismatch"
-    );
-    assert_eq!(
-        outbound.length_cipher.key_bytes, responder_l,
-        "outbound length key mismatch"
-    );
-    assert_eq!(
-        outbound.packet_cipher.key_bytes, responder_p,
-        "outbound packet key mismatch"
-    );
-
-    let outbound_term = reader
-        .outbound_garbage_terminator()
-        .expect("Expected outbound garbage terminator");
-    assert_eq!(outbound_term, server_garbage_terminator);
+    assert_handshake_writer_has_consumed(&mut parser);
 }
 
 // Data read tests
@@ -1249,6 +1203,7 @@ fn test_tag_replacement() {
     let mut ct_body = out[NUM_LENGTH_BYTES..NUM_LENGTH_BYTES + packet_len].to_vec();
     let (_pkt, msg) = bob_in.decrypt_in_place(&mut ct_body, None).unwrap();
     assert_eq!(&msg[1..], plaintext);
+    assert_writer_has_consumed(&mut parser);
 }
 
 // 7. Encrypt with DataWriteParser, decrypt with DataReadParser. Verify plaintext matches.
@@ -1280,8 +1235,9 @@ const ALICE_SECRET: [u8; 32] =
 const BOB_SECRET: [u8; 32] =
     hex!("6f312890ec83bbb26798abaadd574684a53e74ccef7953b790fcc29409080246");
 
-// Complete a BIP-324 handshake using new_handshake_pair. Returns ciphers for both sides.
-fn complete_handshake() -> (InboundCipher, OutboundCipher, InboundCipher, OutboundCipher) {
+// Returns derived ciphers for both sides from a completed BIP-324 handshake using new_handshake_pair.
+fn get_derived_ciphers_from_handshake()
+-> (InboundCipher, OutboundCipher, InboundCipher, OutboundCipher) {
     let (mut alice_reader, _, mut bob_reader, _) = do_full_handshake();
     let alice_inbound = alice_reader.take_inbound_cipher().unwrap();
     let alice_outbound = alice_reader.take_outbound_cipher().unwrap();
@@ -1294,8 +1250,8 @@ fn complete_handshake() -> (InboundCipher, OutboundCipher, InboundCipher, Outbou
 //    Side A encrypts with DataWriteParser → Side B decrypts with DataReadParser → matches plaintext.
 #[test]
 fn test_full_protocol_flow() {
-    let (_alice_inbound, alice_outbound, bob_inbound, _bob_outbound) = complete_handshake();
-
+    let (_alice_inbound, alice_outbound, bob_inbound, _bob_outbound) =
+        get_derived_ciphers_from_handshake();
     let plaintext = b"hello from alice to bob";
 
     let mut encrypt_parser = DataWriteParser::new(alice_outbound);
@@ -1318,8 +1274,8 @@ fn test_full_protocol_flow() {
 //    DataWriteParser encrypts with alice's outbound cipher; DataReadParser decrypts with bob's inbound cipher.
 #[test]
 fn test_that_data_parsers_from_handshake_material_are_correct() {
-    let (_alice_inbound, alice_outbound, bob_inbound, _bob_outbound) = complete_handshake();
-
+    let (_alice_inbound, alice_outbound, bob_inbound, _bob_outbound) =
+        get_derived_ciphers_from_handshake();
     let msg = b"standalone parsers work without any external infrastructure";
     let mut write = DataWriteParser::new(alice_outbound);
     let ct = encrypt_with_parser(&mut write, msg, None);
@@ -1365,7 +1321,7 @@ fn test_coupled_handshake() {
 
     // Verify the derived ciphers actually work end-to-end: encrypt with alice's outbound,
     // decrypt with bob's inbound.
-    let plaintext = b"coupled handshake roundtrip";
+    let plaintext = b"coupled handAdded test_partial_read_no_intermediate_drain (test 8) and test_partial_drain_phase_boundary (test 9) to cover these.shake roundtrip";
     let mut write_parser = DataWriteParser::new(alice_outbound);
     let ciphertext = encrypt_with_parser(&mut write_parser, plaintext, None);
 

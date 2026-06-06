@@ -1321,7 +1321,7 @@ fn test_coupled_handshake() {
 
     // Verify the derived ciphers actually work end-to-end: encrypt with alice's outbound,
     // decrypt with bob's inbound.
-    let plaintext = b"coupled handAdded test_partial_read_no_intermediate_drain (test 8) and test_partial_drain_phase_boundary (test 9) to cover these.shake roundtrip";
+    let plaintext = b"coupled handshake roundtrip";
     let mut write_parser = DataWriteParser::new(alice_outbound);
     let ciphertext = encrypt_with_parser(&mut write_parser, plaintext, None);
 

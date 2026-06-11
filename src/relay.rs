@@ -53,15 +53,12 @@ pub struct FakePeerRelay {
 }
 
 impl FakePeerRelay {
-    pub fn remove_first_packet_if_consumed(&mut self) {
+    pub fn remove_first_packet_if_empty(&mut self) {
         if self.packets.is_empty() {
             return;
         }
-        let packet = &self.packets[0];
-        let packet_is_empty = packet.is_empty();
-        let is_consumed = packet_is_empty && self.packets.len() > 1;
 
-        if is_consumed {
+        if self.packets[0].is_empty() {
             self.packets.splice(..1, []);
         }
     }
@@ -112,7 +109,7 @@ impl FakePeerRelayReader for FakePeerRelay {
         let packet = &mut self.packets[0];
         let size = packet.read_length_bytes(data);
 
-        self.remove_first_packet_if_consumed();
+        self.remove_first_packet_if_empty();
 
         size
     }
@@ -133,7 +130,7 @@ impl FakePeerRelayReader for FakePeerRelay {
         let packet = &mut self.packets[0];
         let size = packet.read_data_bytes(data);
 
-        self.remove_first_packet_if_consumed();
+        self.remove_first_packet_if_empty();
 
         size
     }
@@ -154,7 +151,7 @@ impl FakePeerRelayReader for FakePeerRelay {
         let packet = &mut self.packets[0];
         let size = packet.read_tag_bytes(data);
 
-        self.remove_first_packet_if_consumed();
+        self.remove_first_packet_if_empty();
 
         size
     }
@@ -175,12 +172,7 @@ impl FakePeerRelayReader for FakePeerRelay {
         let packet = &mut self.packets[0];
         let aad = packet.read_aad();
 
-        let packet_is_empty = packet.is_empty();
-        let is_consumed = packet_is_empty && self.packets.len() > 1;
-
-        if is_consumed {
-            self.packets.splice(..1, []);
-        }
+        self.remove_first_packet_if_empty();
 
         aad
     }

@@ -1972,6 +1972,134 @@ mod mitmfakepeerbip324_tests {
     }
 
     #[test]
+    fn test_server_sends_one_message_after_terminator() {
+        let mut rng = secp256k1::rand::thread_rng();
+        let mut mitm = MitmBIP324::new(&mut rng).unwrap();
+
+        let bytes = secret_key_bytes_from_rng(&mut rng);
+        let client_key = key_from_secret_bytes(bytes).unwrap();
+        let (mut client_reader, mut client_writer) =
+            bip324::new_handshake_pair(protocol::Role::Initiator, MAINNET_MAGIC, client_key);
+
+        let bytes = secret_key_bytes_from_rng(&mut rng);
+        let server_key = key_from_secret_bytes(bytes).unwrap();
+        let (mut server_reader, mut server_writer) =
+            bip324::new_handshake_pair(protocol::Role::Responder, MAINNET_MAGIC, server_key);
+
+        client_writer.push_garbage_bytes(&[0x77u8; 1301]);
+        client_writer.set_garbage_eof();
+        let server_garbage = [0x59u8; 1577];
+        server_writer.push_garbage_bytes(&server_garbage);
+        server_writer.set_garbage_eof();
+
+        let mut buf = [0u8; 8192];
+        let buf_len = buf.len();
+        // Client -- key + garbage --> MITM
+        {
+            let mut bufref = &mut buf[..];
+            client_writer.produce(&mut bufref).unwrap();
+            let written = buf_len - bufref.len();
+            mitm.client_write(&buf[..written]).unwrap();
+        }
+
+        // MITM -- key + garbage --> Server
+        {
+            let size = mitm.server_read(&mut buf[..]).unwrap();
+            let mut bufref = &buf[..size];
+            server_reader.consume(&mut bufref).unwrap();
+            assert!(
+                bufref.is_empty(),
+                "buffer was not emptied for server_writer.consume"
+            );
+        }
+
+        let mut bufref = &mut buf[..];
+        // Writes key + garbage + terminator
+        server_writer.produce(&mut bufref).unwrap();
+        let server_handshake_size = buf_len - bufref.len();
+        let mut server_writer = server_writer.into_data_writer();
+
+        // Writes [msg1]
+        server_writer.push_length_bytes(&[10u8, 0u8, 0u8]);
+        server_writer.push_data_bytes(&[1u8; 11]);
+        server_writer.push_tag_bytes(&[0u8; 16]);
+        server_writer.produce(&mut bufref).unwrap();
+
+        // Server -- key + garbage + terminator + [msg1] --> MITM
+        {
+            let written = buf_len - bufref.len();
+            mitm.server_write(&buf[..written]).unwrap();
+        }
+
+        // MITM -- key + garbage + terminator --> Client
+        {
+            let bufref = &mut buf[..server_handshake_size];
+            let size = mitm.client_read(bufref).unwrap();
+            assert_eq!(size, server_handshake_size);
+            let mut bufref = &buf[..size];
+            client_reader.consume(&mut bufref).unwrap();
+            assert!(
+                bufref.is_empty(),
+                "handshake was not emptied for client_reader.consume"
+            );
+        }
+
+        assert_eq!(client_reader.drain_key_bytes().len(), 64);
+        assert!(client_reader.is_key_eof());
+        assert_eq!(client_reader.drain_garbage_bytes(), server_garbage);
+        assert_eq!(client_reader.drain_terminator_bytes().len(), 16);
+        assert!(client_reader.is_garbage_eof());
+
+        let (mut client_reader, _aad) = client_reader.into_data_reader();
+
+        // MITM -- [msg1] --> Client
+        {
+            let size = mitm.client_read(&mut buf[..]).unwrap();
+            let mut bufref = &buf[..size];
+            client_reader.consume(&mut bufref).unwrap();
+            assert!(
+                bufref.is_empty(),
+                "data not emptied for client_reader.consume"
+            );
+        }
+        assert_eq!(client_reader.drain_length_bytes(), vec![10u8, 0u8, 0u8]);
+        assert_eq!(client_reader.drain_data_bytes(), vec![1u8; 11]);
+        assert_eq!(client_reader.drain_tag_bytes().len(), 16);
+
+        // Writes to the buffer [msg2] [msg3]
+        let mut bufref = &mut buf[..];
+        for _ in 0..2 {
+            server_writer.push_length_bytes(&[10u8, 0u8, 0u8]);
+            server_writer.push_data_bytes(&[1u8; 11]);
+            server_writer.push_tag_bytes(&[0u8; 16]);
+            server_writer.produce(&mut bufref).unwrap();
+        }
+
+        // Server -- [msg2] [msg3] --> MITM
+        {
+            let written = buf_len - bufref.len();
+            mitm.server_write(&buf[..written]).unwrap();
+        }
+
+        // MITM -- [msg2] [msg3] --> Client
+        {
+            let size = mitm.client_read(&mut buf[..]).unwrap();
+            let mut bufref = &buf[..size];
+            client_reader.consume(&mut bufref).unwrap();
+            assert!(
+                bufref.is_empty(),
+                "data not emptied for client_reader.consume"
+            );
+        }
+        assert_eq!(
+            client_reader.drain_length_bytes(),
+            vec![10u8, 0u8, 0u8, 10u8, 0u8, 0u8]
+        );
+        assert_eq!(client_reader.drain_data_bytes(), vec![1u8; 11 * 2]);
+        assert_eq!(client_reader.drain_tag_bytes().len(), 32);
+    }
+
+    #[test]
     fn test_client_sends_one_message_after_terminator() {
         let mut rng = secp256k1::rand::thread_rng();
         let mut mitm = MitmBIP324::new(&mut rng).unwrap();
@@ -2012,7 +2140,7 @@ mod mitmfakepeerbip324_tests {
             let mut bufref = &buf[..size];
             server_reader.consume(&mut bufref).unwrap();
             assert!(
-                bufref.len() == 0,
+                bufref.is_empty(),
                 "buffer was not emptied for server_writer.consume"
             );
         }
@@ -2039,22 +2167,22 @@ mod mitmfakepeerbip324_tests {
 
         // MITM -- key + garbage + terminator --> Client
         {
-            let mut bufref = &mut buf[..server_handshake_size];
-            let size = mitm.client_read(&mut bufref).unwrap();
+            let bufref = &mut buf[..server_handshake_size];
+            let size = mitm.client_read(bufref).unwrap();
             assert_eq!(size, server_handshake_size);
             let mut bufref = &buf[..size];
             client_reader.consume(&mut bufref).unwrap();
             assert!(
-                bufref.len() == 0,
+                bufref.is_empty(),
                 "handshake was not emptied for client_reader.consume"
             );
         }
 
         assert_eq!(client_reader.drain_key_bytes().len(), 64);
-        assert_eq!(client_reader.is_key_eof(), true);
+        assert!(client_reader.is_key_eof());
         assert_eq!(client_reader.drain_garbage_bytes(), server_garbage);
         assert_eq!(client_reader.drain_terminator_bytes().len(), 16);
-        assert_eq!(client_reader.is_garbage_eof(), true);
+        assert!(client_reader.is_garbage_eof());
 
         let (mut client_reader, _aad) = client_reader.into_data_reader();
 
@@ -2064,7 +2192,7 @@ mod mitmfakepeerbip324_tests {
             let mut bufref = &buf[..size];
             client_reader.consume(&mut bufref).unwrap();
             assert!(
-                bufref.len() == 0,
+                bufref.is_empty(),
                 "data not emptied for client_reader.consume"
             );
         }
@@ -2091,15 +2219,15 @@ mod mitmfakepeerbip324_tests {
             let mut bufref = &buf[..size];
             server_reader.consume(&mut bufref).unwrap();
             assert!(
-                bufref.len() == 0,
+                bufref.is_empty(),
                 "data not emptied for server_reader.consume"
             );
         }
         assert_eq!(server_reader.drain_key_bytes().len(), 64);
-        assert_eq!(server_reader.is_key_eof(), true);
+        assert!(server_reader.is_key_eof());
         assert_eq!(server_reader.drain_garbage_bytes(), client_garbage);
         assert_eq!(server_reader.drain_terminator_bytes().len(), 16);
-        assert_eq!(server_reader.is_garbage_eof(), true);
+        assert!(server_reader.is_garbage_eof());
 
         let mut client_writer = client_writer.into_data_writer();
         let (mut server_reader, _aad) = server_reader.into_data_reader();
@@ -2125,7 +2253,7 @@ mod mitmfakepeerbip324_tests {
             let mut bufref = &buf[..size];
             server_reader.consume(&mut bufref).unwrap();
             assert!(
-                bufref.len() == 0,
+                bufref.is_empty(),
                 "data not emptied for server_reader.consume"
             );
         }

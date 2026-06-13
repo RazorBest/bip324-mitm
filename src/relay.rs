@@ -1,7 +1,11 @@
 use std::collections::VecDeque;
+use std::error::Error;
 use std::io::{Read, Write};
 
-use crate::protocol::{PartialPacket, ProtocolBuffer};
+use crate::protocol::{
+    NUM_ELLIGATOR_SWIFT_BYTES, NUM_GARBAGE_TERMINATOR_BYTES, NUM_LENGTH_BYTES, NUM_TAG_BYTES,
+    PartialPacket, ProtocolBuffer,
+};
 
 pub trait FakePeerRelayReader {
     fn read_key(&mut self, data: &mut [u8]) -> std::io::Result<usize>;
@@ -61,6 +65,13 @@ impl FakePeerRelay {
         if self.packets[0].is_empty() {
             self.packets.splice(..1, []);
         }
+    }
+
+    pub fn remove_first_packet(&mut self) {
+        if self.packets.is_empty() {
+            return;
+        }
+        self.packets.splice(..1, []);
     }
 }
 
@@ -283,5 +294,196 @@ impl FakePeerRelayWriter for FakePeerRelay {
         let last_packet = &mut self.packets[packets_len - 1];
 
         last_packet.set_aad(aad);
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct HandshakeKey {
+    pub data: Box<[u8; NUM_ELLIGATOR_SWIFT_BYTES]>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct HandshakeGarbage {
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct HandshakeTerminator {
+    pub data: Box<[u8; NUM_GARBAGE_TERMINATOR_BYTES]>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ProtocolHandshakePacket {
+    Key(HandshakeKey),
+    Garbage(HandshakeGarbage),
+    Terminator(HandshakeTerminator),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ProtocolDataPacket {
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum ProtocolPacket {
+    Handshake(ProtocolHandshakePacket),
+    Data(ProtocolDataPacket),
+    Err(Box<dyn Error>),
+}
+
+impl PartialEq for ProtocolPacket {
+    fn eq(&self, other: &Self) -> bool {
+        use ProtocolPacket::*;
+        match (self, other) {
+            (Handshake(v1), Handshake(v2)) => v1 == v2,
+            (Data(v1), Data(v2)) => v1 == v2,
+            (Err(..), Err(..)) => false,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct UserPacketRelay {
+    pub stream_relay: FakePeerRelay,
+    pub queue: VecDeque<ProtocolPacket>,
+}
+
+impl FakePeerRelayWriter for UserPacketRelay {
+    fn write_key(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.stream_relay.write_key(data)
+    }
+
+    fn set_eof_key(&mut self) {
+        if self.stream_relay.is_eof_key() {
+            return;
+        }
+        self.stream_relay.set_eof_key();
+
+        let mut data = [0u8; NUM_ELLIGATOR_SWIFT_BYTES];
+        let packet = match self.stream_relay.read_key(&mut data) {
+            Ok(read_cnt) => {
+                if read_cnt != data.len() {
+                    let err = format!(
+                        "User relay can't read the entire key. Expected: {}. Read: {}.",
+                        data.len(),
+                        read_cnt
+                    );
+                    ProtocolPacket::Err(err.into())
+                } else {
+                    ProtocolPacket::Handshake(ProtocolHandshakePacket::Key(HandshakeKey {
+                        data: data.into(),
+                    }))
+                }
+            }
+            Err(err) => ProtocolPacket::Err(err.into()),
+        };
+
+        self.queue.push_front(packet);
+    }
+
+    fn write_garbage(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.stream_relay.write_garbage(data)
+    }
+
+    fn set_eof_garbage(&mut self) {
+        if self.stream_relay.is_eof_garbage() {
+            return;
+        }
+        self.stream_relay.set_eof_garbage();
+
+        let mut data = vec![0u8; self.stream_relay.peek_len_garbage()];
+        let packet = match self.stream_relay.read_garbage(&mut data) {
+            Ok(read_cnt) => {
+                if read_cnt != data.len() {
+                    let err = format!(
+                        "User relay can't read the entire garbage. Expected: {}. Read: {}.",
+                        data.len(),
+                        read_cnt
+                    );
+                    ProtocolPacket::Err(err.into())
+                } else {
+                    ProtocolPacket::Handshake(ProtocolHandshakePacket::Garbage(HandshakeGarbage {
+                        data,
+                    }))
+                }
+            }
+            Err(err) => ProtocolPacket::Err(err.into()),
+        };
+
+        self.queue.push_front(packet);
+    }
+
+    fn write_terminator(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.stream_relay.write_terminator(data)
+    }
+
+    fn set_eof_terminator(&mut self) {
+        if self.stream_relay.is_eof_terminator() {
+            return;
+        }
+        self.stream_relay.set_eof_terminator();
+
+        let mut data = [0u8; NUM_GARBAGE_TERMINATOR_BYTES];
+        let packet = match self.stream_relay.read_terminator(&mut data) {
+            Ok(read_cnt) => {
+                if read_cnt != data.len() {
+                    let err = format!(
+                        "User relay can't read the entire terminator. Expected: {}. Read: {}.",
+                        data.len(),
+                        read_cnt
+                    );
+                    ProtocolPacket::Err(err.into())
+                } else {
+                    ProtocolPacket::Handshake(ProtocolHandshakePacket::Terminator(
+                        HandshakeTerminator { data: data.into() },
+                    ))
+                }
+            }
+            Err(err) => ProtocolPacket::Err(err.into()),
+        };
+
+        self.queue.push_front(packet);
+    }
+
+    fn write_length_bytes(&mut self, data: &[u8]) {
+        self.stream_relay.write_length_bytes(data);
+
+        if self.stream_relay.peek_length_bytes() < NUM_LENGTH_BYTES {
+            return;
+        }
+
+        let mut buf = [0u8; NUM_LENGTH_BYTES];
+        self.stream_relay.read_length_bytes(&mut buf);
+    }
+
+    fn write_data_bytes(&mut self, data: &[u8]) {
+        self.stream_relay.write_data_bytes(data);
+    }
+
+    fn write_tag_bytes(&mut self, data: &[u8]) {
+        self.stream_relay.write_tag_bytes(data);
+        if self.stream_relay.peek_tag_bytes() < NUM_TAG_BYTES {
+            return;
+        }
+
+        let payload_len = self.stream_relay.peek_data_bytes();
+        let mut buf = vec![0u8; payload_len];
+        self.stream_relay.read_data_bytes(&mut buf);
+        self.queue
+            .push_front(ProtocolPacket::Data(ProtocolDataPacket { data: buf }));
+        // Since we only read the data, and we don't need something else, we can
+        // remove the packet even if it's not empty
+        self.stream_relay.remove_first_packet();
+    }
+
+    fn set_aad(&mut self, _aad: &[u8]) {
+        // The user packet relay doesn't expose the aad
+    }
+}
+
+impl UserPacketRelay {
+    pub fn next_protocol_packet(&mut self) -> Option<ProtocolPacket> {
+        self.queue.pop_back()
     }
 }

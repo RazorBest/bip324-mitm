@@ -524,7 +524,7 @@ fn test_write_full_handshake() {
     expected.extend_from_slice(&terminator);
 
     assert_eq!(buf, expected);
-    assert!(parser.is_done());
+    assert!(parser.is_done_writing());
     assert_handshake_writer_has_consumed(&mut parser);
 }
 
@@ -550,7 +550,7 @@ fn test_write_no_garbage() {
     expected.extend_from_slice(&terminator);
 
     assert_eq!(buf, expected);
-    assert!(parser.is_done());
+    assert!(parser.is_done_writing());
     assert_handshake_writer_has_consumed(&mut parser);
 }
 
@@ -691,7 +691,7 @@ fn test_terminator_waits_for_ecdh() {
     parser.produce(&mut buf.as_mut_slice()).unwrap();
 
     // Parser is stuck at SendingGarbageTerminator, not Done
-    assert!(!parser.is_done());
+    assert!(!parser.is_done_writing());
     assert!(parser.is_sending_terminator());
     assert_eq!(buf, vec![0u8; 200]);
     assert_handshake_writer_has_consumed(&mut parser);
@@ -1395,13 +1395,13 @@ fn do_full_handshake() -> (
         .produce(&mut alice_term.as_mut_slice())
         .unwrap();
     assert!(
-        alice_writer.is_done(),
+        alice_writer.is_done_writing(),
         "alice writer must reach Done after produce()"
     );
     let mut bob_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
     bob_writer.produce(&mut bob_term.as_mut_slice()).unwrap();
     assert!(
-        bob_writer.is_done(),
+        bob_writer.is_done_writing(),
         "bob writer must reach Done after produce()"
     );
 
@@ -1415,21 +1415,21 @@ fn do_full_handshake() -> (
     (alice_reader, alice_writer, bob_reader, bob_writer)
 }
 
-// 5. Complete a handshake, call into_data_reader(), feed encrypted data to the resulting
+// 5. Complete a handshake, call get_data_reader(), feed encrypted data to the resulting
 //    DataReadParser, and verify decryption works.
 #[test]
-fn test_handshake_reader_into_data_reader() {
-    let (alice_reader, alice_writer, bob_reader, _bob_writer) = do_full_handshake();
+fn test_handshake_reader_get_data_reader() {
+    let (mut alice_reader, alice_writer, mut bob_reader, _bob_writer) = do_full_handshake();
 
     // Alice transitions to data phase; outbound cipher is deposited into shared state.
-    let (_alice_data_reader, _) = alice_reader.into_data_reader();
+    let (_alice_data_reader, _) = alice_reader.get_data_reader();
     let mut alice_data_writer = alice_writer.into_data_writer();
 
     // Bob's read transition yields the DataReadParser
-    let (mut bob_data_reader, _) = bob_reader.into_data_reader();
+    let (mut bob_data_reader, _) = bob_reader.get_data_reader();
 
     // Alice encrypts, bob decrypts
-    let plaintext = b"into_data_reader test";
+    let plaintext = b"get_data_reader test";
     let ciphertext = encrypt_with_parser(&mut alice_data_writer, plaintext, None);
 
     bob_data_reader.consume(&mut ciphertext.as_slice()).unwrap();
@@ -1443,15 +1443,15 @@ fn test_handshake_reader_into_data_reader() {
 // 6. Complete a handshake, call into_data_writer(), encrypt data, and verify decryption.
 #[test]
 fn test_handshake_writer_into_data_writer() {
-    let (alice_reader, alice_writer, bob_reader, _bob_writer) = do_full_handshake();
+    let (mut alice_reader, alice_writer, mut bob_reader, _bob_writer) = do_full_handshake();
 
     // Alice transitions to data phase (reader stores outbound in shared state)
-    let (_alice_data_reader, _) = alice_reader.into_data_reader();
+    let (_alice_data_reader, _) = alice_reader.get_data_reader();
     let mut alice_data_writer = alice_writer.into_data_writer();
 
     // Bob needs inbound cipher: use take_ciphers on a fresh handshake as a cross-check,
     // but since we're testing the writer we get bob's inbound from his reader transition.
-    let (mut bob_data_reader, _) = bob_reader.into_data_reader();
+    let (mut bob_data_reader, _) = bob_reader.get_data_reader();
 
     let plaintext = b"into_data_writer test";
     let ciphertext = encrypt_with_parser(&mut alice_data_writer, plaintext, None);
@@ -1468,12 +1468,12 @@ fn test_handshake_writer_into_data_writer() {
 //    a message and Bob decrypts it.
 #[test]
 fn test_data_phase_roundtrip() {
-    let (alice_reader, alice_writer, bob_reader, bob_writer) = do_full_handshake();
+    let (mut alice_reader, alice_writer, mut bob_reader, bob_writer) = do_full_handshake();
 
-    let (_alice_data_reader, _) = alice_reader.into_data_reader();
+    let (_alice_data_reader, _) = alice_reader.get_data_reader();
     let mut alice_data_writer = alice_writer.into_data_writer();
 
-    let (mut bob_data_reader, _) = bob_reader.into_data_reader();
+    let (mut bob_data_reader, _) = bob_reader.get_data_reader();
     let _bob_data_writer = bob_writer.into_data_writer();
 
     // Alice encrypts → Bob decrypts
@@ -1492,14 +1492,14 @@ fn test_data_phase_roundtrip() {
     assert_writer_has_consumed(&mut alice_data_writer);
 }
 
-// 8. Call into_data_reader() before the handshake completes → should panic.
+// 8. Call get_data_reader() before the handshake completes → should panic.
 #[test]
 #[should_panic(expected = "Handshake must be done before transitioning to data phase")]
-fn test_into_data_reader_panics_if_not_done() {
+fn test_get_data_reader_panics_if_not_done() {
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
-    let (alice_reader, _alice_writer) =
+    let (mut alice_reader, _alice_writer) =
         super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
 
     // Handshake not done yet -- should panic
-    let _ = alice_reader.into_data_reader();
+    let _ = alice_reader.get_data_reader();
 }

@@ -19,9 +19,9 @@ use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use thiserror::Error;
 
 use crate::bip324::{DataReadParser, DataWriteParser, HandshakeReadParser, HandshakeWriteParser};
-use crate::cipher::{InboundCipher, OutboundCipher};
+use crate::cipher::{OutboundCipher};
 use crate::protocol::{
-    AADType, EcdhPoint, GarbageTerminatorType, MAINNET_MAGIC, MagicType, NUM_ELLIGATOR_SWIFT_BYTES,
+    EcdhPoint, GarbageTerminatorType, MAINNET_MAGIC, MagicType, NUM_ELLIGATOR_SWIFT_BYTES,
     NUM_SECRET_BYTES, REGTEST_MAGIC, Role, TESTNET_MAGIC,
 };
 use crate::relay::{FakePeerRelay, FakePeerRelayReader, FakePeerRelayWriter, UserPacketRelay};
@@ -402,12 +402,11 @@ impl MitmHandshakeImpersonatorLegReader {
         if !self.parser.is_handshake_done() {
             return None;
         }
-        let (data_parser, aad) = self.parser.into_data_reader();
+        let (data_parser, _aad) = self.parser.into_data_reader();
         Some(MitmImpersonatorLegReader::new_from_parser(
             self.relay_out,
             self.user_relay,
             data_parser,
-            &aad,
         ))
     }
 
@@ -596,16 +595,6 @@ pub struct MitmImpersonatorLegReader {
 }
 
 impl MitmImpersonatorLegReader {
-    pub fn new(
-        aad: AADType,
-        relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
-        inbound_cipher: InboundCipher,
-    ) -> Self {
-        let parser = DataReadParser::new(aad.clone(), inbound_cipher);
-        relay_out.borrow_mut().set_aad(&aad);
-        Self { parser, relay_out }
-    }
-
     /// Create a data-phase reader from an already-built `DataReadParser`.
     ///
     /// `aad` must be the same garbage content that was fed to `DataReadParser::new()` so that
@@ -614,9 +603,7 @@ impl MitmImpersonatorLegReader {
         relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
         user_relay: Option<UserPacketRelay>,
         parser: DataReadParser,
-        aad: &[u8],
     ) -> Self {
-        relay_out.borrow_mut().set_aad(aad);
         Self {
             parser,
             relay_out,
@@ -2330,7 +2317,6 @@ mod mitmfakepeerbip324_tests {
             let size = mitm.client_read(&mut buf).unwrap();
             let expected = server_handshake_size + msg1_size;
             assert_eq!(size, expected);
-            let mut bufref = &buf[..size];
         }
 
         // Buffer -- key + garbage + terminator --> Client
@@ -2762,7 +2748,6 @@ mod mitmbip324_component_tests {
     use crate::relay::ProtocolHandshakePacket::Key as HKey;
     use crate::relay::ProtocolHandshakePacket::Terminator as HTerm;
     use crate::relay::ProtocolPacket::Data as PD;
-    use crate::relay::ProtocolPacket::Err as PErr;
     use crate::relay::ProtocolPacket::Handshake as PHS;
 
     macro_rules! HandshakeKey {

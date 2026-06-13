@@ -472,7 +472,11 @@ impl ProtocolReadParser for HandshakeReadParser {
 
                     let currlen = self.read_buffer.len();
                     let garbage_len = currlen - other_garbage_terminator.len();
-                    let lhs = cmp::max(prevlen, insurance_len) - insurance_len;
+                    let lhs = if !self.terminator_is_not_split {
+                        cmp::max(prevlen, insurance_len) - insurance_len
+                    } else {
+                        prevlen
+                    };
                     let new_range = lhs..garbage_len;
 
                     {

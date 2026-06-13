@@ -19,7 +19,7 @@ use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use thiserror::Error;
 
 use crate::bip324::{DataReadParser, DataWriteParser, HandshakeReadParser, HandshakeWriteParser};
-use crate::cipher::{OutboundCipher};
+use crate::cipher::OutboundCipher;
 use crate::protocol::{
     EcdhPoint, GarbageTerminatorType, MAINNET_MAGIC, MagicType, NUM_ELLIGATOR_SWIFT_BYTES,
     NUM_SECRET_BYTES, REGTEST_MAGIC, Role, TESTNET_MAGIC,
@@ -1020,7 +1020,9 @@ mod mitmfakepeerbip324_tests {
     use std::str::FromStr;
 
     use crate::cipher::{CipherSession, InboundCipher, OutboundCipher, SessionKeyMaterial};
-    use crate::protocol::{NUM_GARBAGE_TERMINATOR_BYTES, NUM_LENGTH_BYTES, NUM_TAG_BYTES, PacketType};
+    use crate::protocol::{
+        NUM_GARBAGE_TERMINATOR_BYTES, NUM_LENGTH_BYTES, NUM_TAG_BYTES, PacketType,
+    };
 
     macro_rules! test_data {
         ($varname:ident, $name:ident { $($field:ident: $ty:ty = $val:expr),* $(,)? }) => {

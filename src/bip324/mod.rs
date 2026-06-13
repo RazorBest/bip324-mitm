@@ -1031,10 +1031,8 @@ impl ProtocolWriteParser for DataWriteParser {
                     .encrypt_len_part_inplace(&mut buf[..size]);
 
                 if size == remaining {
-                    let length_bytes: [u8; 8] =
-                        [new_written, vec![0u8; 5]].concat().try_into().unwrap();
-                    // Add 1 for the header, which is not included in the length
-                    let payload_len = 1 + usize::from_le_bytes(length_bytes);
+                    let payload_len =
+                        parse_length_bytes([new_written[0], new_written[1], new_written[2]]);
                     let stream_cipher = self
                         .outbound_cipher
                         .packet_cipher

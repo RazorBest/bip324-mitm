@@ -262,7 +262,7 @@ impl ProtocolReadParser for MitmImpersonatorLeg {
 
                 if reader_leg.is_final() {
                     let new_reader_leg = reader_leg.next_phase().unwrap();
-                    (Data(new_reader_leg), Ok(ProtocolStatus::End))
+                    (Data(new_reader_leg), Ok(ProtocolStatus::Continue))
                 } else {
                     (Handshake(reader_leg), Ok(ProtocolStatus::End))
                 }
@@ -304,7 +304,7 @@ impl ProtocolWriteParser for MitmImpersonatorLeg {
                 if writer_leg.is_final() {
                     if writer_leg.parser.has_outbound_cipher() {
                         let new_writer_leg = writer_leg.next_phase().unwrap();
-                        (Data(new_writer_leg), Ok(ProtocolStatus::End))
+                        (Data(new_writer_leg), Ok(ProtocolStatus::Continue))
                     } else {
                         // Cipher not yet forwarded from reader; stay in handshake
                         (Handshake(writer_leg), Ok(ProtocolStatus::End))
@@ -1033,7 +1033,7 @@ mod mitmfakepeerbip324_tests {
     use std::str::FromStr;
 
     use crate::cipher::{CipherSession, InboundCipher, OutboundCipher, SessionKeyMaterial};
-    use crate::protocol::{NUM_GARBAGE_TERMINATOR_BYTES, NUM_LENGTH_BYTES, PacketType};
+    use crate::protocol::{NUM_GARBAGE_TERMINATOR_BYTES, NUM_LENGTH_BYTES, NUM_TAG_BYTES, PacketType};
 
     macro_rules! test_data {
         ($varname:ident, $name:ident { $($field:ident: $ty:ty = $val:expr),* $(,)? }) => {
@@ -2303,31 +2303,39 @@ mod mitmfakepeerbip324_tests {
         }
 
         let mut bufref = &mut buf[..];
-        // Writes key + garbage + terminator
+        // Server -- key + garbage + terminator --> Buffer
         server_writer.produce(&mut bufref).unwrap();
         let server_handshake_size = buf_len - bufref.len();
         let mut server_writer = server_writer.into_data_writer();
 
-        // Writes [msg1]
+        // Server -- [msg1] --> Buffer
         {
             server_writer.push_length_bytes(&[10u8, 0u8, 0u8]);
             server_writer.push_data_bytes(&[1u8; 11]);
-            server_writer.push_tag_bytes(&[0u8; 16]);
+            server_writer.push_tag_bytes(&[0u8; NUM_TAG_BYTES]);
             server_writer.produce(&mut bufref).unwrap();
         }
+        let msg1_size = NUM_LENGTH_BYTES + 11 + NUM_TAG_BYTES;
+        let written = buf_len - bufref.len();
+        let expected_written = server_handshake_size + msg1_size;
+        assert_eq!(written, expected_written);
 
         // Server -- key + garbage + terminator + [msg1] --> MITM
         {
-            let written = buf_len - bufref.len();
             mitm.server_write(&buf[..written]).unwrap();
         }
 
-        // MITM -- key + garbage + terminator --> Client
+        // MITM -- key + garbage + terminator + [msg1] --> Buffer
         {
-            let bufref = &mut buf[..server_handshake_size];
-            let size = mitm.client_read(bufref).unwrap();
-            assert_eq!(size, server_handshake_size);
+            let size = mitm.client_read(&mut buf).unwrap();
+            let expected = server_handshake_size + msg1_size;
+            assert_eq!(size, expected);
             let mut bufref = &buf[..size];
+        }
+
+        // Buffer -- key + garbage + terminator --> Client
+        {
+            let mut bufref = &buf[..server_handshake_size];
             client_reader.consume(&mut bufref).unwrap();
             assert!(
                 bufref.is_empty(),
@@ -2343,10 +2351,9 @@ mod mitmfakepeerbip324_tests {
 
         let (mut client_reader, _aad) = client_reader.get_data_reader();
 
-        // MITM -- [msg1] --> Client
+        // Buffer -- [msg1] --> Client
         {
-            let size = mitm.client_read(&mut buf[..]).unwrap();
-            let mut bufref = &buf[..size];
+            let mut bufref = &buf[server_handshake_size..server_handshake_size + msg1_size];
             client_reader.consume(&mut bufref).unwrap();
             assert!(
                 bufref.is_empty(),

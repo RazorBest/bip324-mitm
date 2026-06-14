@@ -22,11 +22,9 @@ fn main() {
     writer1.push_garbage_bytes(&[13u8; 133]);
 
     let mut data = vec![0u8; 512];
-    let (mut data1, mut data2) = data.split_at_mut(300);
+    let (data1, _data2) = data.split_at_mut(300);
     let data1_len = data1.len();
-    let data2_len = data2.len();
     let mut buf1 = &mut data1[..];
-    let mut buf2 = &mut data2[..];
 
     writer1.produce(&mut buf1).unwrap();
     println!("Written1: {}", data1_len - buf1.len());
@@ -43,7 +41,7 @@ fn main() {
         let written_len = data1_len - buf1.len();
         let d1 = &data1[..written_len];
         let d1_len = d1.len();
-        let mut buf1 = &d1[..];
+        let mut buf1 = d1;
 
         reader2.consume(&mut buf1).unwrap();
         println!("Read2: {}", d1_len - buf1.len());
@@ -58,11 +56,9 @@ fn main() {
     println!("Written2: {}", data1_len - buf1.len());
 
     {
-        let written_len = data1_len - buf1.len();
-        // let d1 = &data1[..written_len];
         let d1 = &data1[..];
         let d1_len = d1.len();
-        let mut buf1 = &d1[..];
+        let mut buf1 = d1;
         reader1.consume(&mut buf1).unwrap();
         println!("Read1: {}", d1_len - buf1.len());
     }
@@ -70,14 +66,14 @@ fn main() {
     let mut data3 = vec![0u8; 1024];
     let data3_len = data3.len();
     let mut buf3 = &mut data3[..];
-    writer1.produce(&mut buf3);
+    writer1.produce(&mut buf3).unwrap();
     println!("Written1: {}", data3_len - buf3.len());
 
     {
         let written_len = data3_len - buf3.len();
         let d1 = &data3[..written_len];
         let d1_len = d1.len();
-        let mut buf1 = &d1[..];
+        let mut buf1 = d1;
 
         reader2.consume(&mut buf1).unwrap();
         println!("Read2: {}", d1_len - buf1.len());
@@ -88,7 +84,7 @@ fn main() {
     let mut data3 = vec![0u8; 1024];
     let data3_len = data3.len();
     let mut buf3 = &mut data3[..];
-    writer1.produce(&mut buf3);
+    writer1.produce(&mut buf3).unwrap();
     println!("Written1: {}", data3_len - buf3.len());
 
     // I don't like the fact that you can push how much you want
@@ -99,7 +95,7 @@ fn main() {
     let mut data3 = vec![0u8; 1024];
     let data3_len = data3.len();
     let mut buf3 = &mut data3[..];
-    writer1.produce(&mut buf3);
+    writer1.produce(&mut buf3).unwrap();
     let buf3_len = buf3.len();
     println!("Written1: {}", data3_len - buf3.len());
 
@@ -108,7 +104,7 @@ fn main() {
         let written_len = data3_len - buf3_len;
         let d1 = &data3[..written_len];
         let d1_len = d1.len();
-        let mut buf1 = &d1[..];
+        let mut buf1 = d1;
 
         println!("Reading2 data: {:?}", buf1);
         reader2.consume(&mut buf1).unwrap();
@@ -123,7 +119,7 @@ fn main() {
         let written_len = data3_len - buf3_len;
         let d1 = &data3[..written_len];
         let d1_len = d1.len();
-        let mut buf1 = &d1[..];
+        let mut buf1 = d1;
 
         reader2.consume(&mut buf1).unwrap();
         println!("Read2: {}", d1_len - buf1.len());
@@ -133,5 +129,5 @@ fn main() {
     println!("Reader2 data: {:?}", reader2.drain_data_bytes());
     println!("Reader2 tag: {:?}", reader2.drain_tag_bytes());
 
-    let mut writer2 = writer2.into_data_writer();
+    let _writer2 = writer2.into_data_writer();
 }

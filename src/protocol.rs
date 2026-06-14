@@ -101,6 +101,7 @@ fn read_vec_dequeue_u8(stream: &mut VecDeque<u8>, buf: &mut [u8]) -> usize {
     limit
 }
 
+#[derive(Debug)]
 pub struct ProtocolBuffer {
     buf: VecDeque<u8>,
     eof: bool,
@@ -174,6 +175,7 @@ impl Write for ProtocolBuffer {
     }
 }
 
+#[derive(Debug)]
 pub struct PartialPacket {
     pub length_bytes: Option<VecDeque<u8>>,
     pub data: Option<VecDeque<u8>>,

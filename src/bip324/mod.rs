@@ -151,6 +151,8 @@ pub struct HandshakeReadParser {
     magic: MagicType,
     state: Option<HandshakeReadState>,
     read_buffer: Vec<u8>,
+    recv_terminator_after_send_key: bool,
+    terminator_is_not_split: bool,
 
     // Output buffers -- drained by caller after each step()
     output_key_bytes: VecDeque<u8>,
@@ -169,6 +171,8 @@ impl HandshakeReadParser {
             magic,
             state: Some(HandshakeReadState::ReceivingKey(remaining)),
             read_buffer: vec![],
+            recv_terminator_after_send_key: false,
+            terminator_is_not_split: false,
             output_key_bytes: VecDeque::new(),
             output_garbage_bytes: VecDeque::new(),
             output_terminator_bytes: VecDeque::new(),
@@ -213,6 +217,35 @@ impl HandshakeReadParser {
                 self.state = Some(ReceivingGarbage(inbound_term));
             }
         }
+
+        Ok(())
+    }
+
+    pub fn ensure_terminator_after_send_key(&mut self, ensure: bool) -> Result<(), String> {
+        if !matches!(
+            self.state.as_ref().expect("Expected state to be present"),
+            HandshakeReadState::ReceivingKey(..)
+        ) {
+            return Err(
+                "Can't change terminator behaviour after the reader read the received key"
+                    .to_string(),
+            );
+        }
+        self.recv_terminator_after_send_key = ensure;
+
+        Ok(())
+    }
+
+    pub fn ensure_terminator_not_split(&mut self, ensure: bool) -> Result<(), String> {
+        if !matches!(
+            self.state.as_ref().expect("Expected state to be present"),
+            HandshakeReadState::ReceivingKey(..)
+        ) {
+            return Err(
+                "Can't change terminator behaviour after the reader received the key".to_string(),
+            );
+        }
+        self.terminator_is_not_split = ensure;
 
         Ok(())
     }
@@ -284,6 +317,24 @@ impl HandshakeReadParser {
                 None
             }
         }
+    }
+
+    pub fn get_data_reader(&mut self) -> (DataReadParser, Vec<u8>) {
+        assert!(
+            self.is_handshake_done(),
+            "Handshake must be done before transitioning to data phase"
+        );
+
+        let inbound_cipher = self
+            .shared
+            .borrow_mut()
+            .inbound_cipher
+            .take()
+            .expect("Inbound cipher must be available after handshake");
+
+        let aad = self.take_aad().unwrap_or_default();
+
+        (DataReadParser::new(aad.clone(), inbound_cipher), aad)
     }
 
     pub fn into_data_reader(mut self) -> (DataReadParser, Vec<u8>) {
@@ -364,6 +415,8 @@ impl ProtocolReadParser for HandshakeReadParser {
                     let data_buf = data.buf_ref();
                     let mut to_consume = cmp::min(data_buf.len(), insurance_len);
 
+                    // Use the read_buffer as a temporary space for searching the terminator that
+                    // crosses the boundary
                     self.read_buffer.extend_from_slice(&data_buf[..to_consume]);
 
                     // If terminator found, actually consume the buffer
@@ -419,13 +472,18 @@ impl ProtocolReadParser for HandshakeReadParser {
 
                     let currlen = self.read_buffer.len();
                     let garbage_len = currlen - other_garbage_terminator.len();
-                    let lhs = cmp::max(prevlen, insurance_len) - insurance_len;
+                    let lhs = if !self.terminator_is_not_split {
+                        cmp::max(prevlen, insurance_len) - insurance_len
+                    } else {
+                        prevlen
+                    };
                     let new_range = lhs..garbage_len;
 
-                    // Copy slices to avoid multiple borrows of self
-                    let garbage_chunk = self.read_buffer[new_range].to_vec();
-                    self.output_garbage_bytes
-                        .extend(garbage_chunk.iter().copied());
+                    {
+                        let garbage_chunk = self.read_buffer[new_range].to_vec();
+                        self.output_garbage_bytes
+                            .extend(garbage_chunk.iter().copied());
+                    }
                     self.garbage_eof = true;
 
                     let term_chunk = self.read_buffer[garbage_len..].to_vec();
@@ -438,10 +496,17 @@ impl ProtocolReadParser for HandshakeReadParser {
                     (HandshakeDone(aad), Ok(ProtocolStatus::End))
                 } else {
                     let currlen = self.read_buffer.len();
-                    let lhs = cmp::max(prevlen, insurance_len) - insurance_len;
-                    let rhs = cmp::max(currlen, insurance_len) - insurance_len;
-                    // The range of data that wasn't relayed and we're sure it's garbage, and is not part of the terminator
-                    let new_range = lhs..rhs;
+                    let new_range = if !self.terminator_is_not_split {
+                        // The range of data that wasn't relayed and we're sure it's garbage, and is not part of the terminator
+                        let lhs = cmp::max(prevlen, insurance_len) - insurance_len;
+                        let rhs = cmp::max(currlen, insurance_len) - insurance_len;
+                        lhs..rhs
+                    } else {
+                        // We asume the peer can't send the terminator before we send the key
+                        let lhs = prevlen;
+                        let rhs = currlen;
+                        lhs..rhs
+                    };
 
                     let garbage_chunk = self.read_buffer[new_range].to_vec();
                     self.output_garbage_bytes
@@ -512,7 +577,7 @@ impl HandshakeWriteParser {
         self.shared.borrow().outbound_cipher.is_some()
     }
 
-    pub fn is_done(&self) -> bool {
+    pub fn is_done_writing(&self) -> bool {
         self.state.as_ref().is_some_and(|s| s.is_final())
     }
 
@@ -537,7 +602,25 @@ impl HandshakeWriteParser {
 
     pub fn into_data_writer(self) -> DataWriteParser {
         assert!(
-            self.is_done(),
+            self.is_done_writing(),
+            "Handshake must be done before transitioning to data phase"
+        );
+
+        let outbound_cipher = self
+            .shared
+            .borrow_mut()
+            .outbound_cipher
+            .take()
+            .expect("Outbound cipher must be available for data phase");
+
+        let mut writer = DataWriteParser::new(outbound_cipher);
+        writer.set_aad(&self.garbage_sent);
+        writer
+    }
+
+    pub fn get_data_writer(&mut self) -> DataWriteParser {
+        assert!(
+            self.is_done_writing(),
             "Handshake must be done before transitioning to data phase"
         );
 
@@ -567,7 +650,7 @@ impl HandshakeWriteParser {
 
 impl ProtocolWriteParser for HandshakeWriteParser {
     type State = HandshakeWriteState;
-    type Error = ();
+    type Error = Bip324Error;
 
     fn transition(
         &mut self,
@@ -712,14 +795,14 @@ impl DataReadParser {
         self.aad = aad;
     }
 
-    fn consume_aad(&mut self) -> Vec<u8> {
+    pub fn consume_aad(&mut self) -> Vec<u8> {
         self.aad.drain(..).collect()
     }
 }
 
 impl ProtocolReadParser for DataReadParser {
     type State = DataReadState;
-    type Error = ();
+    type Error = Bip324Error;
 
     fn transition(
         &mut self,
@@ -914,7 +997,7 @@ impl DataWriteParser {
 
 impl ProtocolWriteParser for DataWriteParser {
     type State = DataWriteState;
-    type Error = ();
+    type Error = Bip324Error;
 
     fn transition(
         &mut self,
@@ -948,10 +1031,8 @@ impl ProtocolWriteParser for DataWriteParser {
                     .encrypt_len_part_inplace(&mut buf[..size]);
 
                 if size == remaining {
-                    let length_bytes: [u8; 8] =
-                        [new_written, vec![0u8; 5]].concat().try_into().unwrap();
-                    // Add 1 for the header, which is not included in the length
-                    let payload_len = 1 + usize::from_le_bytes(length_bytes);
+                    let payload_len =
+                        parse_length_bytes([new_written[0], new_written[1], new_written[2]]);
                     let stream_cipher = self
                         .outbound_cipher
                         .packet_cipher
@@ -1042,6 +1123,36 @@ impl ProtocolWriteParser for DataWriteParser {
     }
 }
 
+pub fn parse_length_bytes(length_bytes: [u8; 3]) -> usize {
+    let length_bytes_8: [u8; 8] = [
+        length_bytes[0],
+        length_bytes[1],
+        length_bytes[2],
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    // Add 1 for the header, which is not included in the length
+    1 + usize::from_le_bytes(length_bytes_8)
+}
+
+/// Takes the length of an entire message (header + payload), and encodes the length of the payload.
+/// The length of the header is not included in the encoding.
+pub fn encode_bip324_raw_message_length(len: usize) -> Result<[u8; NUM_LENGTH_BYTES], String> {
+    if len == 0 {
+        return Err("Length is too small".to_string());
+    }
+    if len >= (2_usize).pow((NUM_LENGTH_BYTES * 8) as u32) {
+        return Err("Length is too big".to_string());
+    }
+
+    let bytes = (len - 1).to_le_bytes();
+
+    Ok([bytes[0], bytes[1], bytes[2]])
+}
+
 pub fn new_handshake_pair(
     role: Role,
     magic: MagicType,
@@ -1055,3 +1166,380 @@ pub fn new_handshake_pair(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub mod test_util {
+    use super::*;
+    use crate::state_machine::{StreamReadParser, StreamWriteParser};
+
+    pub enum ReadParserState {
+        Handshake(HandshakeReadParser),
+        HandshakeAndData(HandshakeReadParser, DataReadParser),
+        Data(DataReadParser),
+    }
+
+    impl HasFinal for ReadParserState {
+        fn is_final(&self) -> bool {
+            false
+        }
+    }
+
+    pub struct ReadParser {
+        state: Option<ReadParserState>,
+    }
+
+    impl ReadParser {
+        pub fn ensure_terminator_not_split(&mut self, ensure: bool) -> Result<(), String> {
+            use ReadParserState::*;
+
+            match self.state.as_mut().unwrap() {
+                Handshake(h_reader) => h_reader.ensure_terminator_not_split(ensure),
+                HandshakeAndData(..) | Data(..) => Ok(()),
+            }
+        }
+
+        pub fn drain_key_bytes(&mut self) -> Vec<u8> {
+            use ReadParserState::*;
+
+            match self.state.as_mut().unwrap() {
+                Handshake(h_reader) => h_reader.drain_key_bytes(),
+                HandshakeAndData(h_reader, _d_reader) => h_reader.drain_key_bytes(),
+                Data(_d_reader) => {
+                    vec![]
+                }
+            }
+        }
+
+        pub fn drain_garbage_bytes(&mut self) -> Vec<u8> {
+            use ReadParserState::*;
+
+            match self.state.as_mut().unwrap() {
+                Handshake(h_reader) => h_reader.drain_garbage_bytes(),
+                HandshakeAndData(h_reader, _d_reader) => h_reader.drain_garbage_bytes(),
+                Data(_d_reader) => {
+                    vec![]
+                }
+            }
+        }
+
+        pub fn drain_terminator_bytes(&mut self) -> Vec<u8> {
+            use ReadParserState::*;
+
+            match &mut self.state.as_mut().unwrap() {
+                Handshake(h_reader) => h_reader.drain_terminator_bytes(),
+                HandshakeAndData(h_reader, _d_reader) => h_reader.drain_terminator_bytes(),
+                Data(_d_reader) => {
+                    vec![]
+                }
+            }
+        }
+
+        pub fn is_key_eof(&self) -> bool {
+            use ReadParserState::*;
+
+            match self.state.as_ref().unwrap() {
+                Handshake(h_reader) => h_reader.is_key_eof(),
+                HandshakeAndData(..) | Data(..) => true,
+            }
+        }
+
+        pub fn is_garbage_eof(&self) -> bool {
+            use ReadParserState::*;
+
+            match self.state.as_ref().unwrap() {
+                Handshake(h_reader) => h_reader.is_garbage_eof(),
+                HandshakeAndData(..) | Data(..) => true,
+            }
+        }
+
+        pub fn take_aad(&mut self) -> Option<AADType> {
+            use ReadParserState::*;
+
+            match self.state.as_mut().unwrap() {
+                Handshake(..) => {
+                    // By the time the handshake reader has the aad, it should be done, and the data
+                    //  reader should be generate
+                    None
+                }
+                HandshakeAndData(_h_reader, d_reader) => d_reader.take_aad(),
+                Data(_d_reader) => Some(vec![]),
+            }
+        }
+
+        pub fn set_aad(&mut self, aad: Vec<u8>) {
+            use ReadParserState::*;
+
+            match self.state.as_mut().unwrap() {
+                Handshake(..) => {
+                    panic!("AAD can't be set while the reader performs the handshake");
+                }
+                HandshakeAndData(_, d_reader) | Data(d_reader) => d_reader.set_aad(aad),
+            }
+        }
+
+        pub fn drain_length_bytes(&mut self) -> Vec<u8> {
+            use ReadParserState::*;
+
+            match self.state.as_mut().unwrap() {
+                Handshake(..) => {
+                    vec![]
+                }
+                HandshakeAndData(_, d_reader) | Data(d_reader) => d_reader.drain_length_bytes(),
+            }
+        }
+
+        pub fn drain_data_bytes(&mut self) -> Vec<u8> {
+            use ReadParserState::*;
+
+            match self.state.as_mut().unwrap() {
+                Handshake(..) => {
+                    vec![]
+                }
+                HandshakeAndData(_, d_reader) | Data(d_reader) => d_reader.drain_data_bytes(),
+            }
+        }
+
+        pub fn drain_tag_bytes(&mut self) -> Vec<u8> {
+            use ReadParserState::*;
+
+            match self.state.as_mut().unwrap() {
+                Handshake(..) => {
+                    vec![]
+                }
+                HandshakeAndData(_, d_reader) | Data(d_reader) => d_reader.drain_tag_bytes(),
+            }
+        }
+
+        pub fn drain_raw_decrypted_bytes(&mut self) -> Vec<u8> {
+            self.drain_key_bytes()
+                .into_iter()
+                .chain(self.drain_garbage_bytes())
+                .chain(self.drain_terminator_bytes())
+                .chain(self.drain_length_bytes())
+                .chain(self.drain_data_bytes())
+                .chain(self.drain_tag_bytes())
+                .collect()
+        }
+    }
+
+    impl ProtocolReadParser for ReadParser {
+        type State = ReadParserState;
+        type Error = Bip324Error;
+
+        fn transition(
+            &mut self,
+            state: Self::State,
+            data: &mut dyn BufReader,
+        ) -> (Self::State, Result<ProtocolStatus, Self::Error>) {
+            use ReadParserState::*;
+
+            match state {
+                Handshake(mut h_reader) => {
+                    if let Err(e) = h_reader.consume(data) {
+                        return (Handshake(h_reader), Err(e));
+                    }
+                    if !h_reader.is_handshake_done() {
+                        (Handshake(h_reader), Ok(ProtocolStatus::End))
+                    } else {
+                        let (d_reader, _aad) = h_reader.get_data_reader();
+                        (
+                            HandshakeAndData(h_reader, d_reader),
+                            Ok(ProtocolStatus::Continue),
+                        )
+                    }
+                }
+                HandshakeAndData(h_reader, mut d_reader) => {
+                    if let Err(e) = d_reader.consume(data) {
+                        return (HandshakeAndData(h_reader, d_reader), Err(e));
+                    }
+
+                    (
+                        HandshakeAndData(h_reader, d_reader),
+                        Ok(ProtocolStatus::End),
+                    )
+                }
+                Data(mut d_reader) => {
+                    if let Err(e) = d_reader.consume(data) {
+                        return (Data(d_reader), Err(e));
+                    }
+                    (Data(d_reader), Ok(ProtocolStatus::End))
+                }
+            }
+        }
+
+        fn take_state(&mut self) -> Self::State {
+            self.state.take().unwrap()
+        }
+        fn set_state(&mut self, state: Self::State) {
+            self.state = Some(state)
+        }
+    }
+
+    pub enum WriteParserState {
+        Handshake(Box<HandshakeWriteParser>),
+        Data(Box<DataWriteParser>),
+    }
+
+    impl HasFinal for WriteParserState {
+        fn is_final(&self) -> bool {
+            false
+        }
+    }
+
+    pub struct WriteParser {
+        state: Option<WriteParserState>,
+    }
+
+    impl WriteParser {
+        pub fn push_garbage_bytes(&mut self, bytes: &[u8]) {
+            use WriteParserState::*;
+
+            match self.state.as_mut().unwrap() {
+                Handshake(h_writer) => h_writer.push_garbage_bytes(bytes),
+                Data(..) => {
+                    panic!("Writer is in data phase");
+                }
+            }
+        }
+
+        pub fn set_garbage_eof(&mut self) {
+            use WriteParserState::*;
+
+            match self.state.as_mut().unwrap() {
+                Handshake(h_writer) => h_writer.set_garbage_eof(),
+                Data(..) => {
+                    panic!("Writer is in data phase");
+                }
+            }
+        }
+
+        pub fn push_length_bytes(&mut self, bytes: &[u8]) {
+            use WriteParserState::*;
+
+            match self.state.as_mut().unwrap() {
+                Handshake(..) => {
+                    panic!("Writer is still in handshake phase");
+                }
+                Data(d_writer) => d_writer.push_length_bytes(bytes),
+            }
+        }
+
+        pub fn push_data_bytes(&mut self, bytes: &[u8]) {
+            use WriteParserState::*;
+
+            match self.state.as_mut().unwrap() {
+                Handshake(..) => {
+                    panic!("Writer is still in handshake phase");
+                }
+                Data(d_writer) => d_writer.push_data_bytes(bytes),
+            }
+        }
+
+        pub fn push_tag_bytes(&mut self, bytes: &[u8]) {
+            use WriteParserState::*;
+
+            match self.state.as_mut().unwrap() {
+                Handshake(..) => {
+                    panic!("Writer is still in handshake phase");
+                }
+                Data(d_writer) => d_writer.push_tag_bytes(bytes),
+            }
+        }
+
+        pub fn set_aad(&mut self, aad: &[u8]) {
+            use WriteParserState::*;
+
+            match self.state.as_mut().unwrap() {
+                Handshake(..) => {
+                    panic!("Writer is still in handshake phase");
+                }
+                Data(d_writer) => d_writer.set_aad(aad),
+            }
+        }
+
+        pub fn peek_input_length_bytes(&self) -> usize {
+            use WriteParserState::*;
+
+            match self.state.as_ref().unwrap() {
+                Handshake(..) => 0,
+                Data(d_writer) => d_writer.peek_input_length_bytes(),
+            }
+        }
+
+        pub fn peek_input_data_bytes(&self) -> usize {
+            use WriteParserState::*;
+
+            match self.state.as_ref().unwrap() {
+                Handshake(..) => 0,
+                Data(d_writer) => d_writer.peek_input_data_bytes(),
+            }
+        }
+
+        pub fn peek_input_tag_bytes(&self) -> usize {
+            use WriteParserState::*;
+
+            match self.state.as_ref().unwrap() {
+                Handshake(..) => 0,
+                Data(d_writer) => d_writer.peek_input_tag_bytes(),
+            }
+        }
+    }
+
+    impl ProtocolWriteParser for WriteParser {
+        type State = WriteParserState;
+        type Error = Bip324Error;
+
+        fn transition(
+            &mut self,
+            state: Self::State,
+            data: &mut dyn BufWriter,
+        ) -> (Self::State, Result<ProtocolStatus, Self::Error>) {
+            use WriteParserState::*;
+
+            match state {
+                Handshake(mut h_writer) => {
+                    if let Err(e) = h_writer.produce(data) {
+                        return (Handshake(h_writer), Err(e));
+                    }
+
+                    if !h_writer.is_done_writing() {
+                        (Handshake(h_writer), Ok(ProtocolStatus::End))
+                    } else {
+                        let d_writer = h_writer.get_data_writer();
+                        (Data(Box::new(d_writer)), Ok(ProtocolStatus::Continue))
+                    }
+                }
+                Data(mut d_writer) => {
+                    if let Err(e) = d_writer.produce(data) {
+                        return (Data(d_writer), Err(e));
+                    }
+                    (Data(d_writer), Ok(ProtocolStatus::End))
+                }
+            }
+        }
+
+        fn take_state(&mut self) -> Self::State {
+            self.state.take().unwrap()
+        }
+        fn set_state(&mut self, state: Self::State) {
+            self.state = Some(state)
+        }
+    }
+
+    pub fn new_reader_writer_pair(
+        role: Role,
+        magic: MagicType,
+        our_key: EcdhPoint,
+    ) -> (ReadParser, WriteParser) {
+        let (h_reader, h_writer) = new_handshake_pair(role, magic, our_key);
+
+        (
+            ReadParser {
+                state: Some(ReadParserState::Handshake(h_reader)),
+            },
+            WriteParser {
+                state: Some(WriteParserState::Handshake(Box::new(h_writer))),
+            },
+        )
+    }
+}

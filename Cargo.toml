@@ -18,3 +18,6 @@ thiserror = "2.0.18"
 bitcoin = "0.32.8"
 hex = { package = "hex-conservative", version = "0.2.0" }
 hex-literal = "1.1.0"
+# example intercept.rs
+nfq = { git = "https://github.com/RazorBest/nfq-rs.git", version = "0.2.6" }
+etherparse = "0.19.0"

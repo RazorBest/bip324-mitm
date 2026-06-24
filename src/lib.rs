@@ -878,29 +878,32 @@ impl MitmBIP324 {
     }
 
     pub fn new<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Result<Self, String> {
-        Self::new_from_magic(MAINNET_MAGIC, rng)
+        Ok(Self::new_from_magic(MAINNET_MAGIC, rng))
     }
 
     pub fn new_testnet<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Result<Self, String> {
-        Self::new_from_magic(TESTNET_MAGIC, rng)
+        Ok(Self::new_from_magic(TESTNET_MAGIC, rng))
     }
 
     pub fn new_regtest<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Result<Self, String> {
-        Self::new_from_magic(REGTEST_MAGIC, rng)
+        Ok(Self::new_from_magic(REGTEST_MAGIC, rng))
     }
 
     pub fn new_from_magic<Rng: RngCore + CryptoRng>(
         magic: MagicType,
         rng: &mut Rng,
-    ) -> Result<Self, String> {
-        let mut client_secret_key = [0u8; 32];
-        RngCore::fill_bytes(rng, &mut client_secret_key);
-        debug_assert_ne!([0u8; NUM_SECRET_BYTES], client_secret_key);
-        let mut server_secret_key = [0u8; 32];
-        RngCore::fill_bytes(rng, &mut server_secret_key);
-        debug_assert_ne!([0u8; NUM_SECRET_BYTES], server_secret_key);
+     ) -> Self {
+        loop {
+            let mut client_secret_key = [0u8; 32];
+            let mut server_secret_key = [0u8; 32];
+            RngCore::fill_bytes(rng, &mut client_secret_key);
+            RngCore::fill_bytes(rng, &mut server_secret_key);
 
-        Self::new_from_magic_and_secrets(magic, client_secret_key, server_secret_key)
+            match Self::new_from_magic_and_secrets(magic, client_secret_key, server_secret_key) {
+                Ok(instance) => return instance,
+                Err(_e) => continue
+            }
+        }
     }
 
     pub fn set_server_secret(

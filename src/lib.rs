@@ -901,7 +901,7 @@ impl MitmBIP324 {
 
             match Self::new_from_magic_and_secrets(magic, client_secret_key, server_secret_key) {
                 Ok(instance) => return instance,
-                Err(_e) => continue
+                Err(_e) => continue,
             }
         }
     }

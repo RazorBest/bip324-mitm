@@ -889,10 +889,7 @@ impl MitmBIP324 {
         Self::new_from_magic(REGTEST_MAGIC, rng)
     }
 
-    pub fn new_from_magic<Rng: RngCore + CryptoRng>(
-        magic: MagicType,
-        rng: &mut Rng,
-     ) -> Self {
+    pub fn new_from_magic<Rng: RngCore + CryptoRng>(magic: MagicType, rng: &mut Rng) -> Self {
         loop {
             let mut client_secret_key = [0u8; 32];
             let mut server_secret_key = [0u8; 32];

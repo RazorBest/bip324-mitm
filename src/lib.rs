@@ -2719,7 +2719,7 @@ mod mitmbip324_component_tests {
     fn new_components<Rng: RngCore + CryptoRng>(
         rng: &mut Rng,
     ) -> (BIP324Components, EcdhPoint, Vec<u8>, EcdhPoint, Vec<u8>) {
-        let mitm = MitmBIP324::new(rng).unwrap();
+        let mitm = MitmBIP324::new(rng);
         let bytes = secret_key_bytes_from_rng(rng);
         let client_key = key_from_secret_bytes(bytes).unwrap();
         let bytes = secret_key_bytes_from_rng(rng);

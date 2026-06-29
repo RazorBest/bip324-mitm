@@ -284,7 +284,7 @@ impl BIP324State {
 
         let bip324 = self.bip324.get_or_insert_with(|| {
             let mut rng = rand::thread_rng();
-            let mut bip324 = MitmBIP324::new(&mut rng).unwrap();
+            let mut bip324 = MitmBIP324::new(&mut rng);
             bip324.ensure_terminator_not_split(true).unwrap();
             bip324.enable_user_relay();
 

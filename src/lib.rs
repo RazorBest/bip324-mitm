@@ -877,30 +877,30 @@ impl MitmBIP324 {
         Self::new_from_magic_and_key_info(REGTEST_MAGIC, client_key, server_key)
     }
 
-    pub fn new<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Result<Self, String> {
+    pub fn new<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Self {
         Self::new_from_magic(MAINNET_MAGIC, rng)
     }
 
-    pub fn new_testnet<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Result<Self, String> {
+    pub fn new_testnet<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Self {
         Self::new_from_magic(TESTNET_MAGIC, rng)
     }
 
-    pub fn new_regtest<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Result<Self, String> {
+    pub fn new_regtest<Rng: RngCore + CryptoRng>(rng: &mut Rng) -> Self {
         Self::new_from_magic(REGTEST_MAGIC, rng)
     }
 
-    pub fn new_from_magic<Rng: RngCore + CryptoRng>(
-        magic: MagicType,
-        rng: &mut Rng,
-    ) -> Result<Self, String> {
-        let mut client_secret_key = [0u8; 32];
-        RngCore::fill_bytes(rng, &mut client_secret_key);
-        debug_assert_ne!([0u8; NUM_SECRET_BYTES], client_secret_key);
-        let mut server_secret_key = [0u8; 32];
-        RngCore::fill_bytes(rng, &mut server_secret_key);
-        debug_assert_ne!([0u8; NUM_SECRET_BYTES], server_secret_key);
+    pub fn new_from_magic<Rng: RngCore + CryptoRng>(magic: MagicType, rng: &mut Rng) -> Self {
+        loop {
+            let mut client_secret_key = [0u8; 32];
+            let mut server_secret_key = [0u8; 32];
+            RngCore::fill_bytes(rng, &mut client_secret_key);
+            RngCore::fill_bytes(rng, &mut server_secret_key);
 
-        Self::new_from_magic_and_secrets(magic, client_secret_key, server_secret_key)
+            match Self::new_from_magic_and_secrets(magic, client_secret_key, server_secret_key) {
+                Ok(instance) => return instance,
+                Err(_e) => continue,
+            }
+        }
     }
 
     pub fn set_server_secret(
@@ -2079,7 +2079,7 @@ mod mitmfakepeerbip324_tests {
     #[test]
     fn random_data_1() {
         let mut rng = secp256k1::rand::thread_rng();
-        let mut mitm = MitmBIP324::new(&mut rng).unwrap();
+        let mut mitm = MitmBIP324::new(&mut rng);
 
         mitm.client_write(&hex!("b4916771c194e010218a41e980586d27ae39e8432c9c33c0158fc0f8aba7dc9446b96091e73ea8b85e072d6cb7d420836bb84dc1c90a0e472c6f74bfff16c4b6")).unwrap();
         mitm.server_write(&hex!("262a2fb35253bc482fccd412c2a4203cc69071a0c67f0da66fb4b0439fd2ac17622a8e252cbddae6094440cd5a5458db28c285d57e1e436417d1eaf6541d58d3")).unwrap();
@@ -2096,7 +2096,7 @@ mod mitmfakepeerbip324_tests {
     #[test]
     fn random_data_2() {
         let mut rng = secp256k1::rand::thread_rng();
-        let mut mitm = MitmBIP324::new(&mut rng).unwrap();
+        let mut mitm = MitmBIP324::new(&mut rng);
 
         mitm.client_write(&hex!("b4916771c194e010218a41e980586d27ae39e8432c9c33c0158fc0f8aba7dc9446b96091e73ea8b85e072d6cb7d420836bb84dc1c90a0e472c6f74bfff16c4b6")).unwrap();
 
@@ -2108,7 +2108,7 @@ mod mitmfakepeerbip324_tests {
     #[test]
     fn test_garbage_limit_exceeded() {
         let mut rng = secp256k1::rand::thread_rng();
-        let mut mitm = MitmBIP324::new(&mut rng).unwrap();
+        let mut mitm = MitmBIP324::new(&mut rng);
 
         mitm.client_write(&hex!("b4916771c194e010218a41e980586d27ae39e8432c9c33c0158fc0f8aba7dc9446b96091e73ea8b85e072d6cb7d420836bb84dc1c90a0e472c6f74bfff16c4b6")).unwrap();
 
@@ -2123,7 +2123,7 @@ mod mitmfakepeerbip324_tests {
     #[test]
     fn test_server_sends_one_message_after_terminator() {
         let mut rng = secp256k1::rand::thread_rng();
-        let mut mitm = MitmBIP324::new(&mut rng).unwrap();
+        let mut mitm = MitmBIP324::new(&mut rng);
 
         let bytes = secret_key_bytes_from_rng(&mut rng);
         let client_key = key_from_secret_bytes(bytes).unwrap();
@@ -2251,7 +2251,7 @@ mod mitmfakepeerbip324_tests {
     #[test]
     fn test_client_sends_one_message_after_terminator() {
         let mut rng = secp256k1::rand::thread_rng();
-        let mut mitm = MitmBIP324::new(&mut rng).unwrap();
+        let mut mitm = MitmBIP324::new(&mut rng);
 
         let bytes = secret_key_bytes_from_rng(&mut rng);
         let client_key = key_from_secret_bytes(bytes).unwrap();
@@ -2716,7 +2716,7 @@ mod mitmbip324_component_tests {
     fn new_components<Rng: RngCore + CryptoRng>(
         rng: &mut Rng,
     ) -> (BIP324Components, EcdhPoint, Vec<u8>, EcdhPoint, Vec<u8>) {
-        let mitm = MitmBIP324::new(rng).unwrap();
+        let mitm = MitmBIP324::new(rng);
         let bytes = secret_key_bytes_from_rng(rng);
         let client_key = key_from_secret_bytes(bytes).unwrap();
         let bytes = secret_key_bytes_from_rng(rng);

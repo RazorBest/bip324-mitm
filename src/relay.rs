@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::io::{Read, Write};
 
+use crate::bip324::encode_bip324_raw_message_length;
 use crate::protocol::{
     NUM_ELLIGATOR_SWIFT_BYTES, NUM_GARBAGE_TERMINATOR_BYTES, NUM_LENGTH_BYTES, NUM_TAG_BYTES,
     PartialPacket, ProtocolBuffer,
@@ -46,6 +47,10 @@ pub trait FakePeerRelayWriter {
     fn write_data_bytes(&mut self, data: &[u8]);
     fn write_tag_bytes(&mut self, data: &[u8]);
     fn set_aad(&mut self, data: &[u8]);
+}
+
+pub trait Serialize {
+    fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()>;
 }
 
 #[derive(Default)]
@@ -321,7 +326,26 @@ pub enum ProtocolHandshakePacket {
 
 #[derive(Debug, PartialEq)]
 pub struct ProtocolDataPacket {
+    /// The data segment, including the first byte of header
     pub data: Vec<u8>,
+}
+
+impl Serialize for ProtocolDataPacket {
+    fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        let Ok(length) = encode_bip324_raw_message_length(self.data.len()) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid data length",
+            ));
+        };
+
+        w.write_all(&length)?;
+        w.write_all(&self.data)?;
+        // Tag. We don't care, since we serialize the decrypted packet.
+        w.write_all(&[0u8; 16])?;
+
+        Ok(())
+    }
 }
 
 #[derive(Debug)]

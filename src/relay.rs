@@ -307,9 +307,21 @@ pub struct HandshakeKey {
     pub data: Box<[u8; NUM_ELLIGATOR_SWIFT_BYTES]>,
 }
 
+impl Serialize for HandshakeKey {
+    fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(&self.data[..])
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct HandshakeGarbage {
     pub data: Vec<u8>,
+}
+
+impl Serialize for HandshakeGarbage {
+    fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(&self.data)
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -317,11 +329,29 @@ pub struct HandshakeTerminator {
     pub data: Box<[u8; NUM_GARBAGE_TERMINATOR_BYTES]>,
 }
 
+impl Serialize for HandshakeTerminator {
+    fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(&self.data[..])
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum ProtocolHandshakePacket {
     Key(HandshakeKey),
     Garbage(HandshakeGarbage),
     Terminator(HandshakeTerminator),
+}
+
+impl Serialize for ProtocolHandshakePacket {
+    fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        use ProtocolHandshakePacket::*;
+
+        match self {
+            Key(obj) => obj.write_to(w),
+            Garbage(obj) => obj.write_to(w),
+            Terminator(obj) => obj.write_to(w),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -354,6 +384,14 @@ pub enum ProtocolPacket {
     Data(ProtocolDataPacket),
 }
 
+impl Serialize for ProtocolPacket {
+    fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        match self {
+            Self::Handshake(obj) => obj.write_to(w),
+            Self::Data(obj) => obj.write_to(w),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ProtocolPacketResult(pub Result<ProtocolPacket, Box<dyn Error>>);

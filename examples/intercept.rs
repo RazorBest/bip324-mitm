@@ -455,7 +455,7 @@ impl Interceptor {
 
         session.state.bip324.as_mut().and_then(|bip324| {
             while let Some(prot_pkt) = bip324.next_client_protocol_packet().unwrap() {
-                if let bip324_mitm::relay::ProtocolPacket::Data(pdata) = prot_pkt {
+                if let bip324_mitm::relay::ProtocolPacket::Data(pdata) = prot_pkt.unwrap() {
                     println!("[client] -> [server]");
                     if pdata.data[0] == 0u8 {
                         println!("Data: {:?}", pdata);
@@ -466,7 +466,7 @@ impl Interceptor {
             }
 
             while let Some(prot_pkt) = bip324.next_server_protocol_packet().unwrap() {
-                if let bip324_mitm::relay::ProtocolPacket::Data(pdata) = prot_pkt {
+                if let bip324_mitm::relay::ProtocolPacket::Data(pdata) = prot_pkt.unwrap() {
                     println!("[server] -> [client]");
                     if pdata.data[0] == 0u8 {
                         println!("Data: {:?}", pdata);

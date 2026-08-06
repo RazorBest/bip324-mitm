@@ -307,9 +307,21 @@ pub struct HandshakeKey {
     pub data: Box<[u8; NUM_ELLIGATOR_SWIFT_BYTES]>,
 }
 
+impl Serialize for HandshakeKey {
+    fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(&self.data[..])
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct HandshakeGarbage {
     pub data: Vec<u8>,
+}
+
+impl Serialize for HandshakeGarbage {
+    fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(&self.data)
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -317,11 +329,29 @@ pub struct HandshakeTerminator {
     pub data: Box<[u8; NUM_GARBAGE_TERMINATOR_BYTES]>,
 }
 
+impl Serialize for HandshakeTerminator {
+    fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(&self.data[..])
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum ProtocolHandshakePacket {
     Key(HandshakeKey),
     Garbage(HandshakeGarbage),
     Terminator(HandshakeTerminator),
+}
+
+impl Serialize for ProtocolHandshakePacket {
+    fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        use ProtocolHandshakePacket::*;
+
+        match self {
+            Key(obj) => obj.write_to(w),
+            Garbage(obj) => obj.write_to(w),
+            Terminator(obj) => obj.write_to(w),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -348,20 +378,44 @@ impl Serialize for ProtocolDataPacket {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ProtocolPacket {
     Handshake(ProtocolHandshakePacket),
     Data(ProtocolDataPacket),
-    Err(Box<dyn Error>),
 }
 
-impl PartialEq for ProtocolPacket {
+impl Serialize for ProtocolPacket {
+    fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        match self {
+            Self::Handshake(obj) => obj.write_to(w),
+            Self::Data(obj) => obj.write_to(w),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ProtocolPacketResult(pub Result<ProtocolPacket, Box<dyn Error>>);
+
+impl ProtocolPacketResult {
+    #[allow(non_snake_case)]
+    pub fn Ok(packet: ProtocolPacket) -> Self {
+        Self(Ok(packet))
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Err(err: Box<dyn Error>) -> Self {
+        Self(Err(err))
+    }
+
+    pub fn unwrap(self) -> ProtocolPacket {
+        self.0.unwrap()
+    }
+}
+
+impl PartialEq for ProtocolPacketResult {
     fn eq(&self, other: &Self) -> bool {
-        use ProtocolPacket::*;
         match (self, other) {
-            (Handshake(v1), Handshake(v2)) => v1 == v2,
-            (Data(v1), Data(v2)) => v1 == v2,
-            (Err(..), Err(..)) => false,
+            (Self(Ok(val1)), Self(Ok(val2))) => val1 == val2,
             _ => false,
         }
     }
@@ -370,7 +424,7 @@ impl PartialEq for ProtocolPacket {
 #[derive(Default)]
 pub struct UserPacketRelay {
     pub stream_relay: FakePeerRelay,
-    pub queue: VecDeque<ProtocolPacket>,
+    pub queue: VecDeque<ProtocolPacketResult>,
 }
 
 impl FakePeerRelayWriter for UserPacketRelay {
@@ -393,14 +447,14 @@ impl FakePeerRelayWriter for UserPacketRelay {
                         data.len(),
                         read_cnt
                     );
-                    ProtocolPacket::Err(err.into())
+                    ProtocolPacketResult::Err(err.into())
                 } else {
-                    ProtocolPacket::Handshake(ProtocolHandshakePacket::Key(HandshakeKey {
-                        data: data.into(),
-                    }))
+                    ProtocolPacketResult::Ok(ProtocolPacket::Handshake(
+                        ProtocolHandshakePacket::Key(HandshakeKey { data: data.into() }),
+                    ))
                 }
             }
-            Err(err) => ProtocolPacket::Err(err.into()),
+            Err(err) => ProtocolPacketResult::Err(err.into()),
         };
 
         self.queue.push_front(packet);
@@ -425,14 +479,14 @@ impl FakePeerRelayWriter for UserPacketRelay {
                         data.len(),
                         read_cnt
                     );
-                    ProtocolPacket::Err(err.into())
+                    ProtocolPacketResult::Err(err.into())
                 } else {
-                    ProtocolPacket::Handshake(ProtocolHandshakePacket::Garbage(HandshakeGarbage {
-                        data,
-                    }))
+                    ProtocolPacketResult::Ok(ProtocolPacket::Handshake(
+                        ProtocolHandshakePacket::Garbage(HandshakeGarbage { data }),
+                    ))
                 }
             }
-            Err(err) => ProtocolPacket::Err(err.into()),
+            Err(err) => ProtocolPacketResult::Err(err.into()),
         };
 
         self.queue.push_front(packet);
@@ -457,14 +511,16 @@ impl FakePeerRelayWriter for UserPacketRelay {
                         data.len(),
                         read_cnt
                     );
-                    ProtocolPacket::Err(err.into())
+                    ProtocolPacketResult::Err(err.into())
                 } else {
-                    ProtocolPacket::Handshake(ProtocolHandshakePacket::Terminator(
-                        HandshakeTerminator { data: data.into() },
+                    ProtocolPacketResult::Ok(ProtocolPacket::Handshake(
+                        ProtocolHandshakePacket::Terminator(HandshakeTerminator {
+                            data: data.into(),
+                        }),
                     ))
                 }
             }
-            Err(err) => ProtocolPacket::Err(err.into()),
+            Err(err) => ProtocolPacketResult::Err(err.into()),
         };
 
         self.queue.push_front(packet);
@@ -495,7 +551,9 @@ impl FakePeerRelayWriter for UserPacketRelay {
         let mut buf = vec![0u8; payload_len];
         self.stream_relay.read_data_bytes(&mut buf);
         self.queue
-            .push_front(ProtocolPacket::Data(ProtocolDataPacket { data: buf }));
+            .push_front(ProtocolPacketResult::Ok(ProtocolPacket::Data(
+                ProtocolDataPacket { data: buf },
+            )));
         // Since we only read the data, and we don't need something else, we can
         // remove the packet even if it's not empty
         self.stream_relay.remove_first_packet();
@@ -507,7 +565,7 @@ impl FakePeerRelayWriter for UserPacketRelay {
 }
 
 impl UserPacketRelay {
-    pub fn next_protocol_packet(&mut self) -> Option<ProtocolPacket> {
+    pub fn next_protocol_packet(&mut self) -> Option<ProtocolPacketResult> {
         self.queue.pop_back()
     }
 }

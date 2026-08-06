@@ -231,7 +231,7 @@ impl MitmImpersonatorLeg {
         }
     }
 
-    pub fn next_protocol_packet(&mut self) -> Result<Option<relay::ProtocolPacket>, String> {
+    pub fn next_protocol_packet(&mut self) -> Result<Option<relay::ProtocolPacketResult>, String> {
         match self.reader_leg_state.as_mut() {
             Some(ReaderLegState::Handshake(reader)) => reader.next_protocol_packet(),
             Some(ReaderLegState::Data(reader)) => reader.next_protocol_packet(),
@@ -410,7 +410,7 @@ impl MitmHandshakeImpersonatorLegReader {
         ))
     }
 
-    pub fn next_protocol_packet(&mut self) -> Result<Option<relay::ProtocolPacket>, String> {
+    pub fn next_protocol_packet(&mut self) -> Result<Option<relay::ProtocolPacketResult>, String> {
         let Some(user_relay) = self.user_relay.as_mut() else {
             return Err("Leg Reader User Relay is not enabled".to_string());
         };
@@ -619,7 +619,7 @@ impl MitmImpersonatorLegReader {
         self.user_relay = Some(UserPacketRelay::default());
     }
 
-    pub fn next_protocol_packet(&mut self) -> Result<Option<relay::ProtocolPacket>, String> {
+    pub fn next_protocol_packet(&mut self) -> Result<Option<relay::ProtocolPacketResult>, String> {
         let Some(user_relay) = self.user_relay.as_mut() else {
             return Err("Leg Writer User Relay is not enabled".to_string());
         };
@@ -956,11 +956,15 @@ impl MitmBIP324 {
         res.map(|_| written)
     }
 
-    pub fn next_client_protocol_packet(&mut self) -> Result<Option<relay::ProtocolPacket>, String> {
+    pub fn next_client_protocol_packet(
+        &mut self,
+    ) -> Result<Option<relay::ProtocolPacketResult>, String> {
         self.server_leg.next_protocol_packet()
     }
 
-    pub fn next_server_protocol_packet(&mut self) -> Result<Option<relay::ProtocolPacket>, String> {
+    pub fn next_server_protocol_packet(
+        &mut self,
+    ) -> Result<Option<relay::ProtocolPacketResult>, String> {
         self.client_leg.next_protocol_packet()
     }
 }
@@ -2749,26 +2753,36 @@ mod mitmbip324_component_tests {
     use crate::relay::ProtocolHandshakePacket::Garbage as HGar;
     use crate::relay::ProtocolHandshakePacket::Key as HKey;
     use crate::relay::ProtocolHandshakePacket::Terminator as HTerm;
+    use crate::relay::ProtocolPacket;
     use crate::relay::ProtocolPacket::Data as PD;
-    use crate::relay::ProtocolPacket::Handshake as PHS;
+    use crate::relay::ProtocolPacketResult as PPR;
+    // use crate::relay::ProtocolPacket::Handshake as PHS;
+
+    macro_rules! PHS {
+        ($x:pat) => {
+            PPR(Ok(ProtocolPacket::Handshake($x)))
+        };
+    }
 
     macro_rules! HandshakeKey {
         ($v:expr) => {
-            PHS(HKey(relay::HandshakeKey {
+            PPR(Ok(ProtocolPacket::Handshake(HKey(relay::HandshakeKey {
                 data: Box::new($v.try_into().unwrap()),
-            }))
+            }))))
         };
     }
 
     macro_rules! HandshakeGarb {
         ($v:expr) => {
-            PHS(HGar(relay::HandshakeGarbage { data: $v.clone() }))
+            PPR(Ok(ProtocolPacket::Handshake(HGar(
+                relay::HandshakeGarbage { data: $v.clone() },
+            ))))
         };
     }
 
     macro_rules! ProtData {
         ($v:expr) => {
-            PD(relay::ProtocolDataPacket { data: $v.clone() })
+            PPR(Ok(PD(relay::ProtocolDataPacket { data: $v.clone() })))
         };
     }
 
@@ -2856,7 +2870,7 @@ mod mitmbip324_component_tests {
         // Client -- last byte of key --> Server
         client_to_server(&mut comps, 1);
         let packet = comps.mitm.next_client_protocol_packet().unwrap().unwrap();
-        assert!(matches!(packet, PHS(HKey(..))));
+        assert!(matches!(packet, PHS!(HKey(..))));
         assert_eq!(packet, HandshakeKey!(client_key.elligator_swift.to_array()));
         let maybe_packet = comps.mitm.next_client_protocol_packet().unwrap();
         assert!(maybe_packet.is_none());
@@ -2907,9 +2921,9 @@ mod mitmbip324_component_tests {
         let packet = comps.mitm.next_server_protocol_packet().unwrap().unwrap();
         assert_eq!(packet, HandshakeGarb!(server_garbage));
         let packet = comps.mitm.next_client_protocol_packet().unwrap().unwrap();
-        assert!(matches!(packet, PHS(HTerm(..))));
+        assert!(matches!(packet, PHS!(HTerm(..))));
         let packet = comps.mitm.next_server_protocol_packet().unwrap().unwrap();
-        assert!(matches!(packet, PHS(HTerm(..))));
+        assert!(matches!(packet, PHS!(HTerm(..))));
         let maybe_packet = comps.mitm.next_client_protocol_packet().unwrap();
         assert!(maybe_packet.is_none());
         let maybe_packet = comps.mitm.next_server_protocol_packet().unwrap();
@@ -2936,7 +2950,7 @@ mod mitmbip324_component_tests {
         // Client -- key --> Server
         client_to_server(&mut comps, NUM_ELLIGATOR_SWIFT_BYTES);
         let packet = comps.mitm.next_client_protocol_packet().unwrap().unwrap();
-        assert!(matches!(packet, PHS(HKey(..))));
+        assert!(matches!(packet, PHS!(HKey(..))));
         assert_eq!(packet, HandshakeKey!(client_key.elligator_swift.to_array()));
         let maybe_packet = comps.mitm.next_client_protocol_packet().unwrap();
         assert!(maybe_packet.is_none());
@@ -2969,7 +2983,7 @@ mod mitmbip324_component_tests {
         // Server -- key --> Client
         server_to_client(&mut comps, NUM_ELLIGATOR_SWIFT_BYTES);
         let packet = comps.mitm.next_server_protocol_packet().unwrap().unwrap();
-        assert!(matches!(packet, PHS(HKey(..))));
+        assert!(matches!(packet, PHS!(HKey(..))));
 
         // Client -- terminator without 1 byte --> MITM
         client_to_mitm(&mut comps, NUM_GARBAGE_TERMINATOR_BYTES - 1);
@@ -2989,7 +3003,7 @@ mod mitmbip324_component_tests {
         let packet = comps.mitm.next_client_protocol_packet().unwrap().unwrap();
         assert_eq!(packet, HandshakeGarb!(client_garbage));
         let packet = comps.mitm.next_client_protocol_packet().unwrap().unwrap();
-        assert!(matches!(packet, PHS(HTerm(..))));
+        assert!(matches!(packet, PHS!(HTerm(..))));
         let maybe_packet = comps.mitm.next_client_protocol_packet().unwrap();
         assert!(maybe_packet.is_none());
 
@@ -3018,7 +3032,7 @@ mod mitmbip324_component_tests {
         let packet = comps.mitm.next_server_protocol_packet().unwrap().unwrap();
         assert_eq!(packet, HandshakeGarb!(server_garbage));
         let packet = comps.mitm.next_server_protocol_packet().unwrap().unwrap();
-        assert!(matches!(packet, PHS(HTerm(..))));
+        assert!(matches!(packet, PHS!(HTerm(..))));
         let maybe_packet = comps.mitm.next_server_protocol_packet().unwrap();
         assert!(maybe_packet.is_none());
 
@@ -3049,20 +3063,20 @@ mod mitmbip324_component_tests {
         let mitm = &mut comps.mitm;
 
         let packet = mitm.next_client_protocol_packet().unwrap().unwrap();
-        assert!(matches!(packet, PHS(HKey(..))));
+        assert!(matches!(packet, PHS!(HKey(..))));
         let packet = mitm.next_client_protocol_packet().unwrap().unwrap();
         assert_eq!(packet, HandshakeGarb!(client_garbage));
         let packet = mitm.next_client_protocol_packet().unwrap().unwrap();
-        assert!(matches!(packet, PHS(HTerm(..))));
+        assert!(matches!(packet, PHS!(HTerm(..))));
         let maybe_packet = mitm.next_client_protocol_packet().unwrap();
         assert!(maybe_packet.is_none());
 
         let packet = mitm.next_server_protocol_packet().unwrap().unwrap();
-        assert!(matches!(packet, PHS(HKey(..))));
+        assert!(matches!(packet, PHS!(HKey(..))));
         let packet = mitm.next_server_protocol_packet().unwrap().unwrap();
         assert_eq!(packet, HandshakeGarb!(server_garbage));
         let packet = mitm.next_server_protocol_packet().unwrap().unwrap();
-        assert!(matches!(packet, PHS(HTerm(..))));
+        assert!(matches!(packet, PHS!(HTerm(..))));
         let maybe_packet = mitm.next_server_protocol_packet().unwrap();
         assert!(maybe_packet.is_none());
 

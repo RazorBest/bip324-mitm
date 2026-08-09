@@ -24,7 +24,9 @@ use crate::protocol::{
     EcdhPoint, GarbageTerminatorType, MAINNET_MAGIC, MagicType, NUM_ELLIGATOR_SWIFT_BYTES,
     NUM_SECRET_BYTES, REGTEST_MAGIC, Role, TESTNET_MAGIC,
 };
-use crate::relay::{FakePeerRelay, FakePeerRelayReader, FakePeerRelayWriter, UserPacketRelay};
+use crate::relay::{
+    FakePeerRelay, FakePeerRelayReader, FakePeerRelayWriter, UserBytesRelay, UserPacketRelay,
+};
 use crate::state_machine::{
     BufReader, BufWriter, HasFinal, ProtocolReadParser, ProtocolStatus, ProtocolWriteParser,
     StreamReadParser, StreamWriteParser,
@@ -176,6 +178,16 @@ impl MitmImpersonatorLeg {
         }
     }
 
+    pub fn enable_bytes_relay(&mut self) {
+        match self.reader_leg_state.as_mut() {
+            Some(ReaderLegState::Handshake(reader)) => reader.enable_bytes_relay(),
+            Some(ReaderLegState::Data(reader)) => reader.enable_bytes_relay(),
+            None => {
+                panic!("Can't enable relay");
+            }
+        }
+    }
+
     pub fn set_secret(
         &mut self,
         secret: [u8; NUM_SECRET_BYTES],
@@ -235,6 +247,16 @@ impl MitmImpersonatorLeg {
         match self.reader_leg_state.as_mut() {
             Some(ReaderLegState::Handshake(reader)) => reader.next_protocol_packet(),
             Some(ReaderLegState::Data(reader)) => reader.next_protocol_packet(),
+            None => {
+                panic!("Can't read protocol packet. No reader present");
+            }
+        }
+    }
+
+    pub fn next_bytes(&mut self) -> Result<Vec<u8>, String> {
+        match self.reader_leg_state.as_mut() {
+            Some(ReaderLegState::Handshake(reader)) => reader.next_bytes(),
+            Some(ReaderLegState::Data(reader)) => reader.next_bytes(),
             None => {
                 panic!("Can't read protocol packet. No reader present");
             }
@@ -335,6 +357,7 @@ pub struct MitmHandshakeImpersonatorLegReader {
     pub parser: HandshakeReadParser,
     relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
     pub user_relay: Option<UserPacketRelay>,
+    pub bytes_relay: Option<UserBytesRelay>,
 }
 
 impl MitmHandshakeImpersonatorLegReader {
@@ -346,6 +369,7 @@ impl MitmHandshakeImpersonatorLegReader {
             parser,
             relay_out,
             user_relay: None,
+            bytes_relay: None,
         }
     }
 
@@ -355,6 +379,14 @@ impl MitmHandshakeImpersonatorLegReader {
         }
 
         self.user_relay = Some(UserPacketRelay::default());
+    }
+
+    pub fn enable_bytes_relay(&mut self) {
+        if self.bytes_relay.is_some() {
+            return;
+        }
+
+        self.bytes_relay = Some(UserBytesRelay::default());
     }
 
     pub fn set_secret(
@@ -406,6 +438,7 @@ impl MitmHandshakeImpersonatorLegReader {
         Some(MitmImpersonatorLegReader::new_from_parser(
             self.relay_out,
             self.user_relay,
+            self.bytes_relay,
             data_parser,
         ))
     }
@@ -416,6 +449,14 @@ impl MitmHandshakeImpersonatorLegReader {
         };
 
         Ok(user_relay.next_protocol_packet())
+    }
+
+    pub fn next_bytes(&mut self) -> Result<Vec<u8>, String> {
+        let Some(bytes_relay) = self.bytes_relay.as_mut() else {
+            return Err("Leg Reader Bytes Relay is not enabled".to_string());
+        };
+
+        Ok(bytes_relay.next_bytes())
     }
 }
 
@@ -436,12 +477,18 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
             if let Some(user_relay) = &mut self.user_relay {
                 user_relay.write_key(&key_bytes).map_err(ReadError)?;
             }
+            if let Some(bytes_relay) = &mut self.bytes_relay {
+                bytes_relay.write_key(&key_bytes).map_err(ReadError)?;
+            }
         }
         if self.parser.is_key_eof() {
             self.relay_out.borrow_mut().set_eof_key();
 
             if let Some(user_relay) = &mut self.user_relay {
                 user_relay.set_eof_key();
+            }
+            if let Some(bytes_relay) = &mut self.bytes_relay {
+                bytes_relay.set_eof_key();
             }
         }
 
@@ -458,12 +505,20 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
                     .write_garbage(&garbage_bytes)
                     .map_err(ReadError)?;
             }
+            if let Some(bytes_relay) = &mut self.bytes_relay {
+                bytes_relay
+                    .write_garbage(&garbage_bytes)
+                    .map_err(ReadError)?;
+            }
         }
         if self.parser.is_garbage_eof() {
             self.relay_out.borrow_mut().set_eof_garbage();
 
             if let Some(user_relay) = &mut self.user_relay {
                 user_relay.set_eof_garbage();
+            }
+            if let Some(bytes_relay) = &mut self.bytes_relay {
+                bytes_relay.set_eof_garbage();
             }
         }
 
@@ -481,6 +536,12 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
                     .write_terminator(&terminator_bytes)
                     .map_err(ReadError)?;
                 user_relay.set_eof_terminator();
+            }
+            if let Some(bytes_relay) = &mut self.bytes_relay {
+                bytes_relay
+                    .write_terminator(&terminator_bytes)
+                    .map_err(ReadError)?;
+                bytes_relay.set_eof_terminator();
             }
         }
 
@@ -592,6 +653,7 @@ pub struct MitmImpersonatorLegReader {
     parser: DataReadParser,
     relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
     user_relay: Option<UserPacketRelay>,
+    bytes_relay: Option<UserBytesRelay>,
 }
 
 impl MitmImpersonatorLegReader {
@@ -602,12 +664,14 @@ impl MitmImpersonatorLegReader {
     pub(crate) fn new_from_parser(
         relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
         user_relay: Option<UserPacketRelay>,
+        bytes_relay: Option<UserBytesRelay>,
         parser: DataReadParser,
     ) -> Self {
         Self {
             parser,
             relay_out,
             user_relay,
+            bytes_relay,
         }
     }
 
@@ -619,12 +683,28 @@ impl MitmImpersonatorLegReader {
         self.user_relay = Some(UserPacketRelay::default());
     }
 
+    pub fn enable_bytes_relay(&mut self) {
+        if self.bytes_relay.is_some() {
+            return;
+        }
+
+        self.bytes_relay = Some(UserBytesRelay::default());
+    }
+
     pub fn next_protocol_packet(&mut self) -> Result<Option<relay::ProtocolPacketResult>, String> {
         let Some(user_relay) = self.user_relay.as_mut() else {
             return Err("Leg Writer User Relay is not enabled".to_string());
         };
 
         Ok(user_relay.next_protocol_packet())
+    }
+
+    pub fn next_bytes(&mut self) -> Result<Vec<u8>, String> {
+        let Some(bytes_relay) = self.bytes_relay.as_mut() else {
+            return Err("Leg Writer Bytes Relay is not enabled".to_string());
+        };
+
+        Ok(bytes_relay.next_bytes())
     }
 }
 
@@ -643,6 +723,9 @@ impl StreamReadParser for MitmImpersonatorLegReader {
             if let Some(user_relay) = &mut self.user_relay {
                 user_relay.write_length_bytes(&length_bytes);
             }
+            if let Some(bytes_relay) = &mut self.bytes_relay {
+                bytes_relay.write_length_bytes(&length_bytes);
+            }
         }
 
         let data_bytes = self.parser.drain_data_bytes();
@@ -651,6 +734,9 @@ impl StreamReadParser for MitmImpersonatorLegReader {
 
             if let Some(user_relay) = &mut self.user_relay {
                 user_relay.write_data_bytes(&data_bytes);
+            }
+            if let Some(bytes_relay) = &mut self.bytes_relay {
+                bytes_relay.write_data_bytes(&data_bytes);
             }
         }
 
@@ -661,6 +747,9 @@ impl StreamReadParser for MitmImpersonatorLegReader {
             if let Some(user_relay) = &mut self.user_relay {
                 user_relay.write_tag_bytes(&tag_bytes);
             }
+            if let Some(bytes_relay) = &mut self.bytes_relay {
+                bytes_relay.write_tag_bytes(&tag_bytes);
+            }
         }
 
         if let Some(aad) = self.parser.take_aad() {
@@ -668,6 +757,9 @@ impl StreamReadParser for MitmImpersonatorLegReader {
 
             if let Some(user_relay) = &mut self.user_relay {
                 user_relay.set_aad(&aad);
+            }
+            if let Some(bytes_relay) = &mut self.bytes_relay {
+                bytes_relay.set_aad(&aad);
             }
         }
 
@@ -922,6 +1014,11 @@ impl MitmBIP324 {
         self.server_leg.enable_user_relay();
     }
 
+    pub fn enable_bytes_relay(&mut self) {
+        self.client_leg.enable_bytes_relay();
+        self.server_leg.enable_bytes_relay();
+    }
+
     pub fn ensure_terminator_after_send_key(&mut self, ensure: bool) -> Result<(), String> {
         self.client_leg.ensure_terminator_after_send_key(ensure)?;
         self.server_leg.ensure_terminator_after_send_key(ensure)
@@ -966,6 +1063,14 @@ impl MitmBIP324 {
         &mut self,
     ) -> Result<Option<relay::ProtocolPacketResult>, String> {
         self.client_leg.next_protocol_packet()
+    }
+
+    pub fn next_bytes_client(&mut self) -> Result<Vec<u8>, String> {
+        self.server_leg.next_bytes()
+    }
+
+    pub fn next_bytes_server(&mut self) -> Result<Vec<u8>, String> {
+        self.client_leg.next_bytes()
     }
 }
 
@@ -2899,8 +3004,7 @@ mod mitmbip324_component_tests {
         // Server -- last byte of key --> Client
         server_to_client(&mut comps, 1);
 
-        // Client -- terminator without 1 byte --> Server
-        // comps.client_writer.push_terminator_bytes(&[0u8; NUM_GARBAGE_TERMINATOR_BYTES]);
+        // Client -- terminator --> Server
         client_to_server(&mut comps, NUM_GARBAGE_TERMINATOR_BYTES);
 
         // Server -- garbage without 1 byte --> Client
@@ -2912,8 +3016,6 @@ mod mitmbip324_component_tests {
         // Server -- terminator --> Client
         server_to_client(&mut comps, NUM_GARBAGE_TERMINATOR_BYTES);
 
-        // Client -- last byte of garbage --> Server
-        // client_to_server(&mut comps, 1);
         let packet = comps.mitm.next_client_protocol_packet().unwrap().unwrap();
         assert_eq!(packet, HandshakeGarb!(client_garbage));
         let packet = comps.mitm.next_server_protocol_packet().unwrap().unwrap();
@@ -3231,5 +3333,530 @@ mod mitmbip324_component_tests {
 
         let maybe_packet = comps.mitm.next_client_protocol_packet().unwrap();
         assert!(maybe_packet.is_none());
+    }
+
+    #[test]
+    fn test_bytes_relay_not_enabled() {
+        let mut rng = secp256k1::rand::thread_rng();
+        let (mut comps, _client_key, client_garbage, _server_key, server_garbage) =
+            new_components(&mut rng);
+        comps.mitm.ensure_terminator_not_split(true).unwrap();
+        comps
+            .client_reader
+            .ensure_terminator_not_split(true)
+            .unwrap();
+        comps
+            .server_reader
+            .ensure_terminator_not_split(true)
+            .unwrap();
+
+        do_handshake(&mut comps, &client_garbage, &server_garbage);
+        let mut mitm = comps.mitm;
+
+        let data = mitm.next_bytes_client();
+        assert!(data.is_err());
+        let data = mitm.next_bytes_client();
+        assert!(data.is_err());
+
+        let data = mitm.next_bytes_server();
+        assert!(data.is_err());
+        let data = mitm.next_bytes_server();
+        assert!(data.is_err());
+    }
+
+    #[track_caller]
+    fn assert_mitm_bytes_relays_empty(mitm: &mut MitmBIP324) {
+        let server_data = mitm.next_bytes_server().unwrap();
+        assert!(server_data.is_empty());
+        let client_data = mitm.next_bytes_client().unwrap();
+        assert!(client_data.is_empty());
+    }
+
+    #[test]
+    fn test_bytes_relay_doesnt_imply_packet_relay() {
+        let mut rng = secp256k1::rand::thread_rng();
+        let (mut comps, _client_key, client_garbage, _server_key, server_garbage) =
+            new_components(&mut rng);
+        comps.mitm.enable_bytes_relay();
+        comps.mitm.ensure_terminator_not_split(true).unwrap();
+        comps
+            .client_reader
+            .ensure_terminator_not_split(true)
+            .unwrap();
+        comps
+            .server_reader
+            .ensure_terminator_not_split(true)
+            .unwrap();
+
+        do_handshake(&mut comps, &client_garbage, &server_garbage);
+        let mut mitm = comps.mitm;
+
+        let packet = mitm.next_client_protocol_packet();
+        assert!(packet.is_err());
+        let packet = mitm.next_client_protocol_packet();
+        assert!(packet.is_err());
+
+        let packet = mitm.next_server_protocol_packet();
+        assert!(packet.is_err());
+        let packet = mitm.next_server_protocol_packet();
+        assert!(packet.is_err());
+    }
+
+    #[test]
+    fn test_data_not_stored_before_bytes_relay_enabled() {
+        let mut rng = secp256k1::rand::thread_rng();
+        let (mut comps, _client_key, client_garbage, _server_key, server_garbage) =
+            new_components(&mut rng);
+        comps.mitm.ensure_terminator_not_split(true).unwrap();
+        comps
+            .client_reader
+            .ensure_terminator_not_split(true)
+            .unwrap();
+        comps
+            .server_reader
+            .ensure_terminator_not_split(true)
+            .unwrap();
+
+        do_handshake(&mut comps, &client_garbage, &server_garbage);
+        let mitm = &mut comps.mitm;
+
+        let data = mitm.next_bytes_client();
+        assert!(data.is_err());
+        let data = mitm.next_bytes_server();
+        assert!(data.is_err());
+
+        mitm.enable_bytes_relay();
+
+        assert_mitm_bytes_relays_empty(mitm);
+    }
+
+    #[test]
+    fn test_bytes_relay_stepped_handshake() {
+        let mut rng = secp256k1::rand::thread_rng();
+        let (mut comps, client_key, client_garbage, server_key, server_garbage) =
+            new_components(&mut rng);
+        comps.mitm.enable_bytes_relay();
+        comps.mitm.ensure_terminator_not_split(true).unwrap();
+        comps
+            .client_reader
+            .ensure_terminator_not_split(true)
+            .unwrap();
+        comps
+            .server_reader
+            .ensure_terminator_not_split(true)
+            .unwrap();
+
+        // Client -- key wihtout 1 byte --> Server
+        client_to_server(&mut comps, NUM_ELLIGATOR_SWIFT_BYTES - 1);
+        let data = comps.mitm.next_bytes_client().unwrap();
+        let expected = &client_key.elligator_swift.to_array()[..NUM_ELLIGATOR_SWIFT_BYTES - 1];
+        assert_eq!(data, expected);
+
+        // Client -- last byte of key --> Server
+        client_to_server(&mut comps, 1);
+        let data = comps.mitm.next_bytes_client().unwrap();
+        let expected = &client_key.elligator_swift.to_array()[NUM_ELLIGATOR_SWIFT_BYTES - 1..];
+        assert_eq!(data, expected);
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+
+        comps.client_writer.push_garbage_bytes(&client_garbage);
+        comps.client_writer.set_garbage_eof();
+
+        // Client -- garbage wihtout 1 byte --> Server
+        client_to_server(&mut comps, client_garbage.len() - 1);
+        let data = comps.mitm.next_bytes_client().unwrap();
+        let expected = &client_garbage[..client_garbage.len() - 1];
+        assert_eq!(data, expected);
+
+        // Client -- last byte of garbage --> Server
+        client_to_server(&mut comps, 1);
+        let data = comps.mitm.next_bytes_client().unwrap();
+        let expected = &client_garbage[client_garbage.len() - 1..];
+        assert_eq!(data, expected);
+
+        comps.server_writer.push_garbage_bytes(&server_garbage);
+        comps.server_writer.set_garbage_eof();
+
+        // Server -- key without 1 byte --> Client
+        server_to_client(&mut comps, NUM_ELLIGATOR_SWIFT_BYTES - 1);
+        let data = comps.mitm.next_bytes_server().unwrap();
+        let expected = &server_key.elligator_swift.to_array()[..NUM_ELLIGATOR_SWIFT_BYTES - 1];
+        assert_eq!(data, expected);
+
+        // Server -- last byte of key --> Client
+        server_to_client(&mut comps, 1);
+
+        // Client -- terminator --> Server
+        client_to_server(&mut comps, NUM_GARBAGE_TERMINATOR_BYTES);
+
+        // Server -- garbage without 1 byte --> Client
+        server_to_client(&mut comps, server_garbage.len() - 1);
+
+        // Server -- last byte of garbage --> Client
+        server_to_client(&mut comps, 1);
+
+        // Server -- terminator --> Client
+        server_to_client(&mut comps, NUM_GARBAGE_TERMINATOR_BYTES);
+
+        let data = comps.mitm.next_bytes_client().unwrap();
+        assert_eq!(data.len(), NUM_GARBAGE_TERMINATOR_BYTES);
+        let data = comps.mitm.next_bytes_server().unwrap();
+        let expected_known = [
+            &server_key.elligator_swift.to_array()[NUM_ELLIGATOR_SWIFT_BYTES - 1..],
+            &server_garbage,
+        ]
+        .concat();
+        assert_eq!(data[..expected_known.len()], expected_known);
+        assert_eq!(
+            data.len() - expected_known.len(),
+            NUM_GARBAGE_TERMINATOR_BYTES
+        );
+
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+    }
+
+    #[test]
+    fn test_bytes_relay_steppped_handshake_split_terminator() {
+        let mut rng = secp256k1::rand::thread_rng();
+        let (mut comps, client_key, client_garbage, server_key, server_garbage) =
+            new_components(&mut rng);
+        comps.mitm.enable_bytes_relay();
+        // It's engough to disable the `terminator_not_split` condition for mitm
+        comps.mitm.ensure_terminator_not_split(false).unwrap();
+        comps
+            .client_reader
+            .ensure_terminator_not_split(true)
+            .unwrap();
+        comps
+            .server_reader
+            .ensure_terminator_not_split(true)
+            .unwrap();
+
+        // Client -- key --> Server
+        client_to_server(&mut comps, NUM_ELLIGATOR_SWIFT_BYTES);
+        let data = comps.mitm.next_bytes_client().unwrap();
+        assert_eq!(data, client_key.elligator_swift.to_array());
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+
+        comps.client_writer.push_garbage_bytes(&client_garbage);
+        comps.client_writer.set_garbage_eof();
+
+        // Client -- garbage without 1 byte --> MITM
+        client_to_mitm(&mut comps, client_garbage.len() - 1);
+        let data = comps.mitm.next_bytes_client().unwrap();
+        let expected_relayed = client_garbage.len() - 1 - (NUM_GARBAGE_TERMINATOR_BYTES - 1);
+        assert_eq!(data, client_garbage[..expected_relayed]);
+
+        // MITM -- partial garbage --> Server
+        let drained = drain_mitm_to_server(&mut comps);
+        // This happens because ensure_terminator_not_split is not set to true
+        assert_eq!(drained, expected_relayed,);
+
+        // Client -- last byte of garbage --> MITM
+        client_to_mitm(&mut comps, 1);
+        // MITM -- one gabage byte (but not the last) --> Server
+        let drained = drain_mitm_to_server(&mut comps);
+        assert_eq!(drained, 1);
+        let data = comps.mitm.next_bytes_client().unwrap();
+        assert_eq!(data, client_garbage[expected_relayed..expected_relayed + 1]);
+
+        // Server -- key --> Client
+        server_to_client(&mut comps, NUM_ELLIGATOR_SWIFT_BYTES);
+        let data = comps.mitm.next_bytes_server().unwrap();
+        assert_eq!(data, server_key.elligator_swift.to_array());
+
+        // Client -- terminator without 1 byte --> MITM
+        client_to_mitm(&mut comps, NUM_GARBAGE_TERMINATOR_BYTES - 1);
+        // The mitm module can't confirm the garbage has ended unless it received the entire
+        // terminator
+        let data = comps.mitm.next_bytes_client().unwrap();
+        assert_eq!(
+            data,
+            client_garbage[expected_relayed + 1..expected_relayed + NUM_GARBAGE_TERMINATOR_BYTES]
+        );
+
+        // MITM -- last 15 bytes of garbage --> Server
+        let drained = drain_mitm_to_server(&mut comps);
+        assert_eq!(drained, NUM_GARBAGE_TERMINATOR_BYTES - 1);
+        // Draining doesn't have an effect to the bytes relay
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+
+        // Client -- last byte of terminator --> MITM
+        client_to_mitm(&mut comps, 1);
+        let data = comps.mitm.next_bytes_client().unwrap();
+        assert_eq!(data.len(), NUM_GARBAGE_TERMINATOR_BYTES);
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+
+        // MITM -- terminator --> Server
+        let drained = drain_mitm_to_server(&mut comps);
+        assert_eq!(drained, NUM_GARBAGE_TERMINATOR_BYTES);
+
+        comps.server_writer.push_garbage_bytes(&server_garbage);
+        comps.server_writer.set_garbage_eof();
+
+        // Server -- garbage + terminator without 1 byte --> MITM
+        server_to_mitm(
+            &mut comps,
+            server_garbage.len() + NUM_GARBAGE_TERMINATOR_BYTES - 1,
+        );
+        let data = comps.mitm.next_bytes_server().unwrap();
+        assert_eq!(data, server_garbage);
+
+        let drained = drain_mitm_to_client(&mut comps);
+        assert_eq!(drained, server_garbage.len());
+        // Draining doesn't have an effect to the bytes relay
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+
+        // Server -- last byte of terminator --> MITM
+        server_to_mitm(&mut comps, 1);
+        let data = comps.mitm.next_bytes_server().unwrap();
+        assert_eq!(data.len(), NUM_GARBAGE_TERMINATOR_BYTES);
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+
+        // MITM -- last byte of terminator --> Client
+        let drained = drain_mitm_to_client(&mut comps);
+        assert_eq!(drained, NUM_GARBAGE_TERMINATOR_BYTES);
+        // Draining doesn't have an effect to the bytes relay
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+    }
+
+    #[test]
+    fn test_bytes_relay_data() {
+        let mut rng = secp256k1::rand::thread_rng();
+        let (mut comps, client_key, client_garbage, server_key, server_garbage) =
+            new_components(&mut rng);
+        comps.mitm.enable_bytes_relay();
+        comps.mitm.ensure_terminator_not_split(true).unwrap();
+        comps
+            .client_reader
+            .ensure_terminator_not_split(true)
+            .unwrap();
+        comps
+            .server_reader
+            .ensure_terminator_not_split(true)
+            .unwrap();
+
+        do_handshake(&mut comps, &client_garbage, &server_garbage);
+        let mitm = &mut comps.mitm;
+
+        let data = mitm.next_bytes_client().unwrap();
+        let expected_known = [&client_key.elligator_swift.to_array()[..], &client_garbage].concat();
+        assert_eq!(data[..expected_known.len()], expected_known);
+        assert_eq!(
+            data.len() - expected_known.len(),
+            NUM_GARBAGE_TERMINATOR_BYTES
+        );
+        let data = mitm.next_bytes_client().unwrap();
+        assert!(data.is_empty());
+
+        let data = mitm.next_bytes_server().unwrap();
+        let expected_known = [&server_key.elligator_swift.to_array()[..], &server_garbage].concat();
+        assert_eq!(data[..expected_known.len()], expected_known);
+        assert_eq!(
+            data.len() - expected_known.len(),
+            NUM_GARBAGE_TERMINATOR_BYTES
+        );
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+
+        // Client -- msg1 --> Server
+        let mut msg1 = vec![0u8; 230];
+        RngCore::fill_bytes(&mut rng, &mut msg1);
+        data_client_to_server(&mut comps, &msg1);
+
+        let data = comps.mitm.next_bytes_client().unwrap();
+        let expected = [
+            // 3 bytes length
+            &[229u8, 0u8, 0u8][..],
+            &msg1,
+        ]
+        .concat();
+        assert_eq!(data[..data.len() - NUM_TAG_BYTES], expected);
+        let data = comps.mitm.next_bytes_server().unwrap();
+        assert!(data.is_empty());
+        drop(msg1);
+
+        // Server -- msg2 --> Client
+        let mut msg2 = vec![0u8; 290];
+        RngCore::fill_bytes(&mut rng, &mut msg2);
+        data_server_to_client(&mut comps, &msg2);
+
+        let data = comps.mitm.next_bytes_server().unwrap();
+        let expected = [
+            // 3 bytes length
+            &[33u8, 1u8, 0u8][..],
+            &msg2,
+        ]
+        .concat();
+        assert_eq!(data[..data.len() - NUM_TAG_BYTES], expected);
+        let data = comps.mitm.next_bytes_client().unwrap();
+        assert!(data.is_empty());
+        drop(msg2);
+
+        // Client -- msg3 msg4 msg5 --> Server
+        let mut msg3 = vec![0u8; 230];
+        let mut msg4 = vec![0u8; 230];
+        let mut msg5 = vec![0u8; 230];
+        RngCore::fill_bytes(&mut rng, &mut msg3);
+        RngCore::fill_bytes(&mut rng, &mut msg4);
+        RngCore::fill_bytes(&mut rng, &mut msg5);
+        data_client_to_server(&mut comps, &msg3);
+        data_client_to_server(&mut comps, &msg4);
+        data_client_to_server(&mut comps, &msg5);
+
+        let data = comps.mitm.next_bytes_client().unwrap();
+        let mut cnt = 0;
+        let expected = [
+            // 3 bytes length
+            &[229u8, 0u8, 0u8][..],
+            &msg3,
+        ]
+        .concat();
+        assert_eq!(data[cnt..cnt + expected.len()], expected);
+        // Ignore tag. We assume it's correct.
+        cnt += expected.len() + NUM_TAG_BYTES;
+
+        let expected = [
+            // 3 bytes length
+            &[229u8, 0u8, 0u8][..],
+            &msg4,
+        ]
+        .concat();
+        assert_eq!(data[cnt..cnt + expected.len()], expected);
+        // Ignore tag. We assume it's correct.
+        cnt += expected.len() + NUM_TAG_BYTES;
+
+        let expected = [
+            // 3 bytes length
+            &[229u8, 0u8, 0u8][..],
+            &msg5,
+        ]
+        .concat();
+        assert_eq!(data[cnt..cnt + expected.len()], expected);
+        // Ignore tag. We assume it's correct.
+        cnt += expected.len() + NUM_TAG_BYTES;
+        assert_eq!(data.len(), cnt);
+
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+        drop(msg3);
+        drop(msg4);
+        drop(msg5);
+
+        // Client                        Server
+        //        <--     msg7       <--
+        //        -->     msg6       -->
+        //        <--     msg8       <--
+        let mut msg6 = vec![0u8; 230];
+        let mut msg7 = vec![0u8; 231];
+        let mut msg8 = vec![0u8; 232];
+        RngCore::fill_bytes(&mut rng, &mut msg6);
+        RngCore::fill_bytes(&mut rng, &mut msg7);
+        RngCore::fill_bytes(&mut rng, &mut msg8);
+        data_server_to_client(&mut comps, &msg7);
+        data_client_to_server(&mut comps, &msg6);
+        data_server_to_client(&mut comps, &msg8);
+
+        let data = comps.mitm.next_bytes_client().unwrap();
+        let expected = [
+            // 3 bytes length
+            &[229u8, 0u8, 0u8][..],
+            &msg6,
+        ]
+        .concat();
+        assert_eq!(data[..data.len() - NUM_TAG_BYTES], expected);
+
+        let data = comps.mitm.next_bytes_server().unwrap();
+        let mut cnt = 0;
+        let expected = [
+            // 3 bytes length
+            &[230u8, 0u8, 0u8][..],
+            &msg7,
+        ]
+        .concat();
+        assert_eq!(data[cnt..cnt + expected.len()], expected);
+        // Ignore tag. We assume it's correct.
+        cnt += expected.len() + NUM_TAG_BYTES;
+
+        let expected = [
+            // 3 bytes length
+            &[231u8, 0u8, 0u8][..],
+            &msg8,
+        ]
+        .concat();
+        assert_eq!(data[cnt..cnt + expected.len()], expected);
+
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+    }
+
+    #[test]
+    fn test_bytes_relay_partial_message() {
+        let mut rng = secp256k1::rand::thread_rng();
+        let (mut comps, _client_key, client_garbage, _server_key, server_garbage) =
+            new_components(&mut rng);
+        comps.mitm.ensure_terminator_not_split(true).unwrap();
+        comps.mitm.enable_bytes_relay();
+        comps
+            .client_reader
+            .ensure_terminator_not_split(true)
+            .unwrap();
+        comps
+            .server_reader
+            .ensure_terminator_not_split(true)
+            .unwrap();
+
+        do_handshake(&mut comps, &client_garbage, &server_garbage);
+        let mitm = &mut comps.mitm;
+
+        // Consume the handshake bytes
+        mitm.next_bytes_client().unwrap();
+        mitm.next_bytes_server().unwrap();
+
+        let data = mitm.next_bytes_client().unwrap();
+        assert!(data.is_empty());
+        let data = mitm.next_bytes_server().unwrap();
+        assert!(data.is_empty());
+
+        let mut msg = vec![0u8; 1000];
+        RngCore::fill_bytes(&mut rng, &mut msg);
+        let msg = msg;
+        let mut contents = msg.clone();
+        let mut length_bytes = encode_bip324_raw_message_length(contents.len())
+            .unwrap()
+            .to_vec();
+        let mut tag = vec![0u8; NUM_TAG_BYTES];
+
+        // The bytes relay should generate a byte for each byte consumed by the mitm
+        loop {
+            let byte;
+            let mut is_tag = false;
+            if !length_bytes.is_empty() {
+                byte = length_bytes[0];
+                comps.client_writer.push_length_bytes(&[byte]);
+                length_bytes.drain(..1);
+            } else if !contents.is_empty() {
+                byte = contents[0];
+                comps.client_writer.push_data_bytes(&[byte]);
+                contents.drain(..1);
+            } else if !tag.is_empty() {
+                println!("tag");
+                byte = tag[0];
+                comps.client_writer.push_tag_bytes(&[byte]);
+                // The bytes relay doesn't provide the tag. It's mocked as 0-bytes.
+                is_tag = true;
+                tag.drain(..1);
+            } else {
+                break;
+            }
+
+            client_to_server(&mut comps, 1);
+            let data = comps.mitm.next_bytes_client().unwrap();
+
+            if !is_tag {
+                assert_eq!(data, &[byte]);
+            } else {
+                assert_eq!(data.len(), 1);
+            }
+        }
+
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
     }
 }

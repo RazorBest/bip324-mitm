@@ -168,10 +168,10 @@ impl MitmImpersonatorLeg {
         Self::new(Role::Initiator, magic, relay_in, relay_out, secret_key)
     }
 
-    pub fn enable_user_relay(&mut self) {
+    pub fn enable_packet_relay(&mut self) {
         match self.reader_leg_state.as_mut() {
-            Some(ReaderLegState::Handshake(reader)) => reader.enable_user_relay(),
-            Some(ReaderLegState::Data(reader)) => reader.enable_user_relay(),
+            Some(ReaderLegState::Handshake(reader)) => reader.enable_packet_relay(),
+            Some(ReaderLegState::Data(reader)) => reader.enable_packet_relay(),
             None => {
                 panic!("Can't enable relay");
             }
@@ -356,7 +356,7 @@ impl ProtocolWriteParser for MitmImpersonatorLeg {
 pub struct MitmHandshakeImpersonatorLegReader {
     pub parser: HandshakeReadParser,
     relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
-    pub user_relay: Option<UserPacketRelay>,
+    pub packet_relay: Option<UserPacketRelay>,
     pub bytes_relay: Option<UserBytesRelay>,
 }
 
@@ -368,17 +368,17 @@ impl MitmHandshakeImpersonatorLegReader {
         Self {
             parser,
             relay_out,
-            user_relay: None,
+            packet_relay: None,
             bytes_relay: None,
         }
     }
 
-    pub fn enable_user_relay(&mut self) {
-        if self.user_relay.is_some() {
+    pub fn enable_packet_relay(&mut self) {
+        if self.packet_relay.is_some() {
             return;
         }
 
-        self.user_relay = Some(UserPacketRelay::default());
+        self.packet_relay = Some(UserPacketRelay::default());
     }
 
     pub fn enable_bytes_relay(&mut self) {
@@ -437,18 +437,18 @@ impl MitmHandshakeImpersonatorLegReader {
         let (data_parser, _aad) = self.parser.into_data_reader();
         Some(MitmImpersonatorLegReader::new_from_parser(
             self.relay_out,
-            self.user_relay,
+            self.packet_relay,
             self.bytes_relay,
             data_parser,
         ))
     }
 
     pub fn next_protocol_packet(&mut self) -> Result<Option<relay::ProtocolPacketResult>, String> {
-        let Some(user_relay) = self.user_relay.as_mut() else {
+        let Some(packet_relay) = self.packet_relay.as_mut() else {
             return Err("Leg Reader User Relay is not enabled".to_string());
         };
 
-        Ok(user_relay.next_protocol_packet())
+        Ok(packet_relay.next_protocol_packet())
     }
 
     pub fn next_bytes(&mut self) -> Result<Vec<u8>, String> {
@@ -474,8 +474,8 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
                 .write_key(&key_bytes)
                 .map_err(ReadError)?;
 
-            if let Some(user_relay) = &mut self.user_relay {
-                user_relay.write_key(&key_bytes).map_err(ReadError)?;
+            if let Some(packet_relay) = &mut self.packet_relay {
+                packet_relay.write_key(&key_bytes).map_err(ReadError)?;
             }
             if let Some(bytes_relay) = &mut self.bytes_relay {
                 bytes_relay.write_key(&key_bytes).map_err(ReadError)?;
@@ -484,8 +484,8 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
         if self.parser.is_key_eof() {
             self.relay_out.borrow_mut().set_eof_key();
 
-            if let Some(user_relay) = &mut self.user_relay {
-                user_relay.set_eof_key();
+            if let Some(packet_relay) = &mut self.packet_relay {
+                packet_relay.set_eof_key();
             }
             if let Some(bytes_relay) = &mut self.bytes_relay {
                 bytes_relay.set_eof_key();
@@ -500,8 +500,8 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
                 .write_garbage(&garbage_bytes)
                 .map_err(ReadError)?;
 
-            if let Some(user_relay) = &mut self.user_relay {
-                user_relay
+            if let Some(packet_relay) = &mut self.packet_relay {
+                packet_relay
                     .write_garbage(&garbage_bytes)
                     .map_err(ReadError)?;
             }
@@ -514,8 +514,8 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
         if self.parser.is_garbage_eof() {
             self.relay_out.borrow_mut().set_eof_garbage();
 
-            if let Some(user_relay) = &mut self.user_relay {
-                user_relay.set_eof_garbage();
+            if let Some(packet_relay) = &mut self.packet_relay {
+                packet_relay.set_eof_garbage();
             }
             if let Some(bytes_relay) = &mut self.bytes_relay {
                 bytes_relay.set_eof_garbage();
@@ -531,11 +531,11 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
                 .map_err(ReadError)?;
             self.relay_out.borrow_mut().set_eof_terminator();
 
-            if let Some(user_relay) = &mut self.user_relay {
-                user_relay
+            if let Some(packet_relay) = &mut self.packet_relay {
+                packet_relay
                     .write_terminator(&terminator_bytes)
                     .map_err(ReadError)?;
-                user_relay.set_eof_terminator();
+                packet_relay.set_eof_terminator();
             }
             if let Some(bytes_relay) = &mut self.bytes_relay {
                 bytes_relay
@@ -652,7 +652,7 @@ impl StreamWriteParser for MitmHandshakeImpersonatorLegWriter {
 pub struct MitmImpersonatorLegReader {
     parser: DataReadParser,
     relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
-    user_relay: Option<UserPacketRelay>,
+    packet_relay: Option<UserPacketRelay>,
     bytes_relay: Option<UserBytesRelay>,
 }
 
@@ -663,24 +663,24 @@ impl MitmImpersonatorLegReader {
     /// the relay is informed of the connection's AAD before the first packet arrives.
     pub(crate) fn new_from_parser(
         relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
-        user_relay: Option<UserPacketRelay>,
+        packet_relay: Option<UserPacketRelay>,
         bytes_relay: Option<UserBytesRelay>,
         parser: DataReadParser,
     ) -> Self {
         Self {
             parser,
             relay_out,
-            user_relay,
+            packet_relay,
             bytes_relay,
         }
     }
 
-    pub fn enable_user_relay(&mut self) {
-        if self.user_relay.is_some() {
+    pub fn enable_packet_relay(&mut self) {
+        if self.packet_relay.is_some() {
             return;
         }
 
-        self.user_relay = Some(UserPacketRelay::default());
+        self.packet_relay = Some(UserPacketRelay::default());
     }
 
     pub fn enable_bytes_relay(&mut self) {
@@ -692,11 +692,11 @@ impl MitmImpersonatorLegReader {
     }
 
     pub fn next_protocol_packet(&mut self) -> Result<Option<relay::ProtocolPacketResult>, String> {
-        let Some(user_relay) = self.user_relay.as_mut() else {
+        let Some(packet_relay) = self.packet_relay.as_mut() else {
             return Err("Leg Writer User Relay is not enabled".to_string());
         };
 
-        Ok(user_relay.next_protocol_packet())
+        Ok(packet_relay.next_protocol_packet())
     }
 
     pub fn next_bytes(&mut self) -> Result<Vec<u8>, String> {
@@ -720,8 +720,8 @@ impl StreamReadParser for MitmImpersonatorLegReader {
                 .borrow_mut()
                 .write_length_bytes(&length_bytes);
 
-            if let Some(user_relay) = &mut self.user_relay {
-                user_relay.write_length_bytes(&length_bytes);
+            if let Some(packet_relay) = &mut self.packet_relay {
+                packet_relay.write_length_bytes(&length_bytes);
             }
             if let Some(bytes_relay) = &mut self.bytes_relay {
                 bytes_relay.write_length_bytes(&length_bytes);
@@ -732,8 +732,8 @@ impl StreamReadParser for MitmImpersonatorLegReader {
         if !data_bytes.is_empty() {
             self.relay_out.borrow_mut().write_data_bytes(&data_bytes);
 
-            if let Some(user_relay) = &mut self.user_relay {
-                user_relay.write_data_bytes(&data_bytes);
+            if let Some(packet_relay) = &mut self.packet_relay {
+                packet_relay.write_data_bytes(&data_bytes);
             }
             if let Some(bytes_relay) = &mut self.bytes_relay {
                 bytes_relay.write_data_bytes(&data_bytes);
@@ -744,8 +744,8 @@ impl StreamReadParser for MitmImpersonatorLegReader {
         if !tag_bytes.is_empty() {
             self.relay_out.borrow_mut().write_tag_bytes(&tag_bytes);
 
-            if let Some(user_relay) = &mut self.user_relay {
-                user_relay.write_tag_bytes(&tag_bytes);
+            if let Some(packet_relay) = &mut self.packet_relay {
+                packet_relay.write_tag_bytes(&tag_bytes);
             }
             if let Some(bytes_relay) = &mut self.bytes_relay {
                 bytes_relay.write_tag_bytes(&tag_bytes);
@@ -755,8 +755,8 @@ impl StreamReadParser for MitmImpersonatorLegReader {
         if let Some(aad) = self.parser.take_aad() {
             self.relay_out.borrow_mut().set_aad(&aad);
 
-            if let Some(user_relay) = &mut self.user_relay {
-                user_relay.set_aad(&aad);
+            if let Some(packet_relay) = &mut self.packet_relay {
+                packet_relay.set_aad(&aad);
             }
             if let Some(bytes_relay) = &mut self.bytes_relay {
                 bytes_relay.set_aad(&aad);
@@ -1009,9 +1009,9 @@ impl MitmBIP324 {
         self.client_leg.set_secret(secret)
     }
 
-    pub fn enable_user_relay(&mut self) {
-        self.client_leg.enable_user_relay();
-        self.server_leg.enable_user_relay();
+    pub fn enable_packet_relay(&mut self) {
+        self.client_leg.enable_packet_relay();
+        self.server_leg.enable_packet_relay();
     }
 
     pub fn enable_bytes_relay(&mut self) {
@@ -2892,7 +2892,7 @@ mod mitmbip324_component_tests {
     }
 
     #[test]
-    fn test_user_relay_not_enabled() {
+    fn test_packet_relay_not_enabled() {
         let mut rng = secp256k1::rand::thread_rng();
         let (mut components, _client_key, client_garbage, _server_key, server_garbage) =
             new_components(&mut rng);
@@ -2921,7 +2921,7 @@ mod mitmbip324_component_tests {
     }
 
     #[test]
-    fn test_packets_not_stored_before_user_relay_enabled() {
+    fn test_packets_not_stored_before_packet_relay_enabled() {
         let mut rng = secp256k1::rand::thread_rng();
         let (mut components, _client_key, client_garbage, _server_key, server_garbage) =
             new_components(&mut rng);
@@ -2943,7 +2943,7 @@ mod mitmbip324_component_tests {
         let packet = mitm.next_server_protocol_packet();
         assert!(packet.is_err());
 
-        mitm.enable_user_relay();
+        mitm.enable_packet_relay();
 
         let maybe_packet = mitm.next_client_protocol_packet().unwrap();
         assert!(maybe_packet.is_none());
@@ -2952,11 +2952,11 @@ mod mitmbip324_component_tests {
     }
 
     #[test]
-    fn test_user_relay_stepped_handshake() {
+    fn test_packet_relay_stepped_handshake() {
         let mut rng = secp256k1::rand::thread_rng();
         let (mut comps, client_key, client_garbage, server_key, server_garbage) =
             new_components(&mut rng);
-        comps.mitm.enable_user_relay();
+        comps.mitm.enable_packet_relay();
         comps.mitm.ensure_terminator_not_split(true).unwrap();
         comps
             .client_reader
@@ -3033,11 +3033,11 @@ mod mitmbip324_component_tests {
     }
 
     #[test]
-    fn test_user_relay_steppped_handshake_split_terminator() {
+    fn test_packet_relay_steppped_handshake_split_terminator() {
         let mut rng = secp256k1::rand::thread_rng();
         let (mut comps, client_key, client_garbage, _server_key, server_garbage) =
             new_components(&mut rng);
-        comps.mitm.enable_user_relay();
+        comps.mitm.enable_packet_relay();
         // It's engough to disable the `terminator_not_split` condition for mitm
         comps.mitm.ensure_terminator_not_split(false).unwrap();
         comps
@@ -3146,11 +3146,11 @@ mod mitmbip324_component_tests {
     }
 
     #[test]
-    fn test_user_relay_data() {
+    fn test_packet_relay_data() {
         let mut rng = secp256k1::rand::thread_rng();
         let (mut comps, _client_key, client_garbage, _server_key, server_garbage) =
             new_components(&mut rng);
-        comps.mitm.enable_user_relay();
+        comps.mitm.enable_packet_relay();
         comps.mitm.ensure_terminator_not_split(true).unwrap();
         comps
             .client_reader
@@ -3263,12 +3263,12 @@ mod mitmbip324_component_tests {
     }
 
     #[test]
-    fn test_user_relay_partial_message() {
+    fn test_packet_relay_partial_message() {
         let mut rng = secp256k1::rand::thread_rng();
         let (mut comps, _client_key, client_garbage, _server_key, server_garbage) =
             new_components(&mut rng);
         comps.mitm.ensure_terminator_not_split(true).unwrap();
-        comps.mitm.enable_user_relay();
+        comps.mitm.enable_packet_relay();
         comps
             .client_reader
             .ensure_terminator_not_split(true)

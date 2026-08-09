@@ -33,7 +33,6 @@ dependencies = [
  "chacha20-poly1305",
  "etherparse",
  "hex-conservative 0.2.2",
- "hex-literal",
  "nfq",
  "rand",
  "secp256k1",
@@ -200,12 +199,6 @@ checksum = "830e599c2904b08f0834ee6337d8fe8f0ed4a63b5d9e7a7f49c0ffa06d08d360"
 dependencies = [
  "arrayvec",
 ]
-
-[[package]]
-name = "hex-literal"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e712f64ec3850b98572bffac52e2c6f282b29fe6c5fa6d42334b30be438d95c1"
 
 [[package]]
 name = "hex_lit"

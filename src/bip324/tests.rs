@@ -2,7 +2,6 @@ use super::*;
 
 use core::str::FromStr;
 use hex::prelude::*;
-use hex_literal::hex;
 use secp256k1::SecretKey;
 use secp256k1::ellswift::{ElligatorSwift, ElligatorSwiftParty};
 use secp256k1::rand::rngs::mock::StepRng;
@@ -15,6 +14,33 @@ use crate::protocol::{
     NUM_TAG_BYTES, PacketType, Role,
 };
 use crate::state_machine::{StreamReadParser, StreamWriteParser};
+
+const fn hex_val(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
+        _ => panic!("invalid hex digit"),
+    }
+}
+
+const fn hex_to_bytes<const N: usize>(hex: &str) -> [u8; N] {
+    let bytes = hex.as_bytes();
+    assert!(bytes.len() == N * 2, "hex string has wrong length");
+    let mut out = [0u8; N];
+    let mut i = 0;
+    while i < N {
+        out[i] = hex_val(bytes[2 * i]) * 16 + hex_val(bytes[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+
+macro_rules! hex {
+    ($hex:expr) => {
+        hex_to_bytes::<{ $hex.len() / 2 }>($hex)
+    };
+}
 
 const MAGIC: [u8; 4] = MAINNET_MAGIC;
 

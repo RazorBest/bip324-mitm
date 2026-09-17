@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::error::Error;
 use std::io::{Read, Write};
-use std::ops::{Deref, DerefMut};
 
 use crate::bip324::encode_bip324_raw_message_length;
 use crate::protocol::{
@@ -613,58 +612,8 @@ impl UserPacketRelay {
     pub fn next_protocol_packet(&mut self) -> Option<ProtocolPacketResult> {
         self.queue.pop_back()
     }
+
     pub fn ensure_garbage_includes_terminator(&mut self, ensure: bool) {
         self.garbage_includes_terminator = ensure;
-    }
-}
-
-#[derive(Default)]
-pub struct UserBytesRelay {
-    pub relay: FakePeerRelay,
-}
-
-impl Deref for UserBytesRelay {
-    type Target = FakePeerRelay;
-
-    fn deref(&self) -> &Self::Target {
-        &self.relay
-    }
-}
-
-impl DerefMut for UserBytesRelay {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.relay
-    }
-}
-
-impl UserBytesRelay {
-    pub fn next_bytes(&mut self) -> Vec<u8> {
-        let relay = &mut self.relay;
-        let size = relay.peek_len_key() + relay.peek_len_garbage() + relay.peek_len_terminator();
-
-        let mut data = vec![0u8; size];
-        let mut cnt = 0;
-        cnt += relay.read_key(&mut data[cnt..]).unwrap();
-        cnt += relay.read_garbage(&mut data[cnt..]).unwrap();
-        relay.read_terminator(&mut data[cnt..]).unwrap();
-
-        loop {
-            let new_size =
-                relay.peek_length_bytes() + relay.peek_data_bytes() + relay.peek_tag_bytes();
-            relay.read_aad();
-
-            if new_size == 0 {
-                break;
-            }
-
-            let mut cur = data.len();
-            data.resize(data.len() + new_size, 0);
-
-            cur += relay.read_length_bytes(&mut data[cur..]);
-            cur += relay.read_data_bytes(&mut data[cur..]);
-            cur += relay.read_tag_bytes(&mut data[cur..]);
-        }
-
-        data
     }
 }

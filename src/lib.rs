@@ -24,9 +24,7 @@ use crate::protocol::{
     EcdhPoint, GarbageTerminatorType, MAINNET_MAGIC, MagicType, NUM_ELLIGATOR_SWIFT_BYTES,
     NUM_SECRET_BYTES, REGTEST_MAGIC, Role, TESTNET_MAGIC,
 };
-use crate::relay::{
-    FakePeerRelay, FakePeerRelayReader, FakePeerRelayWriter, UserBytesRelay, UserPacketRelay,
-};
+use crate::relay::{FakePeerRelay, FakePeerRelayReader, FakePeerRelayWriter, UserPacketRelay};
 use crate::state_machine::{
     BufReader, BufWriter, HasFinal, ProtocolReadParser, ProtocolStatus, ProtocolWriteParser,
     StreamReadParser, StreamWriteParser,
@@ -357,7 +355,7 @@ pub struct MitmHandshakeImpersonatorLegReader {
     pub parser: HandshakeReadParser,
     relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
     pub packet_relay: Option<UserPacketRelay>,
-    pub bytes_relay: Option<UserBytesRelay>,
+    pub bytes_relay: Option<ProtocolBuffer>,
 }
 
 impl MitmHandshakeImpersonatorLegReader {
@@ -386,7 +384,7 @@ impl MitmHandshakeImpersonatorLegReader {
             return;
         }
 
-        self.bytes_relay = Some(UserBytesRelay::default());
+        self.bytes_relay = Some(ProtocolBuffer::default());
     }
 
     pub fn set_secret(
@@ -456,7 +454,7 @@ impl MitmHandshakeImpersonatorLegReader {
             return Err("Leg Reader Bytes Relay is not enabled".to_string());
         };
 
-        Ok(bytes_relay.next_bytes())
+        Ok(bytes_relay.consume_all())
     }
 }
 
@@ -478,7 +476,7 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
                 packet_relay.write_key(&key_bytes).map_err(ReadError)?;
             }
             if let Some(bytes_relay) = &mut self.bytes_relay {
-                bytes_relay.write_key(&key_bytes).map_err(ReadError)?;
+                bytes_relay.write(&key_bytes).map_err(ReadError)?;
             }
         }
         if self.parser.is_key_eof() {
@@ -486,9 +484,6 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
 
             if let Some(packet_relay) = &mut self.packet_relay {
                 packet_relay.set_eof_key();
-            }
-            if let Some(bytes_relay) = &mut self.bytes_relay {
-                bytes_relay.set_eof_key();
             }
         }
 
@@ -506,9 +501,7 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
                     .map_err(ReadError)?;
             }
             if let Some(bytes_relay) = &mut self.bytes_relay {
-                bytes_relay
-                    .write_garbage(&garbage_bytes)
-                    .map_err(ReadError)?;
+                bytes_relay.write(&garbage_bytes).map_err(ReadError)?;
             }
         }
         if self.parser.is_garbage_eof() {
@@ -516,9 +509,6 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
 
             if let Some(packet_relay) = &mut self.packet_relay {
                 packet_relay.set_eof_garbage();
-            }
-            if let Some(bytes_relay) = &mut self.bytes_relay {
-                bytes_relay.set_eof_garbage();
             }
         }
 
@@ -538,10 +528,7 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
                 packet_relay.set_eof_terminator();
             }
             if let Some(bytes_relay) = &mut self.bytes_relay {
-                bytes_relay
-                    .write_terminator(&terminator_bytes)
-                    .map_err(ReadError)?;
-                bytes_relay.set_eof_terminator();
+                bytes_relay.write(&terminator_bytes).map_err(ReadError)?;
             }
         }
 
@@ -645,15 +632,23 @@ impl StreamWriteParser for MitmHandshakeImpersonatorLegWriter {
             return Ok(self.parser.step(&mut limited)?);
         }
 
+        if self.parser.is_done_writing() && self.garbage_includes_terminator {
+            let garbage_len = self.parser.garbage_sent.len();
+            self.parser
+                .garbage_sent
+                .truncate(garbage_len - NUM_GARBAGE_TERMINATOR_BYTES);
+        }
+
         Ok(self.parser.step(data)?)
     }
 }
 
+#[derive(Clone)]
 pub struct MitmImpersonatorLegReader {
     parser: DataReadParser,
     relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
     packet_relay: Option<UserPacketRelay>,
-    bytes_relay: Option<UserBytesRelay>,
+    bytes_relay: Option<ProtocolBuffer>,
 }
 
 impl MitmImpersonatorLegReader {
@@ -664,7 +659,7 @@ impl MitmImpersonatorLegReader {
     pub(crate) fn new_from_parser(
         relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
         packet_relay: Option<UserPacketRelay>,
-        bytes_relay: Option<UserBytesRelay>,
+        bytes_relay: Option<ProtocolBuffer>,
         parser: DataReadParser,
     ) -> Self {
         Self {
@@ -676,19 +671,11 @@ impl MitmImpersonatorLegReader {
     }
 
     pub fn enable_packet_relay(&mut self) {
-        if self.packet_relay.is_some() {
-            return;
-        }
-
-        self.packet_relay = Some(UserPacketRelay::default());
+        self.packet_relay.get_or_insert_default();
     }
 
     pub fn enable_bytes_relay(&mut self) {
-        if self.bytes_relay.is_some() {
-            return;
-        }
-
-        self.bytes_relay = Some(UserBytesRelay::default());
+        self.bytes_relay.get_or_insert_default();
     }
 
     pub fn next_protocol_packet(&mut self) -> Result<Option<relay::ProtocolPacketResult>, String> {
@@ -704,7 +691,7 @@ impl MitmImpersonatorLegReader {
             return Err("Leg Writer Bytes Relay is not enabled".to_string());
         };
 
-        Ok(bytes_relay.next_bytes())
+        Ok(bytes_relay.consume_all())
     }
 }
 
@@ -724,7 +711,7 @@ impl StreamReadParser for MitmImpersonatorLegReader {
                 packet_relay.write_length_bytes(&length_bytes);
             }
             if let Some(bytes_relay) = &mut self.bytes_relay {
-                bytes_relay.write_length_bytes(&length_bytes);
+                let _ = bytes_relay.write(&length_bytes).unwrap();
             }
         }
 
@@ -736,7 +723,7 @@ impl StreamReadParser for MitmImpersonatorLegReader {
                 packet_relay.write_data_bytes(&data_bytes);
             }
             if let Some(bytes_relay) = &mut self.bytes_relay {
-                bytes_relay.write_data_bytes(&data_bytes);
+                let _ = bytes_relay.write(&data_bytes).unwrap();
             }
         }
 
@@ -748,7 +735,7 @@ impl StreamReadParser for MitmImpersonatorLegReader {
                 packet_relay.write_tag_bytes(&tag_bytes);
             }
             if let Some(bytes_relay) = &mut self.bytes_relay {
-                bytes_relay.write_tag_bytes(&tag_bytes);
+                let _ = bytes_relay.write(&tag_bytes).unwrap();
             }
         }
 
@@ -757,9 +744,6 @@ impl StreamReadParser for MitmImpersonatorLegReader {
 
             if let Some(packet_relay) = &mut self.packet_relay {
                 packet_relay.set_aad(&aad);
-            }
-            if let Some(bytes_relay) = &mut self.bytes_relay {
-                bytes_relay.set_aad(&aad);
             }
         }
 

@@ -30,6 +30,7 @@ pub trait FakePeerRelayReader {
     fn peek_tag_bytes(&self) -> usize;
     fn read_aad(&mut self) -> Option<Vec<u8>>;
     fn peek_aad_bytes(&self) -> usize;
+    fn get_expected_terminator(&self) -> Option<&[u8]>;
 }
 
 pub trait FakePeerRelayWriter {
@@ -48,6 +49,7 @@ pub trait FakePeerRelayWriter {
     fn write_data_bytes(&mut self, data: &[u8]);
     fn write_tag_bytes(&mut self, data: &[u8]);
     fn set_aad(&mut self, data: &[u8]);
+    fn set_expected_terminator(&mut self, data: &[u8]);
 }
 
 pub trait Serialize {
@@ -59,6 +61,7 @@ pub struct FakePeerRelay {
     key: ProtocolBuffer,
     garbage: ProtocolBuffer,
     terminator: ProtocolBuffer,
+    expected_terminator: Option<Vec<u8>>,
     packets: Vec<PartialPacket>,
 }
 
@@ -201,6 +204,10 @@ impl FakePeerRelayReader for FakePeerRelay {
 
         self.packets[0].peek_aad()
     }
+
+    fn get_expected_terminator(&self) -> Option<&[u8]> {
+        self.expected_terminator.as_deref()
+    }
 }
 
 impl FakePeerRelayWriter for FakePeerRelay {
@@ -300,6 +307,10 @@ impl FakePeerRelayWriter for FakePeerRelay {
         let last_packet = &mut self.packets[packets_len - 1];
 
         last_packet.set_aad(aad);
+    }
+
+    fn set_expected_terminator(&mut self, terminator: &[u8]) {
+        self.expected_terminator = Some(terminator.to_vec());
     }
 }
 
@@ -571,6 +582,10 @@ impl FakePeerRelayWriter for UserPacketRelay {
 
     fn set_aad(&mut self, _aad: &[u8]) {
         // The user packet relay doesn't expose the aad
+    }
+
+    fn set_expected_terminator(&mut self, _terminator: &[u8]) {
+        // The user packet relay doesn't expose expected terminator
     }
 }
 

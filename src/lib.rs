@@ -3838,6 +3838,114 @@ mod mitmbip324_component_tests {
     }
 
     #[test]
+    fn test_bytes_relay_garbage_includes_terminator() {
+        let mut rng = secp256k1::rand::thread_rng();
+        let (mut comps, client_key, client_garbage, server_key, server_garbage) =
+            new_components(&mut rng);
+        comps.mitm.enable_bytes_relay();
+        comps.mitm.ensure_terminator_not_split(false).unwrap();
+        comps.mitm.ensure_garbage_includes_terminator(true).unwrap();
+        comps
+            .client_reader
+            .ensure_terminator_not_split(false)
+            .unwrap();
+        comps
+            .server_reader
+            .ensure_terminator_not_split(false)
+            .unwrap();
+
+        // Client -- key --> Server
+        client_to_server(&mut comps, NUM_ELLIGATOR_SWIFT_BYTES);
+        let data = comps.mitm.next_bytes_client().unwrap();
+        assert_eq!(data, client_key.elligator_swift.to_array());
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+
+        comps.client_writer.push_garbage_bytes(&client_garbage);
+        comps.client_writer.set_garbage_eof();
+
+        // Client -- garbage without 1 byte --> MITM
+        client_to_mitm(&mut comps, client_garbage.len() - 1);
+        let data = comps.mitm.next_bytes_client().unwrap();
+        let expected_relayed = client_garbage.len() - 1;
+        assert_eq!(data, client_garbage[..expected_relayed]);
+
+        // MITM -- partial garbage --> Server
+        let drained = drain_mitm_to_server(&mut comps);
+        assert_eq!(drained, expected_relayed);
+
+        // Client -- last byte of garbage --> MITM
+        client_to_mitm(&mut comps, 1);
+        // MITM -- one gabage byte (but not the last) --> Server
+        let drained = drain_mitm_to_server(&mut comps);
+        assert_eq!(drained, 1);
+        let data = comps.mitm.next_bytes_client().unwrap();
+        assert_eq!(data, client_garbage[expected_relayed..expected_relayed + 1]);
+
+        // Server -- key --> Client
+        server_to_client(&mut comps, NUM_ELLIGATOR_SWIFT_BYTES);
+        let data = comps.mitm.next_bytes_server().unwrap();
+        assert_eq!(data, server_key.elligator_swift.to_array());
+
+        // Client -- terminator without 1 byte --> MITM
+        client_to_mitm(&mut comps, NUM_GARBAGE_TERMINATOR_BYTES - 1);
+        let data = comps.mitm.next_bytes_client().unwrap();
+        assert_eq!(data.len(), NUM_GARBAGE_TERMINATOR_BYTES - 1);
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+
+        // MITM -- last 15 bytes of garbage --> Server
+        let drained = drain_mitm_to_server(&mut comps);
+        assert_eq!(drained, NUM_GARBAGE_TERMINATOR_BYTES - 1);
+        // Draining doesn't have an effect to the bytes relay
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+
+        // Client -- last byte of terminator --> MITM
+        client_to_mitm(&mut comps, 1);
+        let data = comps.mitm.next_bytes_client().unwrap();
+        assert_eq!(data.len(), 1);
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+
+        // MITM -- last byte of terminator --> Server
+        let drained = drain_mitm_to_server(&mut comps);
+        assert_eq!(drained, 1);
+
+        comps.server_writer.push_garbage_bytes(&server_garbage);
+        comps.server_writer.set_garbage_eof();
+
+        // Server -- garbage + terminator without 1 byte --> MITM
+        server_to_mitm(
+            &mut comps,
+            server_garbage.len() + NUM_GARBAGE_TERMINATOR_BYTES - 1,
+        );
+        let data = comps.mitm.next_bytes_server().unwrap();
+        assert_eq!(
+            data.len(),
+            server_garbage.len() + NUM_GARBAGE_TERMINATOR_BYTES - 1
+        );
+        assert_eq!(data[..server_garbage.len()], server_garbage);
+
+        // MITM -- garbage + terminator without 1 byte --> Client
+        let drained = drain_mitm_to_client(&mut comps);
+        assert_eq!(
+            drained,
+            server_garbage.len() + NUM_GARBAGE_TERMINATOR_BYTES - 1
+        );
+        // Draining doesn't have an effect to the bytes relay
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+
+        // Server -- last byte of terminator --> MITM
+        server_to_mitm(&mut comps, 1);
+        let data = comps.mitm.next_bytes_server().unwrap();
+        assert_eq!(data.len(), 1);
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+
+        // MITM -- last byte of terminator --> Client
+        let drained = drain_mitm_to_client(&mut comps);
+        assert_eq!(drained, 1);
+        // Draining doesn't have an effect to the bytes relay
+        assert_mitm_bytes_relays_empty(&mut comps.mitm);
+    }
+
+    #[test]
     fn test_bytes_relay_data() {
         let mut rng = secp256k1::rand::thread_rng();
         let (mut comps, client_key, client_garbage, server_key, server_garbage) =

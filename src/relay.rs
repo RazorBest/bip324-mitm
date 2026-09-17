@@ -446,6 +446,7 @@ impl PartialEq for ProtocolPacketResult {
 pub struct UserPacketRelay {
     pub stream_relay: FakePeerRelay,
     pub queue: VecDeque<ProtocolPacketResult>,
+    pub garbage_includes_terminator: bool,
 }
 
 impl FakePeerRelayWriter for UserPacketRelay {
@@ -492,7 +493,7 @@ impl FakePeerRelayWriter for UserPacketRelay {
         self.stream_relay.set_eof_garbage();
 
         let mut data = vec![0u8; self.stream_relay.peek_len_garbage()];
-        let packet = match self.stream_relay.read_garbage(&mut data) {
+        match self.stream_relay.read_garbage(&mut data) {
             Ok(read_cnt) => {
                 if read_cnt != data.len() {
                     let err = format!(
@@ -500,25 +501,44 @@ impl FakePeerRelayWriter for UserPacketRelay {
                         data.len(),
                         read_cnt
                     );
-                    ProtocolPacketResult::Err(err.into())
+                    self.queue.push_front(ProtocolPacketResult::Err(err.into()));
                 } else {
-                    ProtocolPacketResult::Ok(ProtocolPacket::Handshake(
+                    let mut terminator = None;
+                    if self.garbage_includes_terminator {
+                        terminator =
+                            Some(data.split_off(data.len() - NUM_GARBAGE_TERMINATOR_BYTES));
+                    }
+                    let garbage_packet = ProtocolPacketResult::Ok(ProtocolPacket::Handshake(
                         ProtocolHandshakePacket::Garbage(HandshakeGarbage { data }),
-                    ))
+                    ));
+                    self.queue.push_front(garbage_packet);
+
+                    if let Some(terminator) = terminator {
+                        let terminator_packet =
+                            ProtocolPacketResult::Ok(ProtocolPacket::Handshake(
+                                ProtocolHandshakePacket::Terminator(HandshakeTerminator {
+                                    data: terminator.try_into().unwrap(),
+                                }),
+                            ));
+                        self.queue.push_front(terminator_packet);
+                    }
                 }
             }
-            Err(err) => ProtocolPacketResult::Err(err.into()),
-        };
-
-        self.queue.push_front(packet);
+            Err(err) => {
+                self.queue.push_front(ProtocolPacketResult::Err(err.into()));
+            }
+        }
     }
 
     fn write_terminator(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.garbage_includes_terminator {
+            return Ok(data.len());
+        }
         self.stream_relay.write_terminator(data)
     }
 
     fn set_eof_terminator(&mut self) {
-        if self.stream_relay.is_eof_terminator() {
+        if self.stream_relay.is_eof_terminator() || self.garbage_includes_terminator {
             return;
         }
         self.stream_relay.set_eof_terminator();
@@ -592,6 +612,9 @@ impl FakePeerRelayWriter for UserPacketRelay {
 impl UserPacketRelay {
     pub fn next_protocol_packet(&mut self) -> Option<ProtocolPacketResult> {
         self.queue.pop_back()
+    }
+    pub fn ensure_garbage_includes_terminator(&mut self, ensure: bool) {
+        self.garbage_includes_terminator = ensure;
     }
 }
 

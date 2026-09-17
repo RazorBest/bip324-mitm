@@ -20,6 +20,7 @@ pub enum Bip324Error {
     KeyGenerationError,
     GarbageLimitExceededError,
     IllegalState(String),
+    TerminatorAlreadySending,
 }
 
 impl std::fmt::Display for Bip324Error {
@@ -29,6 +30,7 @@ impl std::fmt::Display for Bip324Error {
             Self::KeyGenerationError => write!(f, "Key generation error"),
             Self::GarbageLimitExceededError => write!(f, "Garbage limit exceeded"),
             Self::IllegalState(msg) => write!(f, "Illegal state: {msg}"),
+            Self::TerminatorAlreadySending => write!(f, "Terminator already sendin"),
         }
     }
 }
@@ -153,6 +155,7 @@ pub struct HandshakeReadParser {
     read_buffer: Vec<u8>,
     recv_terminator_after_send_key: bool,
     terminator_is_not_split: bool,
+    pub garbage_includes_terminator: bool,
 
     // Output buffers -- drained by caller after each step()
     output_key_bytes: VecDeque<u8>,
@@ -173,6 +176,7 @@ impl HandshakeReadParser {
             read_buffer: vec![],
             recv_terminator_after_send_key: false,
             terminator_is_not_split: false,
+            garbage_includes_terminator: false,
             output_key_bytes: VecDeque::new(),
             output_garbage_bytes: VecDeque::new(),
             output_terminator_bytes: VecDeque::new(),
@@ -250,16 +254,41 @@ impl HandshakeReadParser {
         Ok(())
     }
 
+    pub fn ensure_garbage_includes_terminator(&mut self, ensure: bool) -> Result<(), String> {
+        if !matches!(
+            self.state.as_ref().expect("Expected state to be present"),
+            HandshakeReadState::ReceivingKey(..)
+        ) {
+            return Err(
+                "Can't change terminator behaviour after the reader received the key".to_string(),
+            );
+        }
+        self.garbage_includes_terminator = ensure;
+
+        Ok(())
+    }
+
     pub fn drain_key_bytes(&mut self) -> Vec<u8> {
         self.output_key_bytes.drain(..).collect()
     }
 
     pub fn drain_garbage_bytes(&mut self) -> Vec<u8> {
+        if self.garbage_includes_terminator {
+            panic!("Must unset flag `garbage_includes_terminator`");
+        }
         self.output_garbage_bytes.drain(..).collect()
     }
 
     pub fn drain_terminator_bytes(&mut self) -> Vec<u8> {
         self.output_terminator_bytes.drain(..).collect()
+    }
+
+    pub fn drain_garbage_plus_terminator_bytes(&mut self) -> Vec<u8> {
+        if !self.garbage_includes_terminator {
+            panic!("Must set flag `garbage_includes_terminator`");
+        }
+
+        self.output_garbage_bytes.drain(..).collect()
     }
 
     pub fn is_key_eof(&self) -> bool {
@@ -298,11 +327,8 @@ impl HandshakeReadParser {
         matches!(self.state, Some(HandshakeReadState::ReceivingGarbage(_)))
     }
 
-    pub fn inbound_garbage_terminator(&self) -> Option<&GarbageTerminatorType> {
-        match self.state.as_ref()? {
-            HandshakeReadState::ReceivingGarbage(gt) => Some(gt),
-            _ => None,
-        }
+    pub fn inbound_garbage_terminator(&self) -> Option<GarbageTerminatorType> {
+        self.shared.borrow().inbound_garbage_terminator
     }
 
     pub fn take_aad(&mut self) -> Option<AADType> {
@@ -410,36 +436,24 @@ impl ProtocolReadParser for HandshakeReadParser {
                 let insurance_len = other_garbage_terminator.len() - 1;
                 let prevlen = self.read_buffer.len();
 
-                // When the read buffer has data that can still be part of the garbage terminator
-                let mut found = {
-                    let data_buf = data.buf_ref();
-                    let mut to_consume = cmp::min(data_buf.len(), insurance_len);
-
-                    // Use the read_buffer as a temporary space for searching the terminator that
-                    // crosses the boundary
-                    self.read_buffer.extend_from_slice(&data_buf[..to_consume]);
-
-                    // If terminator found, actually consume the buffer
-                    if let Some((_garbage, rest)) =
-                        find_garbage(&self.read_buffer, other_garbage_terminator)
-                    {
-                        to_consume -= rest.len();
-                        // TODO: replace unwrap
-                        let _ = data.read(&mut vec![0u8; to_consume]).unwrap();
-
-                        // Remove the final bytes that are not part of the garbage
-                        self.read_buffer
-                            .resize(self.read_buffer.len() - rest.len(), 0u8);
-
-                        true
-                    // If terminator not found, restore the read buffer
-                    } else {
-                        self.read_buffer
-                            .resize(self.read_buffer.len() - to_consume, 0u8);
-
-                        false
+                // Look for the terminator that already starts in the read_buffer
+                // Prepares `insurance_len` bytes to the left and `insurance_len` to the right
+                let mut candidate =
+                    self.read_buffer[prevlen.saturating_sub(insurance_len)..].to_vec();
+                let old_len = candidate.len();
+                let mut found = false;
+                for byte in data.buf_ref().iter().take(insurance_len) {
+                    candidate.push(*byte);
+                    if candidate.ends_with(&other_garbage_terminator) {
+                        found = true;
+                        break;
                     }
-                };
+                }
+                if found {
+                    let new_len = candidate.len() - old_len;
+                    self.read_buffer.resize(prevlen + new_len, 0u8);
+                    data.read_exact(&mut self.read_buffer[prevlen..]).unwrap();
+                }
 
                 // If still not found, look for the garbage terminator in the new data
                 found = if !found {
@@ -452,9 +466,8 @@ impl ProtocolReadParser for HandshakeReadParser {
                         (data_buf.len(), false)
                     };
 
-                    let mut buf = vec![0u8; to_consume];
-                    data.read_exact(&mut buf).unwrap();
-                    self.read_buffer.extend(buf);
+                    self.read_buffer.resize(prevlen + to_consume, 0u8);
+                    data.read_exact(&mut self.read_buffer[prevlen..]).unwrap();
 
                     found
                 } else {
@@ -469,26 +482,30 @@ impl ProtocolReadParser for HandshakeReadParser {
                 if found {
                     // Here, we expect self.read_buffer to contain the garbage, including the
                     // terminator
-
-                    let currlen = self.read_buffer.len();
-                    let garbage_len = currlen - other_garbage_terminator.len();
-                    let lhs = if !self.terminator_is_not_split {
-                        cmp::max(prevlen, insurance_len) - insurance_len
-                    } else {
+                    let garbage_len = self.read_buffer.len() - other_garbage_terminator.len();
+                    let lhs = if self.terminator_is_not_split || self.garbage_includes_terminator {
                         prevlen
+                    } else {
+                        cmp::max(prevlen, insurance_len) - insurance_len
                     };
-                    let new_range = lhs..garbage_len;
 
+                    let terminator_chunk = &self.read_buffer[cmp::max(garbage_len, lhs)..];
                     {
-                        let garbage_chunk = self.read_buffer[new_range].to_vec();
-                        self.output_garbage_bytes
-                            .extend(garbage_chunk.iter().copied());
+                        if garbage_len > lhs {
+                            let new_range = lhs..garbage_len;
+                            let garbage_chunk = &self.read_buffer[new_range];
+                            self.output_garbage_bytes.extend(garbage_chunk);
+                        }
+                        if self.garbage_includes_terminator {
+                            self.output_garbage_bytes.extend(terminator_chunk);
+                        }
                     }
                     self.garbage_eof = true;
 
-                    let term_chunk = self.read_buffer[garbage_len..].to_vec();
-                    self.output_terminator_bytes
-                        .extend(term_chunk.iter().copied());
+                    if !self.garbage_includes_terminator {
+                        self.output_terminator_bytes
+                            .extend(terminator_chunk.iter().copied());
+                    }
 
                     let aad: Vec<_> = self.read_buffer.splice(..garbage_len, []).collect();
                     self.read_buffer.clear();
@@ -496,17 +513,19 @@ impl ProtocolReadParser for HandshakeReadParser {
                     (HandshakeDone(aad), Ok(ProtocolStatus::End))
                 } else {
                     let currlen = self.read_buffer.len();
-                    let new_range = if !self.terminator_is_not_split {
-                        // The range of data that wasn't relayed and we're sure it's garbage, and is not part of the terminator
-                        let lhs = cmp::max(prevlen, insurance_len) - insurance_len;
-                        let rhs = cmp::max(currlen, insurance_len) - insurance_len;
-                        lhs..rhs
-                    } else {
-                        // We asume the peer can't send the terminator before we send the key
-                        let lhs = prevlen;
-                        let rhs = currlen;
-                        lhs..rhs
-                    };
+                    let new_range =
+                        if self.terminator_is_not_split || self.garbage_includes_terminator {
+                            // We asume the peer can't send the terminator before we send the key
+                            // Or that the garbage includes the terminator
+                            let lhs = prevlen;
+                            let rhs = currlen;
+                            lhs..rhs
+                        } else {
+                            // The range of data that wasn't relayed and we're sure it's garbage, and is not part of the terminator
+                            let lhs = cmp::max(prevlen, insurance_len) - insurance_len;
+                            let rhs = cmp::max(currlen, insurance_len) - insurance_len;
+                            lhs..rhs
+                        };
 
                     let garbage_chunk = self.read_buffer[new_range].to_vec();
                     self.output_garbage_bytes

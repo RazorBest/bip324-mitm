@@ -61,6 +61,7 @@ impl From<crate::bip324::Bip324Error> for BIP324MitmError {
             E::KeyGenerationError => BIP324MitmError::KeyGenerationError,
             E::GarbageLimitExceededError => BIP324MitmError::GarbageLimitExceededError,
             E::IllegalState(msg) => BIP324MitmError::IllegalState(msg),
+            err @ E::TerminatorAlreadySending => BIP324MitmError::ProtocolError(err),
         }
     }
 }

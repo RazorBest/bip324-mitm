@@ -9,6 +9,15 @@ pub struct ChaCha20Poly1305Stream {
     encrypted: Vec<u8>,
 }
 
+impl Clone for ChaCha20Poly1305Stream {
+    fn clone(&self) -> Self {
+        Self {
+            chacha: self.chacha,
+            encrypted: self.encrypted.clone(),
+        }
+    }
+}
+
 // Copied from https://github.com/rust-bitcoin/rust-bitcoin/blob/c93d17ab2becc683e090486b9dbe5b02ce46f82e/chacha20_poly1305/src/lib.rs
 // And modified to support proper stream encryption
 impl ChaCha20Poly1305Stream {

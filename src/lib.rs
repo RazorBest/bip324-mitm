@@ -429,7 +429,7 @@ impl MitmHandshakeImpersonatorLegReader {
         self.parser.is_receiving_garbage()
     }
 
-    pub fn inbound_garbage_terminator(&self) -> Option<&GarbageTerminatorType> {
+    pub fn inbound_garbage_terminator(&self) -> Option<GarbageTerminatorType> {
         self.parser.inbound_garbage_terminator()
     }
 
@@ -1546,7 +1546,7 @@ mod mitmfakepeerbip324_tests {
             panic!("Wrong leg state");
         };
         assert!(reader_leg.is_receiving_garbage());
-        let other_garbage_terminator = *reader_leg
+        let other_garbage_terminator = reader_leg
             .inbound_garbage_terminator()
             .expect("Expected garbage terminator to be set");
 

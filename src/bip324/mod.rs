@@ -151,21 +151,21 @@ impl HasFinal for HandshakeReadState {
 
 #[derive(Clone)]
 pub struct HandshakeReadParser {
-    role: Role,
-    magic: MagicType,
-    state: Option<HandshakeReadState>,
-    read_buffer: Vec<u8>,
-    recv_terminator_after_send_key: bool,
-    terminator_is_not_split: bool,
+    pub role: Role,
+    pub magic: MagicType,
+    pub state: Option<HandshakeReadState>,
+    pub read_buffer: Vec<u8>,
+    pub recv_terminator_after_send_key: bool,
+    pub terminator_is_not_split: bool,
     pub garbage_includes_terminator: bool,
 
     // Output buffers -- drained by caller after each step()
-    output_key_bytes: VecDeque<u8>,
-    output_garbage_bytes: VecDeque<u8>,
-    output_terminator_bytes: VecDeque<u8>,
-    key_eof: bool,
-    garbage_eof: bool,
-    shared: SharedHandshakeState,
+    pub output_key_bytes: VecDeque<u8>,
+    pub output_garbage_bytes: VecDeque<u8>,
+    pub output_terminator_bytes: VecDeque<u8>,
+    pub key_eof: bool,
+    pub garbage_eof: bool,
+    pub shared: SharedHandshakeState,
 }
 
 impl HandshakeReadParser {
@@ -566,13 +566,14 @@ impl HasFinal for HandshakeWriteState {
 
 #[derive(Clone)]
 pub struct HandshakeWriteParser {
-    state: Option<HandshakeWriteState>,
-    key_bytes_sent: usize,
-    garbage_bytes: VecDeque<u8>,
-    garbage_sent: Vec<u8>,
-    garbage_eof: bool,
-    terminator_bytes_sent: usize,
-    shared: SharedHandshakeState,
+    pub state: Option<HandshakeWriteState>,
+    pub key_bytes_sent: usize,
+    pub garbage_bytes: VecDeque<u8>,
+    pub garbage_sent: Vec<u8>,
+    pub garbage_eof: bool,
+    pub terminator_bytes_sent: usize,
+    pub flag_skip_terminator: bool,
+    pub shared: SharedHandshakeState,
 }
 
 impl HandshakeWriteParser {

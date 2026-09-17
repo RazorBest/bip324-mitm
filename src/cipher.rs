@@ -405,6 +405,7 @@ impl fmt::Debug for InboundCipher {
     }
 }
 
+#[derive(Clone)]
 pub struct LengthDecryptor {
     pub remaining_bytes: usize,
     pub length_cipher: FSChaCha20Stream,

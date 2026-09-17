@@ -131,8 +131,8 @@ impl HasFinal for WriterLegState {
 
 #[derive(Clone)]
 pub struct MitmImpersonatorLeg {
-    reader_leg_state: Option<ReaderLegState>,
-    writer_leg_state: Option<WriterLegState>,
+    pub reader_leg_state: Option<ReaderLegState>,
+    pub writer_leg_state: Option<WriterLegState>,
 }
 
 impl MitmImpersonatorLeg {

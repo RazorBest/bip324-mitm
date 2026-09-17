@@ -630,7 +630,7 @@ impl StreamWriteParser for MitmHandshakeImpersonatorLegWriter {
 
     fn step(&mut self, data: &mut dyn BufWriter) -> Result<ProtocolStatus, Self::Error> {
         if self.parser.is_sending_key() {
-            // Pacing: only write as many key bytes as the real peer has signalled
+            // Pacing: only write as many key bytes as the real peer has signaled
             let available = self.relay_in.borrow().peek_len_key();
             if available == 0 {
                 return Ok(ProtocolStatus::End);
@@ -1484,7 +1484,7 @@ mod mitmfakepeerbip324_tests {
     }
 
     #[test]
-    fn client_key_by_parts() {
+    fn client_key_in_parts() {
         let (mut server, _, _) = get_mitm_fake_server();
 
         // Send one key byte

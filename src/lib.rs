@@ -22,7 +22,8 @@ use crate::bip324::{DataReadParser, DataWriteParser, HandshakeReadParser, Handsh
 use crate::cipher::OutboundCipher;
 use crate::protocol::{
     EcdhPoint, GarbageTerminatorType, MAINNET_MAGIC, MagicType, NUM_ELLIGATOR_SWIFT_BYTES,
-    NUM_SECRET_BYTES, REGTEST_MAGIC, Role, TESTNET_MAGIC,
+    NUM_GARBAGE_TERMINATOR_BYTES, NUM_SECRET_BYTES, ProtocolBuffer, REGTEST_MAGIC, Role,
+    TESTNET_MAGIC,
 };
 use crate::relay::{FakePeerRelay, FakePeerRelayReader, FakePeerRelayWriter, UserPacketRelay};
 use crate::state_machine::{
@@ -243,6 +244,35 @@ impl MitmImpersonatorLeg {
                 panic!("Can't read protocol packet. No reader present");
             }
         }
+    }
+
+    pub fn ensure_garbage_includes_terminator(&mut self, ensure: bool) -> Result<(), String> {
+        let reader = match &mut self.reader_leg_state {
+            Some(ReaderLegState::Handshake(reader)) => reader,
+            Some(ReaderLegState::Data(_)) => {
+                return Err("Handhsake was completed. Can't change terminator behavior".to_string());
+            }
+            None => {
+                panic!("Can't read protocol packet. No reader present");
+            }
+        };
+        let writer = match &mut self.writer_leg_state {
+            Some(WriterLegState::Handshake(writer)) => writer,
+            Some(WriterLegState::Data(_)) => {
+                return Err("Handhsake was completed. Can't change terminator behavior".to_string());
+            }
+            None => {
+                panic!("Can't read protocol packet. No reader present");
+            }
+        };
+
+        reader.parser.ensure_garbage_includes_terminator(ensure)?;
+        writer.ensure_garbage_includes_terminator(ensure);
+        if let Some(r) = reader.packet_relay.as_mut() {
+            r.ensure_garbage_includes_terminator(ensure);
+        }
+
+        Ok(())
     }
 
     pub fn next_protocol_packet(&mut self) -> Result<Option<relay::ProtocolPacketResult>, String> {
@@ -490,10 +520,19 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
             if let Some(packet_relay) = &mut self.packet_relay {
                 packet_relay.set_eof_key();
             }
+
+            let expected_terminator = self.parser.inbound_garbage_terminator().unwrap();
+            self.relay_out
+                .borrow_mut()
+                .set_expected_terminator(&expected_terminator);
         }
 
         // Forward garbage bytes to relay
-        let garbage_bytes = self.parser.drain_garbage_bytes();
+        let garbage_bytes = if self.parser.garbage_includes_terminator {
+            self.parser.drain_garbage_plus_terminator_bytes()
+        } else {
+            self.parser.drain_garbage_bytes()
+        };
         if !garbage_bytes.is_empty() {
             self.relay_out
                 .borrow_mut()
@@ -545,6 +584,8 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
 pub struct MitmHandshakeImpersonatorLegWriter {
     pub parser: HandshakeWriteParser,
     relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
+    pub garbage_includes_terminator: bool,
+    pub tcnt: usize,
 }
 
 impl MitmHandshakeImpersonatorLegWriter {
@@ -552,7 +593,16 @@ impl MitmHandshakeImpersonatorLegWriter {
         relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
         parser: HandshakeWriteParser,
     ) -> Self {
-        Self { parser, relay_in }
+        Self {
+            parser,
+            relay_in,
+            garbage_includes_terminator: false,
+            tcnt: 0,
+        }
+    }
+
+    pub fn ensure_garbage_includes_terminator(&mut self, ensure: bool) {
+        self.garbage_includes_terminator = ensure;
     }
 
     pub fn is_final(&self) -> bool {
@@ -586,12 +636,8 @@ impl StreamWriteParser for MitmHandshakeImpersonatorLegWriter {
                 return Ok(ProtocolStatus::End);
             }
             let limit = cmp::min(available, data.remaining());
-            let mut pacing_buf = vec![0u8; limit];
-            let size = self
-                .relay_in
-                .borrow_mut()
-                .read_key(&mut pacing_buf)
-                .unwrap();
+            let mut _buf = vec![0u8; limit];
+            let size = self.relay_in.borrow_mut().read_key(&mut _buf).unwrap();
             if size == 0 {
                 return Ok(ProtocolStatus::End);
             }
@@ -608,7 +654,36 @@ impl StreamWriteParser for MitmHandshakeImpersonatorLegWriter {
             if available > 0 {
                 let mut buf = vec![0u8; available];
                 let size = self.relay_in.borrow_mut().read_garbage(&mut buf).unwrap();
-                self.parser.push_garbage_bytes(&buf[..size]);
+                buf.truncate(size);
+
+                if self.garbage_includes_terminator {
+                    // Map garbage characters from the opposite leg to this leg
+                    // Why are we using the terminators to map characters? Because
+                    // we don't know which of them are part of the terminator.
+                    // So we map each prefix of the in_terminator to a prefix of the out_terminator
+                    // in_terminator and out_terminator are different from the inbound/outbound pair
+                    // in_terminator comes from the opposite leg of the mitm
+                    // out_terminator is what will be sent by this leg
+                    let relay_in = self.relay_in.borrow();
+                    let in_terminator = relay_in.get_expected_terminator().unwrap();
+                    // The parser's reader twin must've receive the key to have the out terminator
+                    // While technically possible, one side shouldn't be able to send a terminator
+                    // unless it has received the key from the other side.
+                    if let Some(out_terminator) = self.parser.outbound_garbage_terminator() {
+                        for x in buf.iter_mut().take(size) {
+                            if *x == in_terminator[self.tcnt] {
+                                *x = out_terminator[self.tcnt];
+                                self.tcnt += 1;
+                            } else {
+                                self.tcnt = 0;
+                            }
+                        }
+
+                        self.parser.skip_terminator().unwrap();
+                    }
+                }
+
+                self.parser.push_garbage_bytes(&buf);
             }
             if self.relay_in.borrow().is_eof_garbage() {
                 self.parser.set_garbage_eof();
@@ -1019,6 +1094,11 @@ impl MitmBIP324 {
     pub fn ensure_terminator_not_split(&mut self, ensure: bool) -> Result<(), String> {
         self.client_leg.ensure_terminator_not_split(ensure)?;
         self.server_leg.ensure_terminator_not_split(ensure)
+    }
+
+    pub fn ensure_garbage_includes_terminator(&mut self, ensure: bool) -> Result<(), String> {
+        self.client_leg.ensure_garbage_includes_terminator(ensure)?;
+        self.server_leg.ensure_garbage_includes_terminator(ensure)
     }
 
     pub fn client_write(&mut self, mut data: &[u8]) -> Result<(), BIP324MitmError> {

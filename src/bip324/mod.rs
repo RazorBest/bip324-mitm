@@ -580,6 +580,7 @@ impl HandshakeWriteParser {
             garbage_sent: Vec::new(),
             garbage_eof: false,
             terminator_bytes_sent: 0,
+            flag_skip_terminator: false,
             shared,
         }
     }
@@ -594,6 +595,10 @@ impl HandshakeWriteParser {
 
     pub fn has_outbound_cipher(&self) -> bool {
         self.shared.borrow().outbound_cipher.is_some()
+    }
+
+    pub fn outbound_garbage_terminator(&self) -> Option<GarbageTerminatorType> {
+        self.shared.borrow().outbound_garbage_terminator
     }
 
     pub fn is_done_writing(&self) -> bool {
@@ -655,6 +660,22 @@ impl HandshakeWriteParser {
         writer
     }
 
+    pub fn skip_terminator(&mut self) -> Result<(), Bip324Error> {
+        if self.terminator_bytes_sent > 0 {
+            return Err(Bip324Error::TerminatorAlreadySending);
+        }
+        self.flag_skip_terminator = true;
+
+        if matches!(
+            self.state,
+            Some(HandshakeWriteState::SendingGarbageTerminator)
+        ) {
+            self.state = Some(HandshakeWriteState::Done);
+        }
+
+        Ok(())
+    }
+
     /// Inject an outbound garbage terminator directly into shared state.
     /// This is only intended for use in tests. In production the terminator is derived
     /// automatically when the read-parser completes the ECDH exchange.
@@ -705,7 +726,11 @@ impl ProtocolWriteParser for HandshakeWriteParser {
                 self.garbage_sent.extend_from_slice(&garbage_chunk);
 
                 if self.garbage_bytes.is_empty() && self.garbage_eof {
-                    (SendingGarbageTerminator, Ok(ProtocolStatus::Continue))
+                    if self.flag_skip_terminator {
+                        (Done, Ok(ProtocolStatus::End))
+                    } else {
+                        (SendingGarbageTerminator, Ok(ProtocolStatus::Continue))
+                    }
                 } else {
                     (state, Ok(ProtocolStatus::End))
                 }

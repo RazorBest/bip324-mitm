@@ -54,7 +54,7 @@ pub trait Serialize {
     fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()>;
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct FakePeerRelay {
     key: ProtocolBuffer,
     garbage: ProtocolBuffer,
@@ -303,7 +303,7 @@ impl FakePeerRelayWriter for FakePeerRelay {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HandshakeKey {
     pub data: Box<[u8; NUM_ELLIGATOR_SWIFT_BYTES]>,
 }
@@ -314,7 +314,7 @@ impl Serialize for HandshakeKey {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HandshakeGarbage {
     pub data: Vec<u8>,
 }
@@ -325,7 +325,7 @@ impl Serialize for HandshakeGarbage {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HandshakeTerminator {
     pub data: Box<[u8; NUM_GARBAGE_TERMINATOR_BYTES]>,
 }
@@ -336,7 +336,7 @@ impl Serialize for HandshakeTerminator {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolHandshakePacket {
     Key(HandshakeKey),
     Garbage(HandshakeGarbage),
@@ -355,7 +355,7 @@ impl Serialize for ProtocolHandshakePacket {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProtocolDataPacket {
     /// The data segment, including the first byte of header
     pub data: Vec<u8>,
@@ -379,7 +379,7 @@ impl Serialize for ProtocolDataPacket {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolPacket {
     Handshake(ProtocolHandshakePacket),
     Data(ProtocolDataPacket),
@@ -396,6 +396,15 @@ impl Serialize for ProtocolPacket {
 
 #[derive(Debug)]
 pub struct ProtocolPacketResult(pub Result<ProtocolPacket, Box<dyn Error>>);
+
+impl Clone for ProtocolPacketResult {
+    fn clone(&self) -> Self {
+        match &self.0 {
+            Ok(packet) => Self(Ok(packet.clone())),
+            Err(_) => Self(Err("Lost error".into())),
+        }
+    }
+}
 
 impl ProtocolPacketResult {
     #[allow(non_snake_case)]
@@ -422,7 +431,7 @@ impl PartialEq for ProtocolPacketResult {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct UserPacketRelay {
     pub stream_relay: FakePeerRelay,
     pub queue: VecDeque<ProtocolPacketResult>,

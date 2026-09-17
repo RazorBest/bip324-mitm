@@ -102,6 +102,7 @@ impl BufWriter for LimitedWriter<'_> {
 }
 
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub enum ReaderLegState {
     Handshake(MitmHandshakeImpersonatorLegReader),
     Data(MitmImpersonatorLegReader),
@@ -115,6 +116,7 @@ impl HasFinal for ReaderLegState {
 }
 
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub enum WriterLegState {
     Handshake(MitmHandshakeImpersonatorLegWriter),
     Data(MitmImpersonatorLegWriter),
@@ -126,6 +128,7 @@ impl HasFinal for WriterLegState {
     }
 }
 
+#[derive(Clone)]
 pub struct MitmImpersonatorLeg {
     reader_leg_state: Option<ReaderLegState>,
     writer_leg_state: Option<WriterLegState>,
@@ -352,6 +355,7 @@ impl ProtocolWriteParser for MitmImpersonatorLeg {
     }
 }
 
+#[derive(Clone)]
 pub struct MitmHandshakeImpersonatorLegReader {
     pub parser: HandshakeReadParser,
     relay_out: Rc<RefCell<dyn FakePeerRelayWriter>>,
@@ -537,6 +541,7 @@ impl StreamReadParser for MitmHandshakeImpersonatorLegReader {
     }
 }
 
+#[derive(Clone)]
 pub struct MitmHandshakeImpersonatorLegWriter {
     pub parser: HandshakeWriteParser,
     relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
@@ -752,6 +757,7 @@ impl StreamReadParser for MitmImpersonatorLegReader {
     }
 }
 
+#[derive(Clone)]
 pub struct MitmImpersonatorLegWriter {
     parser: DataWriteParser,
     relay_in: Rc<RefCell<dyn FakePeerRelayReader>>,
@@ -835,6 +841,7 @@ pub fn key_from_secret_bytes(
     })
 }
 
+#[derive(Clone)]
 pub struct MitmBIP324 {
     pub client_leg: MitmImpersonatorLeg,
     pub server_leg: MitmImpersonatorLeg,

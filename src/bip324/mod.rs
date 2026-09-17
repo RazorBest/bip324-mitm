@@ -38,6 +38,7 @@ impl std::fmt::Display for Bip324Error {
 impl std::error::Error for Bip324Error {}
 
 /// Shared handshake state owned by both the read and write parsers.
+#[derive(Clone)]
 pub struct HandshakeState {
     pub(super) our_key: EcdhPoint,
     pub(super) our_ellswift_bytes: [u8; NUM_ELLIGATOR_SWIFT_BYTES],
@@ -135,7 +136,7 @@ impl HandshakeState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum HandshakeReadState {
     ReceivingKey(usize),                     // remaining_bytes
     ReceivingGarbage(GarbageTerminatorType), // inbound_garbage_terminator
@@ -148,6 +149,7 @@ impl HasFinal for HandshakeReadState {
     }
 }
 
+#[derive(Clone)]
 pub struct HandshakeReadParser {
     role: Role,
     magic: MagicType,
@@ -548,6 +550,7 @@ impl ProtocolReadParser for HandshakeReadParser {
     }
 }
 
+#[derive(Clone)]
 pub enum HandshakeWriteState {
     SendingKey,
     SendingGarbage,
@@ -561,6 +564,7 @@ impl HasFinal for HandshakeWriteState {
     }
 }
 
+#[derive(Clone)]
 pub struct HandshakeWriteParser {
     state: Option<HandshakeWriteState>,
     key_bytes_sent: usize,
@@ -776,6 +780,7 @@ impl ProtocolWriteParser for HandshakeWriteParser {
 // 14 extra bytes are for the BIP-324 header byte and 13 serialization header bytes (message type).
 const MAX_PACKET_SIZE_FOR_ALLOCATION: usize = 4000014;
 
+#[derive(Clone)]
 pub enum DataReadState {
     ReceivingPacketLen(LengthDecryptor),
     ReceivingPacketContent(ChaCha20Poly1305Stream),
@@ -789,6 +794,7 @@ impl HasFinal for DataReadState {
     }
 }
 
+#[derive(Clone)]
 pub struct DataReadParser {
     state: Option<DataReadState>,
     remaining: usize,
@@ -974,6 +980,7 @@ impl ProtocolReadParser for DataReadParser {
     }
 }
 
+#[derive(Clone)]
 pub enum DataWriteState {
     SendingLength(usize, Vec<u8>),
     SendingPayload(usize, ChaCha20Poly1305Stream),
@@ -987,6 +994,7 @@ impl HasFinal for DataWriteState {
     }
 }
 
+#[derive(Clone)]
 pub struct DataWriteParser {
     state: Option<DataWriteState>,
     outbound_cipher: OutboundCipher,

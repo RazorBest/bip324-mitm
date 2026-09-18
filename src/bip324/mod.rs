@@ -850,7 +850,7 @@ impl DataReadParser {
     }
 
     pub fn consume_aad(&mut self) -> Vec<u8> {
-        self.aad.drain(..).collect()
+        std::mem::take(&mut self.aad)
     }
 }
 

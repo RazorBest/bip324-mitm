@@ -240,8 +240,8 @@ impl FSChaCha20Stream {
             self.rekey();
 
             // Encrypt chunks of fixed size, and rekey after each chunk
-            let mut chunks = rest.chunks_exact_mut(STREAM_SIZE as usize);
-            for chunk in &mut chunks {
+            let (chunks, remainder) = rest.as_chunks_mut::<{ STREAM_SIZE as usize }>();
+            for chunk in chunks {
                 debug_assert_eq!(self.byte_counter, 0);
                 let mut cipher = self.initialize_cipher_at_position(0);
                 cipher.apply_keystream(chunk);
@@ -250,7 +250,7 @@ impl FSChaCha20Stream {
                 self.rekey();
             }
 
-            chunks.into_remainder()
+            remainder
         } else {
             data
         };

@@ -144,7 +144,7 @@ fn reader_from_seed(role: Role, seed: u64) -> HandshakeReadParser {
     reader_from_rng(role, &mut rng)
 }
 
-// 1. Feed 64 key bytes at once. Verify drain_key_bytes() returns all 64.
+// Feed 64 key bytes at once. Verify drain_key_bytes() returns all 64.
 //    Verify state transitions to ReceivingGarbage.
 #[test]
 fn test_parse_key_complete() {
@@ -160,7 +160,7 @@ fn test_parse_key_complete() {
     assert!(parser.is_key_eof());
 }
 
-// 2. Feed 1 byte at a time (64 iterations). After each step(), verify
+// Feed 1 byte at a time (64 iterations). After each step(), verify
 //    drain_key_bytes() returns 1 byte. After 64, verify state is ReceivingGarbage.
 #[test]
 fn test_parse_key_byte_by_byte() {
@@ -178,7 +178,7 @@ fn test_parse_key_byte_by_byte() {
     assert!(parser.is_key_eof());
 }
 
-// 3. Feed 74 bytes. Verify key output is 64 bytes, parser in ReceivingGarbage,
+// Feed 74 bytes. Verify key output is 64 bytes, parser in ReceivingGarbage,
 //    extra 10 bytes consumed as potential garbage.
 #[test]
 fn test_parse_key_overflow() {
@@ -195,7 +195,7 @@ fn test_parse_key_overflow() {
     assert!(parser.is_key_eof());
 }
 
-// 4. Feed HANDSHAKE_PARAMS1.client_key as the peer's key. Verify take_inbound_cipher()
+// Feed HANDSHAKE_PARAMS1.client_key as the peer's key. Verify take_inbound_cipher()
 //    and take_outbound_cipher() each return Some. Confirm derived key material matches
 //    expected vectors.
 #[test]
@@ -245,10 +245,10 @@ fn test_cipher_session_derivation() {
     let inbound_term = parser
         .inbound_garbage_terminator()
         .expect("Expected ReceivingGarbage state");
-    assert_eq!(*inbound_term, client_garbage_terminator);
+    assert_eq!(inbound_term, client_garbage_terminator);
 }
 
-// 5. Feed key + garbage + terminator. Verify drain_garbage_bytes() returns the
+// Feed key + garbage + terminator. Verify drain_garbage_bytes() returns the
 //    garbage, is_handshake_done() is true.
 #[test]
 fn test_garbage_with_terminator() {
@@ -287,7 +287,44 @@ fn test_garbage_with_terminator() {
     assert!(parser.is_handshake_done());
 }
 
-// 6. Feed key + 4112 bytes of garbage. Verify GarbageLimitExceededError.
+// Enable the `garbage_includes_terminator` flag. Feed key + garbage + terminator.
+// Verify drain_garbage_bytes() returns garbage + terminator,
+// drain_terminator_bytes() returns empty, is_handshake_done() is true.
+#[test]
+fn test_garbage_includes_terminator() {
+    let TestHandshakeParams {
+        server_seed,
+        client_key,
+        client_garbage_terminator,
+        ..
+    } = HANDSHAKE_PARAMS1;
+
+    let mut parser = reader_from_seed(Role::Responder, server_seed);
+    parser.ensure_garbage_includes_terminator(true).unwrap();
+
+    let garbage = [0xAAu8; 20];
+    let mut input = Vec::new();
+    input.extend_from_slice(&client_key);
+    input.extend_from_slice(&garbage);
+    input.extend_from_slice(&client_garbage_terminator);
+
+    let mut data = &input[..];
+    parser.consume(&mut data).unwrap();
+
+    let drained_garbage = parser.drain_garbage_plus_terminator_bytes();
+    let drained_term = parser.drain_terminator_bytes();
+
+    let expected: Vec<_> = garbage
+        .into_iter()
+        .chain(client_garbage_terminator)
+        .collect();
+    assert_eq!(drained_garbage, expected, "Garbage content mismatch");
+    assert_eq!(drained_term, []);
+    assert!(parser.is_garbage_eof());
+    assert!(parser.is_handshake_done());
+}
+
+// Feed key + 4112 bytes of garbage. Verify GarbageLimitExceededError.
 #[test]
 fn test_garbage_limit_exceeded() {
     let TestHandshakeParams {
@@ -312,7 +349,7 @@ fn test_garbage_limit_exceeded() {
     );
 }
 
-// 7. Set new EcdhPoint after receiving some key bytes (still in ReceivingKey).
+// Set new EcdhPoint after receiving some key bytes (still in ReceivingKey).
 //    Verify the new point is used for ECDH.
 #[test]
 fn test_set_ecdh_point_during_key() {
@@ -354,7 +391,7 @@ fn test_set_ecdh_point_during_key() {
     assert_eq!(outbound.packet_cipher.key_bytes, responder_p);
 }
 
-// 8. Set new EcdhPoint after full key received (in ReceivingGarbage).
+// Set new EcdhPoint after full key received (in ReceivingGarbage).
 //    Verify take_ciphers() returns ciphers derived from the new point.
 #[test]
 fn test_set_ecdh_point_after_key() {
@@ -392,7 +429,7 @@ fn test_set_ecdh_point_after_key() {
     assert_eq!(outbound.packet_cipher.key_bytes, responder_p);
 }
 
-// 9. Verify is_receiving_key() is true before key bytes are fully received,
+// Verify is_receiving_key() is true before key bytes are fully received,
 //     and is_receiving_garbage() is true after key is complete.
 #[test]
 fn test_reader_state_transition_into_recv_garbage() {
@@ -408,7 +445,7 @@ fn test_reader_state_transition_into_recv_garbage() {
     assert!(parser.is_receiving_garbage());
 }
 
-// 10. elligator_swift_bytes() returns the parser's own ellswift key.
+// elligator_swift_bytes() returns the parser's own ellswift key.
 #[test]
 fn test_elligator_swift_bytes() {
     let point = key_from_secret_bytes(ALICE_SECRET).unwrap();
@@ -417,7 +454,7 @@ fn test_elligator_swift_bytes() {
     assert_eq!(reader.elligator_swift_bytes(), expected);
 }
 
-// 11. After a complete handshake, take_aad() returns the garbage bytes that were received.
+// After a complete handshake, take_aad() returns the garbage bytes that were received.
 #[test]
 fn test_take_aad_after_handshake() {
     let TestHandshakeParams {
@@ -445,7 +482,7 @@ fn test_take_aad_after_handshake() {
     assert_eq!(aad, garbage, "AAD must equal the received garbage bytes");
 }
 
-// 12. After receiving the peer's full key and completing ECDH,
+// After receiving the peer's full key and completing ECDH,
 //     outbound_garbage_terminator() returns Some.
 #[test]
 fn test_outbound_garbage_terminator_after_ecdh() {
@@ -464,6 +501,8 @@ fn test_outbound_garbage_terminator_after_ecdh() {
         "outbound_garbage_terminator must be Some after ECDH"
     );
 }
+
+// ----------------------------------------------------------------------------
 
 const KEY_LEN: usize = NUM_ELLIGATOR_SWIFT_BYTES;
 const TERMINATOR_LEN: usize = NUM_GARBAGE_TERMINATOR_BYTES;
@@ -486,7 +525,7 @@ fn assert_handshake_writer_has_consumed(parser: &mut HandshakeWriteParser) {
     assert_eq!(slice.len(), 1, "writer has unconsumed data");
 }
 
-// 1. Create writer. Call produce() with a full KEY_LEN buffer.
+// Create writer. Call produce() with a full KEY_LEN buffer.
 //    Verify the output matches the expected ellswift bytes.
 #[test]
 fn test_write_key_complete() {
@@ -500,7 +539,7 @@ fn test_write_key_complete() {
     assert_handshake_writer_has_consumed(&mut parser);
 }
 
-// 2. Create parser and step() with 10-byte buffer repeatedly. Verify correct chunking.
+// Create parser and step() with 10-byte buffer repeatedly. Verify correct chunking.
 #[test]
 fn test_write_key_chunked() {
     let (mut parser, expected_key) = make_writer();
@@ -523,7 +562,7 @@ fn test_write_key_chunked() {
     assert_handshake_writer_has_consumed(&mut parser);
 }
 
-// 3. Full handshake: key || garbage || terminator in one produce() call.
+// Full handshake: key || garbage || terminator in one produce() call.
 //    The outbound terminator is injected via the test helper.
 #[test]
 fn test_write_full_handshake() {
@@ -538,7 +577,7 @@ fn test_write_full_handshake() {
     parser.set_garbage_eof();
     parser.inject_outbound_garbage_terminator_for_test(terminator);
 
-    let mut buf = vec![0u8; KEY_LEN + 20 + TERMINATOR_LEN];
+    let mut buf = vec![0u8; KEY_LEN + garbage.len() + TERMINATOR_LEN];
     {
         let mut s = buf.as_mut_slice();
         parser.produce(&mut s).unwrap();
@@ -554,7 +593,7 @@ fn test_write_full_handshake() {
     assert_handshake_writer_has_consumed(&mut parser);
 }
 
-// 4. No garbage: output is key || terminator.
+// No garbage: output is key || terminator.
 #[test]
 fn test_write_no_garbage() {
     let point = key_from_secret_bytes(SECRET_B).unwrap();
@@ -580,7 +619,7 @@ fn test_write_no_garbage() {
     assert_handshake_writer_has_consumed(&mut parser);
 }
 
-// 5. writer_started_sending is false before any write, true after.
+// writer_started_sending is false before any write, true after.
 #[test]
 fn test_writer_started_sending_flag() {
     let (mut parser, _) = make_writer();
@@ -593,7 +632,7 @@ fn test_writer_started_sending_flag() {
     assert!(parser.writer_started_sending());
 }
 
-// 6. set_ecdh_point returns Ok when called before the writer has started sending.
+// set_ecdh_point returns Ok when called before the writer has started sending.
 #[test]
 fn test_set_ecdh_point_ok_before_writer_starts() {
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
@@ -607,7 +646,7 @@ fn test_set_ecdh_point_ok_before_writer_starts() {
     );
 }
 
-// 7. set_ecdh_point returns an error once the writer has started sending, even
+// set_ecdh_point returns an error once the writer has started sending, even
 //    when called after the full peer key has been received (ReceivingGarbage).
 //    Mirrors the setup of test_set_ecdh_point_after_key but commits the writer first.
 #[test]
@@ -642,7 +681,7 @@ fn test_set_ecdh_point_error_after_writer_started() {
     );
 }
 
-// 8. Push garbage in small chunks, calling step() after each. Verify output accumulates correctly.
+// Push garbage in small chunks, calling step() after each. Verify output accumulates correctly.
 #[test]
 fn test_pacing_garbage() {
     let point = key_from_secret_bytes(SECRET_A).unwrap();
@@ -675,7 +714,129 @@ fn test_pacing_garbage() {
     assert_handshake_writer_has_consumed(&mut parser);
 }
 
-// 9. Push garbage without setting EOF. Verify parser stays in SendingGarbage and returns End.
+#[test]
+fn test_skip_terminator_enable_at_beginning() {
+    let point = key_from_secret_bytes(SECRET_A).unwrap();
+    let expected_key = point.elligator_swift.to_array();
+    let (_, mut parser) = super::new_handshake_pair(Role::Initiator, MAINNET_MAGIC, point);
+
+    let garbage = vec![0xFFu8; 20];
+    let terminator = [0xAAu8; TERMINATOR_LEN];
+
+    parser.push_garbage_bytes(&garbage);
+    parser.set_garbage_eof();
+    parser.inject_outbound_garbage_terminator_for_test(terminator);
+
+    // Enable before feeding anything
+    parser.skip_terminator().unwrap();
+
+    // Write key and garbage
+    let mut buf = vec![0u8; KEY_LEN + garbage.len()];
+    {
+        let mut s = buf.as_mut_slice();
+        parser.produce(&mut s).unwrap();
+    }
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&expected_key);
+    expected.extend_from_slice(&garbage);
+    assert_eq!(buf, expected);
+
+    // Write terminator
+    let mut buf = vec![0u8; terminator.len()];
+    let mut s = buf.as_mut_slice();
+    parser.produce(&mut s).unwrap();
+    assert_eq!(s.len(), buf.len());
+
+    // Calling again shouldn't throw an error
+    parser.skip_terminator().unwrap();
+
+    assert!(parser.is_done_writing());
+}
+
+#[test]
+fn test_skip_terminator_enable_after_garbage() {
+    let point = key_from_secret_bytes(SECRET_A).unwrap();
+    let expected_key = point.elligator_swift.to_array();
+    let (_, mut parser) = super::new_handshake_pair(Role::Initiator, MAINNET_MAGIC, point);
+
+    let garbage = vec![0xFFu8; 20];
+    let terminator = [0xAAu8; TERMINATOR_LEN];
+
+    parser.push_garbage_bytes(&garbage);
+    parser.set_garbage_eof();
+    parser.inject_outbound_garbage_terminator_for_test(terminator);
+
+    // Write key and garbage
+    let mut buf = vec![0u8; KEY_LEN + garbage.len()];
+    {
+        let mut s = buf.as_mut_slice();
+        parser.produce(&mut s).unwrap();
+    }
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&expected_key);
+    expected.extend_from_slice(&garbage);
+    assert_eq!(buf, expected);
+
+    // Enable skip terminator and verify
+    parser.skip_terminator().unwrap();
+
+    // Write terminator
+    let mut buf = vec![0u8; terminator.len()];
+    let mut s = buf.as_mut_slice();
+    parser.produce(&mut s).unwrap();
+    assert_eq!(s.len(), buf.len());
+
+    // Calling again shouldn't throw an error
+    parser.skip_terminator().unwrap();
+
+    assert!(parser.is_done_writing());
+}
+
+#[test]
+fn test_skip_terminator_after_terminator_sending() {
+    let point = key_from_secret_bytes(SECRET_A).unwrap();
+    let expected_key = point.elligator_swift.to_array();
+    let (_, mut parser) = super::new_handshake_pair(Role::Initiator, MAINNET_MAGIC, point);
+
+    let garbage = vec![0xFFu8; 20];
+    let terminator = [0xAAu8; TERMINATOR_LEN];
+
+    parser.push_garbage_bytes(&garbage);
+    parser.set_garbage_eof();
+    parser.inject_outbound_garbage_terminator_for_test(terminator);
+
+    // Write key and garbage
+    let mut buf = vec![0u8; KEY_LEN + garbage.len() + 1];
+    {
+        let mut s = buf.as_mut_slice();
+        parser.produce(&mut s).unwrap();
+        assert!(s.is_empty());
+    }
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&expected_key);
+    expected.extend_from_slice(&garbage);
+    expected.extend_from_slice(&terminator[..1]);
+    assert_eq!(buf, expected);
+
+    // Enable skip terminator and verify
+    let err = parser.skip_terminator();
+    assert!(err.is_err());
+
+    // Write the rest of the terminator
+    let mut buf = vec![0u8; terminator.len() - 1];
+    let mut s = buf.as_mut_slice();
+    parser.produce(&mut s).unwrap();
+    assert!(s.is_empty());
+    assert_eq!(buf, &terminator[1..]);
+
+    // Calling again should still be an error
+    let err = parser.skip_terminator();
+    assert!(err.is_err());
+
+    assert!(parser.is_done_writing());
+}
+
+// Push garbage without setting EOF. Verify parser stays in SendingGarbage and returns End.
 #[test]
 fn test_no_output_when_no_garbage_eof() {
     let (mut parser, _) = make_writer();
@@ -699,7 +860,7 @@ fn test_no_output_when_no_garbage_eof() {
     assert_handshake_writer_has_consumed(&mut parser);
 }
 
-// 10. SendingGarbageTerminator waits when outbound_garbage_terminator is not yet ready.
+// SendingGarbageTerminator waits when outbound_garbage_terminator is not yet ready.
 #[test]
 fn test_terminator_waits_for_ecdh() {
     let (mut parser, _) = make_writer();
@@ -759,7 +920,7 @@ fn assert_packet_outputs(parser: &mut DataReadParser, plaintext: &[u8], cipherte
     );
 }
 
-// 1. Encrypt a message with OutboundCipher. Feed encrypted bytes to DataReadParser. Drain
+// Encrypt a message with OutboundCipher. Feed encrypted bytes to DataReadParser. Drain
 //    outputs. Verify length, data, tag match expectations.
 #[test]
 fn test_decrypt_single_packet() {
@@ -775,7 +936,7 @@ fn test_decrypt_single_packet() {
     assert_packet_outputs(&mut parser, plaintext, &ciphertext);
 }
 
-// 2. Feed one encrypted byte at a time. Verify incremental output after each step.
+// Feed one encrypted byte at a time. Verify incremental output after each step.
 #[test]
 fn test_decrypt_byte_by_byte() {
     let (mut alice_out, bob_in) = make_cipher_pair();
@@ -809,7 +970,7 @@ fn test_decrypt_byte_by_byte() {
     );
 }
 
-// 3. Encrypt two messages. Feed each in a separate consume(). Verify both decrypted correctly.
+// Encrypt two messages. Feed each in a separate consume(). Verify both decrypted correctly.
 #[test]
 fn test_decrypt_multiple_packets() {
     let (mut alice_out, bob_in) = make_cipher_pair();
@@ -832,7 +993,7 @@ fn test_decrypt_multiple_packets() {
     assert_packet_outputs(&mut parser, msg2, &ct2);
 }
 
-// 4. Create parser with non-empty AAD. Decrypt first packet (encrypted with matching AAD).
+// Create parser with non-empty AAD. Decrypt first packet (encrypted with matching AAD).
 //    Verify take_aad() returns the AAD for first packet, None for second.
 #[test]
 fn test_aad_first_packet() {
@@ -867,7 +1028,7 @@ fn test_aad_first_packet() {
     );
 }
 
-// 5. Encrypt a packet with AAD_A; create parser with a different AAD_B.
+// Encrypt a packet with AAD_A; create parser with a different AAD_B.
 //    Verify consume() panics with "AEAD tag check fail".
 #[test]
 #[should_panic(expected = "AEAD tag check fail")]
@@ -884,7 +1045,7 @@ fn test_aad_mismatch_panics() {
     parser.consume(&mut data).unwrap();
 }
 
-// 6. Feed correct length + content, then corrupt tag bytes. Verify panic.
+// Feed correct length + content, then corrupt tag bytes. Verify panic.
 #[test]
 #[should_panic(expected = "AEAD tag check fail")]
 fn test_corrupt_tag_panics() {
@@ -902,7 +1063,7 @@ fn test_corrupt_tag_panics() {
     parser.consume(&mut data).unwrap();
 }
 
-// 7. Use known session keys. Verify the parser decodes the known ciphertext vector.
+// Use known session keys. Verify the parser decodes the known ciphertext vector.
 //    Matches test_vector_1 in cipher.rs: alice encrypts [0x8e] after one warmup packet,
 //    producing ciphertext "7530d2a18720162ac09c25329a60d75adf36eda3c3".
 #[test]
@@ -952,7 +1113,7 @@ fn test_known_vectors() {
     );
 }
 
-// 8. Feed ciphertext in two halves without draining between consume() calls.
+// Feed ciphertext in two halves without draining between consume() calls.
 //    Verifies output buffers accumulate correctly across partial reads.
 #[test]
 fn test_partial_read_no_intermediate_drain() {
@@ -973,7 +1134,7 @@ fn test_partial_read_no_intermediate_drain() {
     assert_packet_outputs(&mut parser, plaintext, &ciphertext);
 }
 
-// 9. Feed exactly the length phase bytes, drain them immediately, then feed the rest.
+// Feed exactly the length phase bytes, drain them immediately, then feed the rest.
 //    Verifies drain_length_bytes() returns a partial result mid-packet and the
 //    subsequent drains complete the packet correctly.
 #[test]
@@ -1063,7 +1224,7 @@ fn assert_writer_has_consumed(parser: &mut DataWriteParser) {
     assert_eq!(slice.len(), 1, "writer has unconsumed data");
 }
 
-// 1. Push 3 length bytes + header+payload + 16 tag bytes. produce(). Decrypt the output
+// Push 3 length bytes + header+payload + 16 tag bytes. produce(). Decrypt the output
 //    with matching InboundCipher. Verify roundtrip.
 #[test]
 fn test_encrypt_single_packet() {
@@ -1082,7 +1243,7 @@ fn test_encrypt_single_packet() {
     assert_writer_has_consumed(&mut parser);
 }
 
-// 2. Push one byte at a time. step() after each. Verify correct encrypted output.
+// Push one byte at a time. step() after each. Verify correct encrypted output.
 #[test]
 fn test_encrypt_byte_by_byte() {
     let (alice_out, mut bob_in) = make_cipher_pair();
@@ -1116,7 +1277,7 @@ fn test_encrypt_byte_by_byte() {
     assert_writer_has_consumed(&mut parser);
 }
 
-// 3. Push two packets' worth of data. Verify both encrypted correctly.
+// Push two packets' worth of data. Verify both encrypted correctly.
 #[test]
 fn test_encrypt_multiple_packets() {
     let (alice_out, mut bob_in) = make_cipher_pair();
@@ -1143,7 +1304,7 @@ fn test_encrypt_multiple_packets() {
     assert_writer_has_consumed(&mut parser);
 }
 
-// 4. Set AAD before first packet. Verify encrypted output decrypts correctly with matching AAD.
+// Set AAD before first packet. Verify encrypted output decrypts correctly with matching AAD.
 #[test]
 fn test_encrypt_with_aad() {
     let (alice_out, mut bob_in) = make_cipher_pair();
@@ -1164,7 +1325,7 @@ fn test_encrypt_with_aad() {
     assert_writer_has_consumed(&mut parser);
 }
 
-// 5. Set AAD before first packet; send a second packet without AAD. Verify first decrypts
+// Set AAD before first packet; send a second packet without AAD. Verify first decrypts
 //    with matching AAD, and second decrypts with None (AAD is consumed after the first packet).
 #[test]
 fn test_aad_applies_only_to_first_packet() {
@@ -1196,7 +1357,7 @@ fn test_aad_applies_only_to_first_packet() {
     assert_writer_has_consumed(&mut parser);
 }
 
-// 6. Push arbitrary tag bytes (not matching computed tag). Verify output uses the parser's
+// Push arbitrary tag bytes (not matching computed tag). Verify output uses the parser's
 //    computed tag (not the input tag bytes).
 #[test]
 fn test_tag_replacement() {
@@ -1232,7 +1393,7 @@ fn test_tag_replacement() {
     assert_writer_has_consumed(&mut parser);
 }
 
-// 7. Encrypt with DataWriteParser, decrypt with DataReadParser. Verify plaintext matches.
+// Encrypt with DataWriteParser, decrypt with DataReadParser. Verify plaintext matches.
 #[test]
 fn test_roundtrip_with_data_read_parser() {
     let (alice_out, bob_in) = make_cipher_pair();
@@ -1272,7 +1433,7 @@ fn get_derived_ciphers_from_handshake()
     (alice_inbound, alice_outbound, bob_inbound, bob_outbound)
 }
 
-// 1. Complete handshake bidirectionally, then verify a data roundtrip:
+// Complete handshake bidirectionally, then verify a data roundtrip:
 //    Side A encrypts with DataWriteParser → Side B decrypts with DataReadParser → matches plaintext.
 #[test]
 fn test_full_protocol_flow() {
@@ -1296,7 +1457,7 @@ fn test_full_protocol_flow() {
     assert_writer_has_consumed(&mut encrypt_parser);
 }
 
-// 2. Verify that data parsers generated from handshake material encrypt and decrypt correctly:
+// Verify that data parsers generated from handshake material encrypt and decrypt correctly:
 //    DataWriteParser encrypts with alice's outbound cipher; DataReadParser decrypts with bob's inbound cipher.
 #[test]
 fn test_that_data_parsers_from_handshake_material_are_correct() {
@@ -1314,7 +1475,7 @@ fn test_that_data_parsers_from_handshake_material_are_correct() {
     assert_writer_has_consumed(&mut write);
 }
 
-// 3. Both sides use new_handshake_pair and derive matching cipher sessions.
+// Both sides use new_handshake_pair and derive matching cipher sessions.
 
 #[test]
 fn test_coupled_handshake() {
@@ -1364,7 +1525,7 @@ fn test_coupled_handshake() {
     assert_writer_has_consumed(&mut write_parser);
 }
 
-// 4. The writer produces the correct ellswift bytes when constructed via new_handshake_pair.
+// The writer produces the correct ellswift bytes when constructed via new_handshake_pair.
 #[test]
 fn test_writer_reads_key_from_handshake_pair() {
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
@@ -1441,7 +1602,7 @@ fn do_full_handshake() -> (
     (alice_reader, alice_writer, bob_reader, bob_writer)
 }
 
-// 5. Complete a handshake, call get_data_reader(), feed encrypted data to the resulting
+// Complete a handshake, call get_data_reader(), feed encrypted data to the resulting
 //    DataReadParser, and verify decryption works.
 #[test]
 fn test_handshake_reader_get_data_reader() {
@@ -1466,7 +1627,7 @@ fn test_handshake_reader_get_data_reader() {
     assert_writer_has_consumed(&mut alice_data_writer);
 }
 
-// 6. Complete a handshake, call into_data_writer(), encrypt data, and verify decryption.
+// Complete a handshake, call into_data_writer(), encrypt data, and verify decryption.
 #[test]
 fn test_handshake_writer_into_data_writer() {
     let (mut alice_reader, alice_writer, mut bob_reader, _bob_writer) = do_full_handshake();
@@ -1490,7 +1651,7 @@ fn test_handshake_writer_into_data_writer() {
     assert_writer_has_consumed(&mut alice_data_writer);
 }
 
-// 7. Both sides complete a handshake and transition to the data phase. Alice encrypts
+// Both sides complete a handshake and transition to the data phase. Alice encrypts
 //    a message and Bob decrypts it.
 #[test]
 fn test_data_phase_roundtrip() {
@@ -1518,7 +1679,7 @@ fn test_data_phase_roundtrip() {
     assert_writer_has_consumed(&mut alice_data_writer);
 }
 
-// 8. Call get_data_reader() before the handshake completes → should panic.
+// Call get_data_reader() before the handshake completes → should panic.
 #[test]
 #[should_panic(expected = "Handshake must be done before transitioning to data phase")]
 fn test_get_data_reader_panics_if_not_done() {

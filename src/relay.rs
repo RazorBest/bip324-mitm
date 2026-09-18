@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::error::Error;
 use std::io::{Read, Write};
-use std::ops::{Deref, DerefMut};
 
 use crate::bip324::encode_bip324_raw_message_length;
 use crate::protocol::{
@@ -30,6 +29,7 @@ pub trait FakePeerRelayReader {
     fn peek_tag_bytes(&self) -> usize;
     fn read_aad(&mut self) -> Option<Vec<u8>>;
     fn peek_aad_bytes(&self) -> usize;
+    fn get_expected_terminator(&self) -> Option<&[u8]>;
 }
 
 pub trait FakePeerRelayWriter {
@@ -48,17 +48,19 @@ pub trait FakePeerRelayWriter {
     fn write_data_bytes(&mut self, data: &[u8]);
     fn write_tag_bytes(&mut self, data: &[u8]);
     fn set_aad(&mut self, data: &[u8]);
+    fn set_expected_terminator(&mut self, data: &[u8]);
 }
 
 pub trait Serialize {
     fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()>;
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct FakePeerRelay {
     key: ProtocolBuffer,
     garbage: ProtocolBuffer,
     terminator: ProtocolBuffer,
+    expected_terminator: Option<Vec<u8>>,
     packets: Vec<PartialPacket>,
 }
 
@@ -201,6 +203,10 @@ impl FakePeerRelayReader for FakePeerRelay {
 
         self.packets[0].peek_aad()
     }
+
+    fn get_expected_terminator(&self) -> Option<&[u8]> {
+        self.expected_terminator.as_deref()
+    }
 }
 
 impl FakePeerRelayWriter for FakePeerRelay {
@@ -301,9 +307,13 @@ impl FakePeerRelayWriter for FakePeerRelay {
 
         last_packet.set_aad(aad);
     }
+
+    fn set_expected_terminator(&mut self, terminator: &[u8]) {
+        self.expected_terminator = Some(terminator.to_vec());
+    }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HandshakeKey {
     pub data: Box<[u8; NUM_ELLIGATOR_SWIFT_BYTES]>,
 }
@@ -314,7 +324,7 @@ impl Serialize for HandshakeKey {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HandshakeGarbage {
     pub data: Vec<u8>,
 }
@@ -325,7 +335,7 @@ impl Serialize for HandshakeGarbage {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HandshakeTerminator {
     pub data: Box<[u8; NUM_GARBAGE_TERMINATOR_BYTES]>,
 }
@@ -336,7 +346,7 @@ impl Serialize for HandshakeTerminator {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolHandshakePacket {
     Key(HandshakeKey),
     Garbage(HandshakeGarbage),
@@ -355,7 +365,7 @@ impl Serialize for ProtocolHandshakePacket {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProtocolDataPacket {
     /// The data segment, including the first byte of header
     pub data: Vec<u8>,
@@ -379,7 +389,7 @@ impl Serialize for ProtocolDataPacket {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolPacket {
     Handshake(ProtocolHandshakePacket),
     Data(ProtocolDataPacket),
@@ -396,6 +406,15 @@ impl Serialize for ProtocolPacket {
 
 #[derive(Debug)]
 pub struct ProtocolPacketResult(pub Result<ProtocolPacket, Box<dyn Error>>);
+
+impl Clone for ProtocolPacketResult {
+    fn clone(&self) -> Self {
+        match &self.0 {
+            Ok(packet) => Self(Ok(packet.clone())),
+            Err(_) => Self(Err("Lost error".into())),
+        }
+    }
+}
 
 impl ProtocolPacketResult {
     #[allow(non_snake_case)]
@@ -422,10 +441,11 @@ impl PartialEq for ProtocolPacketResult {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct UserPacketRelay {
     pub stream_relay: FakePeerRelay,
     pub queue: VecDeque<ProtocolPacketResult>,
+    pub garbage_includes_terminator: bool,
 }
 
 impl FakePeerRelayWriter for UserPacketRelay {
@@ -472,7 +492,7 @@ impl FakePeerRelayWriter for UserPacketRelay {
         self.stream_relay.set_eof_garbage();
 
         let mut data = vec![0u8; self.stream_relay.peek_len_garbage()];
-        let packet = match self.stream_relay.read_garbage(&mut data) {
+        match self.stream_relay.read_garbage(&mut data) {
             Ok(read_cnt) => {
                 if read_cnt != data.len() {
                     let err = format!(
@@ -480,25 +500,44 @@ impl FakePeerRelayWriter for UserPacketRelay {
                         data.len(),
                         read_cnt
                     );
-                    ProtocolPacketResult::Err(err.into())
+                    self.queue.push_front(ProtocolPacketResult::Err(err.into()));
                 } else {
-                    ProtocolPacketResult::Ok(ProtocolPacket::Handshake(
+                    let mut terminator = None;
+                    if self.garbage_includes_terminator {
+                        terminator =
+                            Some(data.split_off(data.len() - NUM_GARBAGE_TERMINATOR_BYTES));
+                    }
+                    let garbage_packet = ProtocolPacketResult::Ok(ProtocolPacket::Handshake(
                         ProtocolHandshakePacket::Garbage(HandshakeGarbage { data }),
-                    ))
+                    ));
+                    self.queue.push_front(garbage_packet);
+
+                    if let Some(terminator) = terminator {
+                        let terminator_packet =
+                            ProtocolPacketResult::Ok(ProtocolPacket::Handshake(
+                                ProtocolHandshakePacket::Terminator(HandshakeTerminator {
+                                    data: terminator.try_into().unwrap(),
+                                }),
+                            ));
+                        self.queue.push_front(terminator_packet);
+                    }
                 }
             }
-            Err(err) => ProtocolPacketResult::Err(err.into()),
-        };
-
-        self.queue.push_front(packet);
+            Err(err) => {
+                self.queue.push_front(ProtocolPacketResult::Err(err.into()));
+            }
+        }
     }
 
     fn write_terminator(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.garbage_includes_terminator {
+            return Ok(data.len());
+        }
         self.stream_relay.write_terminator(data)
     }
 
     fn set_eof_terminator(&mut self) {
-        if self.stream_relay.is_eof_terminator() {
+        if self.stream_relay.is_eof_terminator() || self.garbage_includes_terminator {
             return;
         }
         self.stream_relay.set_eof_terminator();
@@ -563,61 +602,18 @@ impl FakePeerRelayWriter for UserPacketRelay {
     fn set_aad(&mut self, _aad: &[u8]) {
         // The user packet relay doesn't expose the aad
     }
+
+    fn set_expected_terminator(&mut self, _terminator: &[u8]) {
+        // The user packet relay doesn't expose expected terminator
+    }
 }
 
 impl UserPacketRelay {
     pub fn next_protocol_packet(&mut self) -> Option<ProtocolPacketResult> {
         self.queue.pop_back()
     }
-}
 
-#[derive(Default)]
-pub struct UserBytesRelay {
-    pub relay: FakePeerRelay,
-}
-
-impl Deref for UserBytesRelay {
-    type Target = FakePeerRelay;
-
-    fn deref(&self) -> &Self::Target {
-        &self.relay
-    }
-}
-
-impl DerefMut for UserBytesRelay {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.relay
-    }
-}
-
-impl UserBytesRelay {
-    pub fn next_bytes(&mut self) -> Vec<u8> {
-        let relay = &mut self.relay;
-        let size = relay.peek_len_key() + relay.peek_len_garbage() + relay.peek_len_terminator();
-
-        let mut data = vec![0u8; size];
-        let mut cnt = 0;
-        cnt += relay.read_key(&mut data[cnt..]).unwrap();
-        cnt += relay.read_garbage(&mut data[cnt..]).unwrap();
-        relay.read_terminator(&mut data[cnt..]).unwrap();
-
-        loop {
-            let new_size =
-                relay.peek_length_bytes() + relay.peek_data_bytes() + relay.peek_tag_bytes();
-            relay.read_aad();
-
-            if new_size == 0 {
-                break;
-            }
-
-            let mut cur = data.len();
-            data.resize(data.len() + new_size, 0);
-
-            cur += relay.read_length_bytes(&mut data[cur..]);
-            cur += relay.read_data_bytes(&mut data[cur..]);
-            cur += relay.read_tag_bytes(&mut data[cur..]);
-        }
-
-        data
+    pub fn ensure_garbage_includes_terminator(&mut self, ensure: bool) {
+        self.garbage_includes_terminator = ensure;
     }
 }

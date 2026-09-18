@@ -666,6 +666,9 @@ impl HandshakeWriteParser {
     }
 
     pub fn skip_terminator(&mut self) -> Result<(), Bip324Error> {
+        if self.flag_skip_terminator {
+            return Ok(());
+        }
         if self.terminator_bytes_sent > 0 {
             return Err(Bip324Error::TerminatorAlreadySending);
         }

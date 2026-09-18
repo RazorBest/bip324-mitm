@@ -577,7 +577,7 @@ fn test_write_full_handshake() {
     parser.set_garbage_eof();
     parser.inject_outbound_garbage_terminator_for_test(terminator);
 
-    let mut buf = vec![0u8; KEY_LEN + 20 + TERMINATOR_LEN];
+    let mut buf = vec![0u8; KEY_LEN + garbage.len() + TERMINATOR_LEN];
     {
         let mut s = buf.as_mut_slice();
         parser.produce(&mut s).unwrap();
@@ -712,6 +712,128 @@ fn test_pacing_garbage() {
 
     assert_eq!(all_garbage_out, full_garbage);
     assert_handshake_writer_has_consumed(&mut parser);
+}
+
+#[test]
+fn test_skip_terminator_enable_at_beginning() {
+    let point = key_from_secret_bytes(SECRET_A).unwrap();
+    let expected_key = point.elligator_swift.to_array();
+    let (_, mut parser) = super::new_handshake_pair(Role::Initiator, MAINNET_MAGIC, point);
+
+    let garbage = vec![0xFFu8; 20];
+    let terminator = [0xAAu8; TERMINATOR_LEN];
+
+    parser.push_garbage_bytes(&garbage);
+    parser.set_garbage_eof();
+    parser.inject_outbound_garbage_terminator_for_test(terminator);
+
+    // Enable before feeding anything
+    parser.skip_terminator().unwrap();
+
+    // Write key and garbage
+    let mut buf = vec![0u8; KEY_LEN + garbage.len()];
+    {
+        let mut s = buf.as_mut_slice();
+        parser.produce(&mut s).unwrap();
+    }
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&expected_key);
+    expected.extend_from_slice(&garbage);
+    assert_eq!(buf, expected);
+
+    // Write terminator
+    let mut buf = vec![0u8; terminator.len()];
+    let mut s = buf.as_mut_slice();
+    parser.produce(&mut s).unwrap();
+    assert_eq!(s.len(), buf.len());
+
+    // Calling again shouldn't throw an error
+    parser.skip_terminator().unwrap();
+
+    assert!(parser.is_done_writing());
+}
+
+#[test]
+fn test_skip_terminator_enable_after_garbage() {
+    let point = key_from_secret_bytes(SECRET_A).unwrap();
+    let expected_key = point.elligator_swift.to_array();
+    let (_, mut parser) = super::new_handshake_pair(Role::Initiator, MAINNET_MAGIC, point);
+
+    let garbage = vec![0xFFu8; 20];
+    let terminator = [0xAAu8; TERMINATOR_LEN];
+
+    parser.push_garbage_bytes(&garbage);
+    parser.set_garbage_eof();
+    parser.inject_outbound_garbage_terminator_for_test(terminator);
+
+    // Write key and garbage
+    let mut buf = vec![0u8; KEY_LEN + garbage.len()];
+    {
+        let mut s = buf.as_mut_slice();
+        parser.produce(&mut s).unwrap();
+    }
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&expected_key);
+    expected.extend_from_slice(&garbage);
+    assert_eq!(buf, expected);
+
+    // Enable skip terminator and verify
+    parser.skip_terminator().unwrap();
+
+    // Write terminator
+    let mut buf = vec![0u8; terminator.len()];
+    let mut s = buf.as_mut_slice();
+    parser.produce(&mut s).unwrap();
+    assert_eq!(s.len(), buf.len());
+
+    // Calling again shouldn't throw an error
+    parser.skip_terminator().unwrap();
+
+    assert!(parser.is_done_writing());
+}
+
+#[test]
+fn test_skip_terminator_after_terminator_sending() {
+    let point = key_from_secret_bytes(SECRET_A).unwrap();
+    let expected_key = point.elligator_swift.to_array();
+    let (_, mut parser) = super::new_handshake_pair(Role::Initiator, MAINNET_MAGIC, point);
+
+    let garbage = vec![0xFFu8; 20];
+    let terminator = [0xAAu8; TERMINATOR_LEN];
+
+    parser.push_garbage_bytes(&garbage);
+    parser.set_garbage_eof();
+    parser.inject_outbound_garbage_terminator_for_test(terminator);
+
+    // Write key and garbage
+    let mut buf = vec![0u8; KEY_LEN + garbage.len() + 1];
+    {
+        let mut s = buf.as_mut_slice();
+        parser.produce(&mut s).unwrap();
+        assert!(s.is_empty());
+    }
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&expected_key);
+    expected.extend_from_slice(&garbage);
+    expected.extend_from_slice(&terminator[..1]);
+    assert_eq!(buf, expected);
+
+    // Enable skip terminator and verify
+    let err = parser.skip_terminator();
+    assert!(err.is_err());
+
+    // Write the rest of the terminator
+    let mut buf = vec![0u8; terminator.len() - 1];
+    let mut s = buf.as_mut_slice();
+    parser.produce(&mut s).unwrap();
+    assert!(s.is_empty());
+    assert_eq!(buf, &terminator[1..]);
+
+    // Calling again should still be an error
+    let err = parser.skip_terminator();
+    assert!(err.is_err());
+
+    assert!(parser.is_done_writing());
 }
 
 // Push garbage without setting EOF. Verify parser stays in SendingGarbage and returns End.

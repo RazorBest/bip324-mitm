@@ -6,6 +6,9 @@ This MitM layer is async-compatible and has byte-level granularity:
 - async-compatible: the read/write functions are non-blocking
 - byte-level granularity: for each byte sent by the sending peer, the mitm bridge can send one byte to the receiving peer
 
+> [!IMPORTANT]  
+> This project is AI-free. The code is either handwritten or copied from the internet (with references provided). However, AI might be used for architectural design and rubber ducking.
+
 ## Getting started
 
 The library exposes the `MitmBIP324` struct, which can be placed between the client and the server, and has 6 main methods:

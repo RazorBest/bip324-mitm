@@ -1743,6 +1743,64 @@ fn test_data_phase_roundtrip() {
 // skip_terminator mode, meaning that the user of the HandshakeWriterParser will manually include
 // the outbound terminator in the garbage. Alice encrypts a message and Bob decrypts it.
 #[test]
+fn test_data_phase_roundtrip_writer_skip_terminator() {
+    let (mut alice_reader, mut alice_writer, mut bob_reader, mut bob_writer) =
+        prepare_communication_peers();
+    // Only one side enables skip terminator
+    alice_writer.skip_terminator().unwrap();
+    do_key_exchange_between_peers(
+        &mut alice_reader,
+        &mut alice_writer,
+        &mut bob_reader,
+        &mut bob_writer,
+    );
+    let alice_to_bob_terminator = alice_writer
+        .shared
+        .borrow()
+        .outbound_garbage_terminator
+        .expect("Alice must have the outbound terminator prepared");
+    // Needed because of the skip_terminator option
+    // The terminator is forced into the garbage, instead, by the user of the library
+    alice_writer.push_garbage_bytes(&alice_to_bob_terminator);
+    do_garbage_phase_between_peers(
+        &mut alice_reader,
+        &mut alice_writer,
+        &mut bob_reader,
+        &mut bob_writer,
+    );
+    do_terminator_phase_between_peers(
+        &mut alice_reader,
+        &mut alice_writer,
+        &mut bob_reader,
+        &mut bob_writer,
+    );
+
+    let (_alice_data_reader, _) = alice_reader.get_data_reader();
+    let mut alice_data_writer = alice_writer.into_data_writer();
+
+    let (mut bob_data_reader, _) = bob_reader.get_data_reader();
+    let _bob_data_writer = bob_writer.into_data_writer();
+
+    // Alice encrypts → Bob decrypts
+    let plaintext = b"full transition roundtrip";
+    let ciphertext = encrypt_with_parser(&mut alice_data_writer, plaintext, None);
+
+    bob_data_reader.consume(&mut ciphertext.as_slice()).unwrap();
+    let decrypted = bob_data_reader.drain_data_bytes();
+
+    assert_eq!(decrypted[0], 0x00, "Expected genuine header byte");
+    assert_eq!(
+        &decrypted[1..],
+        plaintext,
+        "Decrypted payload must match original plaintext"
+    );
+    assert_writer_has_consumed(&mut alice_data_writer);
+}
+
+// Both sides complete a handshake and transition to the data phase. Alice is configured in
+// skip_terminator mode, meaning that the user of the HandshakeWriterParser will manually include
+// the outbound terminator in the garbage. Alice encrypts a message and Bob decrypts it.
+#[test]
 fn test_data_phase_roundtrip_reader_garbage_inlcudes_terminator() {
     let (mut alice_reader, mut alice_writer, mut bob_reader, mut bob_writer) =
         prepare_communication_peers();

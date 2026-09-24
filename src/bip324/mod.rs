@@ -629,6 +629,19 @@ impl HandshakeWriteParser {
         self.shared.borrow().writer_started_sending
     }
 
+    pub fn get_aad(&self) -> Vec<u8> {
+        assert!(
+            self.is_done_writing(),
+            "Handshake must be done before getting aad"
+        );
+
+        if self.flag_skip_terminator {
+            return self.garbage_sent[..self.garbage_sent.len() - NUM_TAG_BYTES].to_vec();
+        }
+
+        self.garbage_sent.clone()
+    }
+
     pub fn into_data_writer(self) -> DataWriteParser {
         assert!(
             self.is_done_writing(),
@@ -643,7 +656,7 @@ impl HandshakeWriteParser {
             .expect("Outbound cipher must be available for data phase");
 
         let mut writer = DataWriteParser::new(outbound_cipher);
-        writer.set_aad(&self.garbage_sent);
+        writer.set_aad(&self.get_aad());
         writer
     }
 
@@ -661,7 +674,7 @@ impl HandshakeWriteParser {
             .expect("Outbound cipher must be available for data phase");
 
         let mut writer = DataWriteParser::new(outbound_cipher);
-        writer.set_aad(&self.garbage_sent);
+        writer.set_aad(&self.get_aad());
         writer
     }
 

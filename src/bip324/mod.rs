@@ -550,7 +550,7 @@ impl ProtocolReadParser for HandshakeReadParser {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum HandshakeWriteState {
     SendingKey,
     SendingGarbage,

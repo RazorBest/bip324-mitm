@@ -1542,10 +1542,7 @@ fn test_writer_reads_key_from_handshake_pair() {
     );
 }
 
-// Helper: run a full BIP-324 handshake for both sides using new_handshake_pair.
-// Returns (alice_reader, alice_writer, bob_reader, bob_writer), all in HandshakeDone/Done state.
-// All bytes flow through produce() → consume(); no internal state is accessed directly.
-fn do_full_handshake() -> (
+fn prepare_communication_peers() -> (
     HandshakeReadParser,
     HandshakeWriteParser,
     HandshakeReadParser,
@@ -1554,14 +1551,18 @@ fn do_full_handshake() -> (
     let alice_key = key_from_secret_bytes(ALICE_SECRET).unwrap();
     let bob_key = key_from_secret_bytes(BOB_SECRET).unwrap();
 
-    let (mut alice_reader, mut alice_writer) =
-        super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
-    let (mut bob_reader, mut bob_writer) =
-        super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
+    let (alice_reader, alice_writer) = super::new_handshake_pair(Role::Initiator, MAGIC, alice_key);
+    let (bob_reader, bob_writer) = super::new_handshake_pair(Role::Responder, MAGIC, bob_key);
 
-    alice_writer.set_garbage_eof();
-    bob_writer.set_garbage_eof();
+    (alice_reader, alice_writer, bob_reader, bob_writer)
+}
 
+fn do_key_exchange_between_peers(
+    alice_reader: &mut HandshakeReadParser,
+    alice_writer: &mut HandshakeWriteParser,
+    bob_reader: &mut HandshakeReadParser,
+    bob_writer: &mut HandshakeWriteParser,
+) {
     // Phase 1: each writer produces its ellswift key bytes
     let mut alice_wire_key = vec![0u8; NUM_ELLIGATOR_SWIFT_BYTES];
     alice_writer
@@ -1575,8 +1576,37 @@ fn do_full_handshake() -> (
     // Phase 2: readers consume peer key bytes, triggering ECDH on both sides
     alice_reader.consume(&mut bob_wire_key.as_slice()).unwrap();
     bob_reader.consume(&mut alice_wire_key.as_slice()).unwrap();
+}
 
-    // Phase 3: writers produce garbage terminators (ECDH complete, terminator in shared state)
+fn do_garbage_phase_between_peers(
+    alice_reader: &mut HandshakeReadParser,
+    alice_writer: &mut HandshakeWriteParser,
+    bob_reader: &mut HandshakeReadParser,
+    bob_writer: &mut HandshakeWriteParser,
+) {
+    alice_writer.set_garbage_eof();
+    bob_writer.set_garbage_eof();
+
+    // Writers produce the garbage
+    let mut alice_garb = vec![0u8; alice_writer.garbage_bytes.len()];
+    alice_writer
+        .produce(&mut alice_garb.as_mut_slice())
+        .unwrap();
+    let mut bob_garb = vec![0u8; bob_writer.garbage_bytes.len()];
+    bob_writer.produce(&mut bob_garb.as_mut_slice()).unwrap();
+
+    // Readers consume the garbage
+    alice_reader.consume(&mut bob_garb.as_slice()).unwrap();
+    bob_reader.consume(&mut alice_garb.as_slice()).unwrap();
+}
+
+fn do_terminator_phase_between_peers(
+    alice_reader: &mut HandshakeReadParser,
+    alice_writer: &mut HandshakeWriteParser,
+    bob_reader: &mut HandshakeReadParser,
+    bob_writer: &mut HandshakeWriteParser,
+) {
+    // Writers produce garbage terminators (ECDH complete, terminator in shared state)
     let mut alice_term = vec![0u8; NUM_GARBAGE_TERMINATOR_BYTES];
     alice_writer
         .produce(&mut alice_term.as_mut_slice())
@@ -1592,12 +1622,42 @@ fn do_full_handshake() -> (
         "bob writer must reach Done after produce()"
     );
 
-    // Phase 4: readers consume peer garbage terminators, completing the handshake
+    // Readers consume peer garbage terminators, completing the handshake
     alice_reader.consume(&mut bob_term.as_slice()).unwrap();
     bob_reader.consume(&mut alice_term.as_slice()).unwrap();
 
     assert!(alice_reader.is_handshake_done());
     assert!(bob_reader.is_handshake_done());
+}
+
+fn do_full_handshake_between_peers(
+    alice_reader: &mut HandshakeReadParser,
+    alice_writer: &mut HandshakeWriteParser,
+    bob_reader: &mut HandshakeReadParser,
+    bob_writer: &mut HandshakeWriteParser,
+) {
+    do_key_exchange_between_peers(alice_reader, alice_writer, bob_reader, bob_writer);
+    do_garbage_phase_between_peers(alice_reader, alice_writer, bob_reader, bob_writer);
+    do_terminator_phase_between_peers(alice_reader, alice_writer, bob_reader, bob_writer);
+}
+
+// Helper: run a full BIP-324 handshake for both sides using new_handshake_pair.
+// Returns (alice_reader, alice_writer, bob_reader, bob_writer), all in HandshakeDone/Done state.
+// All bytes flow through produce() → consume(); no internal state is accessed directly.
+fn do_full_handshake() -> (
+    HandshakeReadParser,
+    HandshakeWriteParser,
+    HandshakeReadParser,
+    HandshakeWriteParser,
+) {
+    let (mut alice_reader, mut alice_writer, mut bob_reader, mut bob_writer) =
+        prepare_communication_peers();
+    do_full_handshake_between_peers(
+        &mut alice_reader,
+        &mut alice_writer,
+        &mut bob_reader,
+        &mut bob_writer,
+    );
 
     (alice_reader, alice_writer, bob_reader, bob_writer)
 }
@@ -1656,6 +1716,46 @@ fn test_handshake_writer_into_data_writer() {
 #[test]
 fn test_data_phase_roundtrip() {
     let (mut alice_reader, alice_writer, mut bob_reader, bob_writer) = do_full_handshake();
+
+    let (_alice_data_reader, _) = alice_reader.get_data_reader();
+    let mut alice_data_writer = alice_writer.into_data_writer();
+
+    let (mut bob_data_reader, _) = bob_reader.get_data_reader();
+    let _bob_data_writer = bob_writer.into_data_writer();
+
+    // Alice encrypts → Bob decrypts
+    let plaintext = b"full transition roundtrip";
+    let ciphertext = encrypt_with_parser(&mut alice_data_writer, plaintext, None);
+
+    bob_data_reader.consume(&mut ciphertext.as_slice()).unwrap();
+    let decrypted = bob_data_reader.drain_data_bytes();
+
+    assert_eq!(decrypted[0], 0x00, "Expected genuine header byte");
+    assert_eq!(
+        &decrypted[1..],
+        plaintext,
+        "Decrypted payload must match original plaintext"
+    );
+    assert_writer_has_consumed(&mut alice_data_writer);
+}
+
+// Both sides complete a handshake and transition to the data phase. Alice is configured in
+// skip_terminator mode, meaning that the user of the HandshakeWriterParser will manually include
+// the outbound terminator in the garbage. Alice encrypts a message and Bob decrypts it.
+#[test]
+fn test_data_phase_roundtrip_reader_garbage_inlcudes_terminator() {
+    let (mut alice_reader, mut alice_writer, mut bob_reader, mut bob_writer) =
+        prepare_communication_peers();
+    // Only one side enables this flag
+    alice_reader
+        .ensure_garbage_includes_terminator(true)
+        .unwrap();
+    do_full_handshake_between_peers(
+        &mut alice_reader,
+        &mut alice_writer,
+        &mut bob_reader,
+        &mut bob_writer,
+    );
 
     let (_alice_data_reader, _) = alice_reader.get_data_reader();
     let mut alice_data_writer = alice_writer.into_data_writer();
